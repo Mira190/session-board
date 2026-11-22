@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session Board</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Session Board</h1>
+  <p id="summary" aria-live="polite"></p>
+  <div class="tools">
+    <button id="next" title="跳到等得最久、最该处理的会话 (N)">下一个等你的 <kbd>N</kbd></button>
+    <label><input type="checkbox" id="notify"> 桌面通知</label>
+    <label><input type="checkbox" id="sound"> 提示音</label>
+    <span id="conn" class="conn">连接中…</span>
+  </div>
+</header>
+<main id="board">
+  <section data-col="attention"><h2>等你回应 <span class="count"></span></h2><p class="hint">权限请求、提问、失败。越靠上越该先处理。</p><div class="cards"></div></section>
+  <section data-col="review"><h2>待验收 <span class="count"></span></h2><p class="hint">agent 说做完了，你还没看。</p><div class="cards"></div></section>
+  <section data-col="working"><h2>工作中 <span class="count"></span></h2><p class="hint">不需要你，除非它安静太久。</p><div class="cards"></div></section>
+  <section data-col="rest"><h2>空闲 / 已结束 <span class="count"></span></h2><p class="hint">等你派下一件事，或已退出。</p><div class="cards"></div></section>
+</main>
+<dialog id="detail"><article></article></dialog>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
