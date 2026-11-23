@@ -54,3 +54,34 @@ export async function demo(url, { speed = 1, headers = { 'content-type': 'applic
     await sleep(700 / speed);
   }
 }
+
+// A fleet: `n` sessions across a handful of projects in a realistic mix of
+// states, including the same permission request open in many sessions at once.
+export async function demoFleet(url, n, { headers = { 'content-type': 'application/json' } } = {}) {
+  const repos = ['shop-api', 'web-app', 'billing', 'docs-site', 'mobile', 'infra', 'search', 'ml-pipeline'];
+  const tasks = ['升级依赖并修复类型错误', 'Add pagination to the list endpoint', '给导出功能补测试', 'Refactor the retry logic', '修复时区相关的偶发失败', 'Migrate config to the new schema', '把日志改成结构化输出', 'Speed up the cold start'];
+  const run = Date.now().toString(36);
+  const post = (agent, body) => fetch(`${url}/ingest/${agent}?host=${body.host}`, { method: 'POST', headers, body: JSON.stringify(body) }).catch(() => {});
+  const jobs = [];
+  for (let i = 0; i < n; i++) {
+    const agent = i % 3 === 2 ? 'codex' : 'claude';
+    const repo = repos[Math.floor((i * 7) % 23 / 3) % repos.length];
+    const me = { session_id: `fleet-${run}-${i}`, cwd: `/work/${repo}`, host: i % 5 === 4 ? 'devbox' : 'macbook' };
+    const say = (hook_event_name, extra = {}) => post(agent, { ...me, hook_event_name, ...extra });
+    jobs.push((async () => {
+      await say('UserPromptSubmit', { prompt: `${tasks[i % tasks.length]}（${repo} #${i}）`, prompt_id: `p${i}` });
+      await say('PreToolUse', { tool_name: 'Bash', tool_use_id: `t${i}`, tool_input: { command: 'npm test' } });
+      const kind = i % 20;
+      if (kind < 3) return say('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'npm install' } }); // same request, many sessions
+      if (kind === 3) return say('PermissionRequest', { tool_name: 'Bash', tool_input: { command: `git push origin feature-${i}` } });
+      if (kind === 4) return say('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'rm -rf node_modules dist' } });
+      if (kind === 5) return say('PreToolUse', { tool_name: 'AskUserQuestion', tool_use_id: `q${i}`, tool_input: { questions: [{ question: '要保留旧接口的兼容层吗？', options: [{ label: '保留' }, { label: '删除' }] }] } });
+      if (kind === 6) return say('StopFailure', { error: 'rate_limit' });
+      if (kind < 11) return say('Stop', { last_assistant_message: '做完了：改了 3 个文件，测试全部通过。' });
+      if (kind === 11) { await say('Stop', { last_assistant_message: 'Done.' }); return say('SessionEnd', {}); }
+      return null; // still working
+    })());
+    if (i % 25 === 24) await sleep(50);
+  }
+  await Promise.all(jobs.map((j) => Promise.race([j, sleep(1500)]))); // held requests never resolve
+}

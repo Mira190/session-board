@@ -16,6 +16,8 @@
       <button id="view-board" aria-pressed="false">看板</button>
       <button id="view-office" aria-pressed="false">办公室</button>
     </div>
+    <input id="filter" type="search" placeholder="筛选：项目、标题、机器…（/）" aria-label="筛选会话">
+    <button id="rules" title="在所有会话里自动允许的命令">自动规则 0</button>
     <button id="backfill" title="把装 hooks 之前就存在的会话从历史文件里导入进来">导入历史</button>
     <label><input type="checkbox" id="notify"> 桌面通知</label>
     <label><input type="checkbox" id="sound"> 提示音</label>
@@ -26,15 +28,17 @@
   <nav id="lists" aria-label="会话"></nav>
   <div id="office" aria-label="办公室">
     <div class="floor">
+      <div class="scene"></div>
       <div class="desks"></div>
       <div class="you"></div>
       <div class="agents"></div>
     </div>
-    <p class="legend">在工位上的不用管。走到你桌前排队的在等你，排在最前面的最该先处理。做完的会把文件放进你的收件盘。点任何一个都在右边处理。</p>
+    <p class="legend">在工位上的不用管。走到你桌前排队的在等你，排在最前面的最该先处理；队伍排不下时，其余的在工位上举红牌。做完的会把文件放进你的收件盘。每个房间是一个项目。点任何一个都在右边处理。</p>
   </div>
   <section id="bench" aria-live="polite"></section>
 </main>
-<footer><kbd>N</kbd> 下一个等你的 <kbd>A</kbd> 允许 <kbd>D</kbd> 拒绝 <kbd>E</kbd> 已验收 <kbd>R</kbd> 回复</footer>
+<dialog id="rules-dialog"><article></article></dialog>
+<footer><kbd>N</kbd> 下一个等你的 <kbd>A</kbd> 允许 <kbd>D</kbd> 拒绝 <kbd>E</kbd> 已验收 <kbd>R</kbd> 回复 <kbd>/</kbd> 筛选</footer>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

@@ -35,7 +35,7 @@ test('permission wait survives parallel tool calls and keeps its start time', ()
   ]);
   const since = s.since;
   assert.equal(s.state, 'needs_input');
-  assert.deepEqual(s.waiting, { id: null, kind: 'permission', tool: 'Bash', detail: 'rm -rf build', questions: null });
+  assert.deepEqual(s.waiting, { id: null, kind: 'permission', tool: 'Bash', detail: 'rm -rf build', questions: null, risky: true });
   assert.equal(s.requests.length, 1, 'PreToolUse + PermissionRequest + Notification are one request');
   s = run('claude', 'b', [
     ['Notification', { notification_type: 'permission_prompt', message: 'Claude needs your permission' }],

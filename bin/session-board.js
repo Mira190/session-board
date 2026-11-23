@@ -12,6 +12,7 @@ const { values: opt, positionals } = parseArgs({
     url: { type: 'string' },
     host: { type: 'string', default: hostname() },
     days: { type: 'string', default: '7' },
+    sessions: { type: 'string' },
     'dry-run': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
   },
@@ -26,7 +27,7 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board status                    is the hub up, are the hooks in place
   session-board backfill [--days 7]       import sessions that predate the hooks
   session-board mcp                       MCP server (stdio) so agents can read the board
-  session-board demo                      play scripted sessions into a running hub
+  session-board demo [--sessions 150]     play scripted sessions into a running hub
   session-board hook <claude|codex>       (used by hooks) forward stdin to the hub
 
 Options: --port 4590  --bind 127.0.0.1  --db <file>  --url <hub url>
@@ -145,8 +146,9 @@ async function main() {
   if (cmd === 'backfill' || cmd === 'demo') {
     const { url, token } = await endpoint();
     if (cmd === 'demo') {
-      const { demo } = await import('../src/demo.js');
-      await demo(url, { headers: authHeaders(token) });
+      const { demo, demoFleet } = await import('../src/demo.js');
+      if (opt.sessions) await demoFleet(url, Number(opt.sessions), { headers: authHeaders(token) });
+      else await demo(url, { headers: authHeaders(token) });
       return console.log('demo events sent. Its permission requests stay open until you answer them in the board (Ctrl+C to stop).');
     }
     const res = await fetch(`${url}/api/backfill`, { method: 'POST', headers: authHeaders(token), body: JSON.stringify({ days: Number(opt.days) }) });

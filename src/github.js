@@ -77,12 +77,36 @@ export function createGitHub({
     return ghOk;
   }
 
+  // With many sessions in one repository, asking per branch means one request
+  // per session per poll. Instead the repository's recent PRs are listed once
+  // and shared for a short while; only a branch missing from that list (an old
+  // PR, beyond the first page) is looked up on its own.
+  const LIST_TTL = 45_000;
+  const lists = new Map(); // repo key -> { at, promise of Map(branch -> pr[]) }
+  function shared(key, load) {
+    const hit = lists.get(key);
+    if (hit && Date.now() - hit.at < LIST_TTL) return hit.promise;
+    const promise = load().catch(() => null);
+    lists.set(key, { at: Date.now(), promise });
+    return promise;
+  }
+  const byBranch = (prs, branchOf) => {
+    const map = new Map();
+    for (const p of prs) (map.get(branchOf(p)) || map.set(branchOf(p), []).get(branchOf(p))).push(p);
+    return map;
+  };
+  const GH_FIELDS = 'number,state,url,title,isDraft,headRefName,headRefOid,baseRefName,updatedAt,reviewDecision,statusCheckRollup';
+
   async function viaGh(cwd, branch) {
-    const out = await exec('gh', [
-      'pr', 'list', '--head', branch, '--state', 'all', '--limit', '5', '--json',
-      'number,state,url,title,isDraft,headRefOid,baseRefName,updatedAt,reviewDecision,statusCheckRollup',
-    ], cwd);
-    if (out == null) return undefined; // gh failed: let the caller try REST
+    const all = await shared(`gh:${cwd}`, async () => {
+      const out = await exec('gh', ['pr', 'list', '--state', 'all', '--limit', '100', '--json', GH_FIELDS], cwd);
+      if (out == null) throw new Error('gh failed');
+      return byBranch(JSON.parse(out), (p) => p.headRefName);
+    });
+    if (all == null) return undefined; // gh failed: let the caller try REST
+    if (all.has(branch)) return pick(all.get(branch).map(fromGh));
+    const out = await exec('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--limit', '5', '--json', GH_FIELDS], cwd);
+    if (out == null) return undefined;
     return pick(JSON.parse(out).map(fromGh));
   }
 
@@ -101,8 +125,15 @@ export function createGitHub({
   }
 
   async function viaRest({ owner, repo }, branch) {
-    const q = new URLSearchParams({ head: `${owner}:${branch}`, state: 'all', per_page: '5', sort: 'updated', direction: 'desc' });
-    const pr = pick((await rest(`/repos/${owner}/${repo}/pulls?${q}`)).map(fromRest));
+    const all = await shared(`rest:${owner}/${repo}`, async () =>
+      byBranch(await rest(`/repos/${owner}/${repo}/pulls?state=all&per_page=100&sort=updated&direction=desc`),
+        (p) => (p.head?.repo?.owner?.login === owner || !p.head?.repo ? p.head?.ref : null)));
+    let found = all?.get(branch);
+    if (!found) {
+      const q = new URLSearchParams({ head: `${owner}:${branch}`, state: 'all', per_page: '5', sort: 'updated', direction: 'desc' });
+      found = await rest(`/repos/${owner}/${repo}/pulls?${q}`);
+    }
+    const pr = pick(found.map(fromRest));
     if (pr?.state === 'open' && pr.head_sha) {
       const runs = await rest(`/repos/${owner}/${repo}/commits/${pr.head_sha}/check-runs?per_page=100`).catch(() => null);
       pr.checks = rollup(runs?.check_runs);

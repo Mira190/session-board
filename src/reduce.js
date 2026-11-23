@@ -81,7 +81,10 @@ function open(s, ts, kind, tool, detail, id, questions) {
     same.questions ??= questions ?? null;
     return;
   }
-  s.requests.push({ id: id ?? null, kind, tool: tool ?? null, detail: detail ?? null, ts, questions: questions ?? null });
+  s.requests.push({
+    id: id ?? null, kind, tool: tool ?? null, detail: detail ?? null, ts, questions: questions ?? null,
+    risky: kind === 'permission' && isRisky(detail),
+  });
 }
 
 // Resolve the oldest open request that matches. A request reported without a
@@ -107,7 +110,7 @@ function derive(s) {
   if (first) {
     s.state = 'needs_input';
     s.since = first.ts;
-    s.waiting = { id: first.id, kind: first.kind, tool: first.tool, detail: first.detail, questions: first.questions };
+    s.waiting = { id: first.id, kind: first.kind, tool: first.tool, detail: first.detail, questions: first.questions, risky: !!first.risky };
   } else {
     s.state = s.phase;
     s.since = s.phase_since;
@@ -129,6 +132,17 @@ function questionsOf(input) {
     })),
   }));
 }
+
+// Commands that deserve a second look. This is a highlighter, not a security
+// boundary: it only decides what is kept out of batch approval and standing
+// rules, so that those shortcuts are never the way something drastic gets in.
+const RISKY = [
+  /\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, /\bsudo\b/, /--force\b|\s-f\b.*\bpush\b|\bpush\b.*\s-f\b/, /\|\s*(ba|z|k)?sh\b/,
+  /\bmkfs\b|\bdd\s+if=/, /\bdrop\s+(table|database|schema)\b/i, /\btruncate\s+table\b/i, /\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)/,
+  /\bchmod\s+-R\b|\bchown\s+-R\b/, />\s*\/dev\/(sd|nvme|disk)/, /\b(shutdown|reboot)\b/, /\bkubectl\s+delete\b|\bterraform\s+(destroy|apply)\b/,
+  /\bcurl\b.*\|\s*\w*sh\b|\bwget\b.*\|\s*\w*sh\b/, /\bgh\s+pr\s+merge\b|\bnpm\s+publish\b/,
+];
+export const isRisky = (detail) => typeof detail === 'string' && RISKY.some((re) => re.test(detail));
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const MAX_FILES = 300;

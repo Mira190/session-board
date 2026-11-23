@@ -10,6 +10,13 @@ export class Store {
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      CREATE TABLE IF NOT EXISTS rules (
+        tool TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        created INTEGER NOT NULL,
+        PRIMARY KEY (tool, detail)
+      );
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -89,6 +96,17 @@ export class Store {
       .all(key, limit)
       .map((r) => ({ id: r.id, ...JSON.parse(r.body) }))
       .reverse();
+  }
+
+  // Global rules: "this exact request is always fine, in any session".
+  rules() {
+    return this.db.prepare('SELECT tool, detail, created FROM rules ORDER BY created').all();
+  }
+  addRule(tool, detail, created) {
+    this.db.prepare('INSERT OR IGNORE INTO rules (tool, detail, created) VALUES (?, ?, ?)').run(tool, detail, created);
+  }
+  removeRule(tool, detail) {
+    this.db.prepare('DELETE FROM rules WHERE tool = ? AND detail = ?').run(tool, detail);
   }
 
   onChange(fn) {
