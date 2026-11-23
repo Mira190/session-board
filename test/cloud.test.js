@@ -74,3 +74,41 @@ test('the account\'s cloud session list: states, unread, children under their pa
   assert.deepEqual([r2['Child B'].state, r2['Child A'].state], ['idle', 'review']);
   await hub.close();
 });
+
+test('the drop box takes deliveries and nothing else: nothing can be read or decided through it', async () => {
+  const hub = createHub({ localHost: 'laptop' });
+  const main = await hub.listen(0, '127.0.0.1');
+  assert.throws(() => hub.listenDropBox(0, '127.0.0.1', 'short'), /at least 16/);
+  const drop = await hub.listenDropBox(0, '127.0.0.1', 'a-long-drop-box-token', { perMinute: 8 });
+  const D = `http://127.0.0.1:${drop.port}`;
+  const M = `http://127.0.0.1:${main.port}`;
+  const auth = { 'content-type': 'application/json', authorization: 'Bearer a-long-drop-box-token' };
+  const send = (path, body, headers = auth, method = 'POST') => fetch(D + path, { method, headers, body: method === 'POST' ? JSON.stringify(body) : undefined });
+
+  assert.equal((await send('/ingest/claude', { session_id: 'c', hook_event_name: 'UserPromptSubmit', prompt: 'from the cloud' }, { 'content-type': 'application/json' })).status, 401, 'no token, no delivery');
+  assert.equal((await send('/ingest/claude', {}, { ...auth, authorization: 'Bearer wrong-token-wrong-token' })).status, 401);
+  assert.equal((await send('/ingest/claude', { session_id: 'c', hook_event_name: 'UserPromptSubmit', prompt: 'from the cloud' })).status, 200);
+  const key = encodeURIComponent('claude:c');
+
+  // With a valid token, everything that reads or acts still does not exist on this door.
+  for (const [method, path] of [['GET', '/'], ['GET', '/api/sessions'], ['GET', '/api/stream'], ['GET', `/api/sessions/${key}/detail`], ['GET', `/api/sessions/${key}/diff`],
+    ['POST', `/api/sessions/${key}/ack`], ['POST', `/api/sessions/${key}/message`], ['POST', '/api/rules'], ['POST', '/api/requests/batch'], ['POST', '/api/requests/abc'], ['POST', '/api/backfill'], ['GET', '/api/triage'], ['POST', '/ingest/../api/sessions']]) {
+    assert.equal((await send(path, {}, auth, method)).status, 404, `${method} ${path}`);
+  }
+  // The delivery arrived on the board, which is only reachable through the main door.
+  const board = await (await fetch(M + '/api/sessions')).json();
+  assert.deepEqual(board.sessions.map((s) => [s.title, s.state]), [['from the cloud', 'working']]);
+
+  // A permission request delivered here is held and answered from the board; the answer goes back on that connection only.
+  const asked = send('/ingest/claude', { session_id: 'c', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'make' } });
+  let id;
+  for (let i = 0; i < 200 && !id; i++) { await new Promise((r) => setTimeout(r, 10)); id = (await (await fetch(M + '/api/sessions')).json()).sessions[0].waiting?.id; }
+  await fetch(`${M}/api/requests/${id}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'allow' }) });
+  assert.equal((await (await asked).json()).hookSpecificOutput.decision.behavior, 'allow');
+
+  // Flooding is cut off.
+  let last;
+  for (let i = 0; i < 12; i++) last = await send('/ingest/event', { agent: 'claude', session_id: 'c', type: 'heartbeat' });
+  assert.equal(last.status, 429);
+  await hub.close();
+});

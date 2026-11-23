@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
 import { basename, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.js';
@@ -808,12 +808,12 @@ export function createHub({
     return null;
   }
 
-  async function handle(req, res) {
+  async function handle(req, res, { admitted = false } = {}) {
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
     const body = async () => JSON.parse((await readBody(req)) || '{}');
 
-    if (path.startsWith('/ingest/') || path.startsWith('/api/')) {
+    if (!admitted && (path.startsWith('/ingest/') || path.startsWith('/api/'))) {
       const denied = guard(req, url);
       if (denied) return json(res, denied, { error: denied === 401 ? 'unauthorized' : 'forbidden' });
     }
@@ -1136,6 +1136,38 @@ export function createHub({
   // Held permission requests legitimately stay open for minutes.
   server.requestTimeout = 0;
 
+  // The drop box: a second, separate door for machines that are not this one
+  // (cloud sessions, another computer). It accepts event deliveries and
+  // nothing else. Nothing can be read through it and nothing can be decided,
+  // replied, archived or changed: those all live behind the main door, which
+  // can stay on 127.0.0.1. So what is exposed to a tunnel is write-only, and
+  // the worst a leaked drop-box token allows is fake cards on the board.
+  const sameToken = (a, b) => {
+    const [x, y] = [a, b].map((v) => createHash('sha256').update(String(v)).digest());
+    return timingSafeEqual(x, y);
+  };
+  let dropBox = null;
+  function listenDropBox(port, host, dropToken, { perMinute = 6000 } = {}) {
+    if (!dropToken || String(dropToken).length < 16) throw new Error('the drop box needs a token of at least 16 characters');
+    let windowStart = 0;
+    let count = 0;
+    dropBox = createServer((req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      // Only deliveries. Everything else does not exist here.
+      if (req.method !== 'POST' || !/^\/ingest\/(claude|codex|event|cloud|status)$/.test(url.pathname)) return json(res, 404, { error: 'not found' });
+      const sent = (req.headers.authorization || '').replace(/^Bearer /, '');
+      if (!sameToken(sent, dropToken)) return json(res, 401, { error: 'unauthorized' });
+      if (now() - windowStart > 60_000) { windowStart = now(); count = 0; }
+      if ((count += 1) > perMinute) return json(res, 429, { error: 'too many deliveries' });
+      handle(req, res, { admitted: true }).catch((err) => {
+        if (!res.headersSent) json(res, err.status || 400, { error: 'bad delivery' });
+        else res.end();
+      });
+    });
+    dropBox.requestTimeout = 0;
+    return new Promise((ok) => dropBox.listen(port, host, () => ok(dropBox.address())));
+  }
+
   return {
     store,
     server,
@@ -1147,6 +1179,7 @@ export function createHub({
     backfill,
     decide,
     listen: (port, host) => new Promise((ok) => server.listen(port, host, () => ok(server.address()))),
+    listenDropBox,
     close: () =>
       new Promise((ok) => {
         clearInterval(tick);
@@ -1155,6 +1188,8 @@ export function createHub({
         clearTimeout(orphanTimer);
         for (const id of [...held.keys()]) release(id);
         for (const res of clients) res.end();
+        dropBox?.close();
+        dropBox?.closeAllConnections?.();
         server.close(() => {
           store.close();
           ok();

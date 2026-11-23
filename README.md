@@ -189,19 +189,40 @@ With it, the header shows the 5-hour and weekly windows with their reset times (
 
 There are two sanctioned ways to get cloud sessions onto the board. Neither touches a private API, and both need a hub the cloud can reach.
 
+### Security first: do not expose the board itself
+
+A cloud session runs in Anthropic's container; `127.0.0.1` there is the container, not your computer. So for the cloud to report, there has to be a channel. But **the board can approve commands and type into your terminals**: put the whole thing on the internet and whoever has the address and token can drive your agents.
+
+There are three levels, from least exposed to most:
+
+| Setup | What is exposed | What you get |
+|---|---|---|
+| Listen on this machine only (default) | Nothing | Everything for local sessions; cloud sessions are not visible |
+| Sync over Remote Control (`cloud-reporter --local`) | Nothing: the request is made on your own computer, over a connection you approve | A snapshot of every cloud session's state; each sync costs a turn |
+| The drop box (`serve --drop-port`) behind a tunnel | One write-only port | Live events from cloud sessions, whose permission requests you can answer on the board |
+
+**The drop box** is a separate port on the hub that accepts event deliveries and nothing else: no session data can be read through it, and nothing can be approved, replied to, archived or changed. Those all live on the main port, on this machine only. A request for anything else, even with the right token, gets "not found". So if the token leaks, the worst outcome is fake cards on your board, not someone reading your code or driving your agents. Deliveries are also rate-limited.
+
+What remains, plainly:
+
+- A fake card could ask you to "approve" something, but there is no real agent waiting behind it, so nothing would run.
+- What the cloud delivers (instructions, command text) passes through whichever tunnel provider you choose.
+- The answer to a permission request goes back only on the connection that asked; nobody else receives it.
+- This has not had an independent security review. It is designed to expose as little as possible; that is not a guarantee.
+
 **1. Each cloud session reports itself (live, no cost).** Hooks committed to the repository run inside every cloud session's container and post to your hub, exactly like local sessions, including permission requests you can answer from the board.
 
 ```bash
 node bin/session-board.js cloud-setup --url https://your-hub.example.com
 ```
 
-It writes `.claude/settings.json` in the current repository and prints the three things left to do: commit the file, run the hub at that address with a token, and in the cloud environment's settings allow that host and provide the token. The hooks are marked cloud-only, so opening the repository on your own machine does not double-report.
+It writes `.claude/settings.json` in the current repository and prints the three things left to do: commit the file, open the drop box on the hub and put only that port behind the address, and in the cloud environment's settings allow that host and provide the token. The hooks are marked cloud-only, so opening the repository on your own machine does not double-report.
 
 How the hub knows a session is in the cloud: inside a cloud container Claude Code sets a variable with the session's cloud id, and the hooks send it in a header. The same hooks on a laptop send nothing there. The board then shows the session as cloud, with a link back to it on claude.ai.
 
 ![Cloud sessions on the board](docs/cloud.png)
 
-**2. One cloud session reports the whole list (coarse, costs a turn).** A cloud session has a built-in tool that lists every cloud session of your account with its state, what it is doing, whether you have read it, and its parent. `node bin/session-board.js cloud-reporter` prints what to tell a session (or a scheduled task) so it posts that list to the hub. This also covers repositories without hooks. Sessions known only this way show their state, not what exactly they are waiting for; children are grouped under the session that started them.
+**2. One cloud session reports the whole list (coarse, costs a turn).** A cloud session has a built-in tool that lists every cloud session of your account with its state, what it is doing, whether you have read it, and its parent. `node bin/session-board.js cloud-reporter` prints what to tell a session (or a scheduled task) so it posts that list to the hub; with `--local` it goes over Remote Control instead and is posted on your own computer to the local hub, exposing nothing. This also covers repositories without hooks. Sessions known only this way show their state, not what exactly they are waiting for; children are grouped under the session that started them.
 
 What was verified, and what was not:
 

@@ -18,6 +18,9 @@ const { values: opt, positionals } = parseArgs({
     'push-test': { type: 'boolean', default: false },
     statusline: { type: 'boolean', default: false },
     'http-only': { type: 'boolean', default: false },
+    'drop-port': { type: 'string' },
+    'drop-bind': { type: 'string', default: '127.0.0.1' },
+    local: { type: 'boolean', default: false },
     model: { type: 'string' },
     interval: { type: 'string', default: '20' },
     'dry-run': { type: 'boolean', default: false },
@@ -142,6 +145,13 @@ async function main() {
     await hub.listen(Number(opt.port), opt.bind);
     writeEndpoint({ url, token });
     console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
+    // A write-only door for cloud sessions and other machines; the board itself stays where it is.
+    if (opt['drop-port']) {
+      const dropToken = process.env.SESSION_BOARD_DROP_TOKEN;
+      if (!dropToken) { console.error('Set SESSION_BOARD_DROP_TOKEN (16+ characters) to open the drop box.'); process.exit(1); }
+      await hub.listenDropBox(Number(opt['drop-port']), opt['drop-bind'], dropToken);
+      console.log(`drop box on ${opt['drop-bind']}:${opt['drop-port']}: accepts event deliveries only; nothing can be read or decided through it`);
+    }
     if (process.env.SESSION_BOARD_NTFY || process.env.SESSION_BOARD_WEBHOOK) console.log('phone notifications: on (sent when no board page is in view)');
     // Claude Code's HTTP hooks carry the hub address; follow the hub if it moved.
     // Keep installed hooks current: follow the hub if it moved, and add events
@@ -266,21 +276,38 @@ async function main() {
 Three things make it work:
   1. Commit that file. Every cloud session of this repository then reports to ${publicUrl}.
      Opened on your own machine the same hooks stay silent (they are marked cloud-only).
-  2. Run the hub where the cloud can reach it, with a token:
-       SESSION_BOARD_TOKEN=<a long random string> session-board serve --bind 0.0.0.0
-     behind HTTPS at ${publicUrl} (a small server, or a tunnel from your machine).
-  3. In the cloud environment's settings: allow the host ${host} in its network access,
-     and give sessions the same token as SESSION_BOARD_TOKEN (the hooks send it as a Bearer header).
+  2. Open the drop box on your hub, and put ONLY that port behind ${publicUrl}:
+       SESSION_BOARD_DROP_TOKEN=<a long random string> session-board serve --drop-port 4591
+     The drop box accepts event deliveries and nothing else. The board itself (which can approve
+     commands and reply) keeps listening on 127.0.0.1 only and is not part of what you expose.
+  3. In the cloud environment's settings: allow the host ${host} in its network access, and give
+     sessions that same string as SESSION_BOARD_TOKEN (the hooks send it as a Bearer header).
 
 Then check with one cloud session: it should appear on the board marked as cloud, with a link back to claude.ai.
-Sessions of repositories without these hooks can still be listed: see \`session-board cloud-reporter\`.`);
+No tunnel at all: \`session-board cloud-reporter --local\` uses Remote Control instead (coarser).`);
     return;
   }
 
   // The other route: a cloud session can read the account's whole session list
   // with its built-in tool. This prints what to tell one to do with it.
   if (cmd === 'cloud-reporter') {
-    const publicUrl = (opt.url || process.env.SESSION_BOARD_PUBLIC_URL || 'https://<your hub>').replace(/\/$/, '');
+    if (opt.local) {
+      // Nothing is exposed: the cloud session reaches this hub through the
+      // user's own computer, over Remote Control, which they approve.
+      console.log(`Give this to a Claude Code cloud session, with your computer available over Remote Control
+(Claude desktop app: Settings, Claude Code, Remote Control):
+
+  List my Claude Code cloud sessions with your session-listing tool (up to 100). Then connect to my
+  computer and, on my computer, save that list exactly as the tool returned it to a temporary file and
+  send it as the JSON body of one HTTP POST to http://127.0.0.1:${opt.port}/ingest/cloud with curl.
+  Do not summarise or reformat the list. Delete the file afterwards and reply with only the number accepted.
+
+Your hub stays on 127.0.0.1 and no port is opened to the internet: the request to it is made on your
+own machine. You approve the connection when the session asks. It is a snapshot (state, what each
+session is doing, unread, parent and children), and each run costs that session a turn.`);
+      return;
+    }
+    const publicUrl = (opt.url || process.env.SESSION_BOARD_PUBLIC_URL || 'https://<your drop box>').replace(/\/$/, '');
     console.log(`Give this to a Claude Code cloud session (or make it a scheduled task there):
 
   List my Claude Code cloud sessions with your session-listing tool (up to 100), then send that list,
@@ -291,7 +318,7 @@ Sessions of repositories without these hooks can still be listed: see \`session-
 It shows every cloud session of your account on the board (state, what it is doing, unread, parent and
 children), including ones in repositories without hooks. It is a snapshot taken when that session runs,
 and each run costs that session a turn, so use it on demand or on a slow schedule. The hooks from
-\`session-board cloud-setup\` are the live, free route.`);
+\`session-board cloud-setup\` are the live, free route. To expose nothing at all, use --local.`);
     return;
   }
 
