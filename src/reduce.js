@@ -44,6 +44,8 @@ function blank(ev) {
     snoozed_until: null, // out of the queue until then, unless it needs them sooner
     acked: null, // { phase, since } before the last acknowledgement, for undo
     outgoing: null, // { text, via, ts } a reply sent from the board, not yet confirmed received
+    queued: [], // messages waiting to be handed over by a hook when its turn ends
+    stop_requested: false, // the human asked it to stop; the next hook tells it
     cloud_id: null, // the vendor's id for a cloud session
     url: null, // where to open it in the vendor's own UI
     activity: null, // what a cloud session says it is doing right now
@@ -223,7 +225,7 @@ export function summarizeToolInput(tool, input) {
 }
 
 export function reduce(prev, ev) {
-  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), auto_allow: [...prev.auto_allow], files: [...prev.files], checks: [...prev.checks], viewed: { ...prev.viewed } } : blank(ev);
+  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), queued: [...prev.queued], auto_allow: [...prev.auto_allow], files: [...prev.files], checks: [...prev.checks], viewed: { ...prev.viewed } } : blank(ev);
   const d = ev.data || {};
   const ts = ev.ts;
   s.last_event_ts = ts;
@@ -388,6 +390,7 @@ export function reduce(prev, ev) {
       s.subagents = 0;
       s.background = 0;
       s.requests = [];
+      s.stop_requested = false;
       // Keep unreviewed results and failures visible after the process exits.
       if (s.phase !== 'review' && s.phase !== 'failed') enter(s, 'ended', ts);
       s.exited = true;
@@ -524,6 +527,27 @@ export function reduce(prev, ev) {
       s.triage = { for: d.for, summary: clip(d.summary, 240), suggestion: d.suggestion || 'none', ts };
       break;
 
+    case 'reply.queued':
+      if (s.queued.length < 10) s.queued.push({ text: clip(d.text, 2000), ts });
+      break;
+
+    case 'reply.delivered':
+      s.queued = [];
+      s.outgoing = null;
+      break;
+
+    case 'human.stop_requested':
+      s.stop_requested = true;
+      break;
+
+    case 'human.stopped':
+      // The agent has been told to stop. The human did it, so it is not news to them.
+      s.stop_requested = false;
+      s.requests = [];
+      s.queued = [];
+      enter(s, 'idle', ts);
+      break;
+
     case 'reply.sent':
       s.outgoing = { text: clip(d.text, 600), via: d.via, ts };
       break;
@@ -590,7 +614,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone', 'reply.queued', 'reply.delivered'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.last_work_ts = ts;
     if (ev.type !== 'heartbeat' && ev.type !== 'notification') s.hooked = true;

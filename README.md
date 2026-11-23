@@ -257,6 +257,15 @@ How the hub knows a session is in the cloud: inside a cloud container Claude Cod
 
 ![Cloud sessions on the board](docs/cloud.png)
 
+**What hooks let you control (not only observe).** A hook is a question and an answer, so the answer can carry your decision:
+
+- **Approve or deny permissions, answer multiple-choice questions**: the request waits on the board and your decision goes back on the same connection. Batch approval and standing rules apply too.
+- **Leave a message for a session that is mid-turn**: when its turn ends, the hook hands it what you queued and it carries on. No tmux needed; works for cloud and local sessions.
+- **Stop it**: it is told to stop at its next step; if it is blocked on a permission request, that request is denied at the same time.
+- An idle session fires no hooks and cannot be woken this way: cloud sessions use the CLI's `--cloud` instead, local ones tmux or a headless resume.
+
+The message hand-over and the stop were verified with real Claude Code 2.1.330 sessions: the queued message was acted on and became the final reply; a session meant to run five commands in a row was stopped during the first, ended four seconds later and had started only one. Neither is implemented for Codex.
+
 **2. One cloud session reports the whole list (coarse, costs a turn).** A cloud session has a built-in tool that lists every cloud session of your account with its state, what it is doing, whether you have read it, and its parent. `node bin/session-board.js cloud-reporter` prints what to tell a session (or a scheduled task) so it posts that list to the hub; with `--local` it goes over Remote Control instead and is posted on your own computer to the local hub, exposing nothing. This also covers repositories without hooks. Sessions known only this way show their state, not what exactly they are waiting for; children are grouped under the session that started them.
 
 What was verified, and what was not:

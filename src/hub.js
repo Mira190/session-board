@@ -135,6 +135,9 @@ export function createHub({
   const promptOpen = (s) => s.requests.some((r) => r.kind === 'permission' || r.kind === 'question');
   const replyRoute = (s) => {
     // A Claude cloud session takes messages through the CLI's own --cloud.
+    // A cloud session that is mid-turn takes a message through its own hooks;
+    // an idle one through the CLI's --cloud.
+    if (s.runtime === 'cloud' && s.agent === 'claude' && hookRoute(s)) return 'hook';
     if (s.runtime === 'cloud' && s.agent === 'claude' && s.cloud_id) return 'cloud';
     if (!isLocal(s)) return null;
     // Codex has an official way to hand a message to an existing session
@@ -142,8 +145,11 @@ export function createHub({
     if (s.agent === 'codex' && !s.imported) return 'queue';
     if (s.tmux?.pane) return promptOpen(s) ? null : 'tmux';
     if (s.exited || s.imported) return 'headless';
-    return null;
+    return hookRoute(s);
   };
+  // No terminal to type into, but its hooks talk to us: a message can wait for
+  // the end of its current turn and be handed over then.
+  const hookRoute = (s) => (s.agent === 'claude' && s.hooked && !s.exited && (s.state === 'working' || s.state === 'needs_input') ? 'hook' : null);
 
   // How an open request can still be answered: 'live' (its hook is waiting on
   // us), 'message' (only by sending the session a message), or 'terminal'
@@ -166,7 +172,9 @@ export function createHub({
     unseen: ATTENTION.has(s.state) && s.since > s.seen_ts,
     snoozed: !!s.snoozed_until && now() < s.snoozed_until,
     // A reply that the agent has not confirmed receiving.
-    undelivered: !!s.outgoing && now() - s.outgoing.ts > UNDELIVERED_MS,
+    undelivered: !!s.outgoing && s.outgoing.via !== 'hook' && now() - s.outgoing.ts > UNDELIVERED_MS,
+    // Stopping works through hooks, so only for sessions that have them and are doing something.
+    can_stop: s.agent === 'claude' && s.hooked && !s.exited && (s.state === 'working' || s.state === 'needs_input'),
     // Which task this belongs to, when it shares one with other sessions.
     task: tasks.get(s.key)?.size > 1 ? { id: tasks.get(s.key).id, size: tasks.get(s.key).size, why: tasks.get(s.key).why } : null,
     context_pct: contextPct.get(s.key) ?? null,
@@ -571,6 +579,10 @@ export function createHub({
       }
       return done({ via: 'tmux' });
     }
+    if (route === 'hook') {
+      emit(s, 'reply.queued', { text });
+      return done({ via: 'hook' });
+    }
     if (route === 'cloud') {
       const out = await new Promise((resolve) => execFile('claude', ['-p', text, '--cloud', `https://claude.ai/code/session_${s.cloud_id}`],
         { timeout: 60_000 }, (err, stdout, stderr) => resolve({ err, text: `${stdout || ''}${stderr || ''}`.trim() })));
@@ -967,6 +979,21 @@ export function createHub({
         return holdPermission(req, res, events[0], payload.tool_input);
       }
       const s = ingest(events);
+      // Hooks are a two-way street. The answer to one can tell the agent to
+      // stop, or, when its turn has just ended, hand it what the human
+      // queued so that it carries on. (Claude Code; verified on 2.1.330.)
+      if (s && hook[1] === 'claude') {
+        if (s.stop_requested) {
+          emit(s, 'human.stopped');
+          return json(res, 200, { continue: false, stopReason: 'Stopped from session-board by the user.' });
+        }
+        if (payload.hook_event_name === 'Stop' && s.queued.length) {
+          const text = s.queued.map((m) => m.text).join('\n\n');
+          emit(s, 'reply.delivered');
+          emit(store.get(s.key), 'prompt.submitted', { prompt: text, via: 'board' });
+          return json(res, 200, { decision: 'block', reason: text });
+        }
+      }
       // Shell commands in a shared folder: look before the command runs (the
       // hook's answer waits for that, a few tens of milliseconds) and after.
       const shell = s && payload.tool_use_id && ['Bash', 'shell', 'local_shell', 'exec_command'].includes(payload.tool_name);
@@ -1160,7 +1187,7 @@ export function createHub({
         : json(res, 410, { error: 'this request is no longer waiting on the board' });
     }
 
-    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail|task|rename|viewed)$/);
+    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail|task|rename|viewed|stop)$/);
     if (act) {
       const key = decodeURIComponent(act[1]);
       const s = store.get(key);
@@ -1184,6 +1211,12 @@ export function createHub({
           const { tool, allow } = await body();
           if (typeof tool !== 'string') return json(res, 400, { error: 'tool required' });
           emit(s, allow === false ? 'rule.removed' : 'rule.added', { tool });
+          return json(res, 200, view(store.get(key)));
+        }
+        if (verb === 'stop') {
+          emit(s, 'human.stop_requested');
+          // A request it is blocked on would keep it from ever reaching its next hook.
+          for (const r of store.get(key).requests) if (r.id && held.has(r.id)) decide(r.id, 'deny', { message: 'Stopped from session-board by the user.' });
           return json(res, 200, view(store.get(key)));
         }
         if (verb === 'rename') {

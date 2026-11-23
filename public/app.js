@@ -879,6 +879,7 @@ function replyBox(s) {
     el('div', { className: 'actions' },
       el('button', { className: 'primary', textContent: t('Send'), onclick: () => send(s) }),
       el('span', { className: 'note', textContent: (s.reply === 'tmux' ? t('Goes straight into its tmux window.')
+        : s.reply === 'hook' ? t('It is mid-turn: this is handed to it when the turn ends, and it carries on from there.')
         : s.reply === 'cloud' ? t('Sent to the cloud session through the Claude Code CLI on this machine.')
         : s.reply === 'queue' ? t('Queued for the session through Codex’s own message queue.')
           : t('Its process has exited: this resumes the same session for another round in the background.')) + t(' Ctrl/⌘ + Enter to send') }),
@@ -1042,6 +1043,13 @@ function nowBlock(s, d) {
       el('button', { textContent: t('Mark unread'), title: t('Keep it in the queue, look again later'), onclick: () => markUnread(s) }),
     );
   }
+  if (s.can_stop) {
+    actions.append(el('button', {
+      className: 'danger', textContent: s.stop_requested ? t('Stopping…') : t('Stop it'), disabled: !!s.stop_requested,
+      title: t('Tells it to stop at its next step. What it has already done stays done.'),
+      onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/stop`, {}).catch((e) => say(s.key, e.message)),
+    }));
+  }
   if (s.snoozed) actions.append(el('button', { className: 'primary', textContent: t('Handle now'), onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/unsnooze`, {}).catch((e) => say(s.key, e.message)) }));
   if (s.quiet) kids.push(el('div', { className: 'warn', textContent: t('No activity for {age}: the process is still there; it may be on a long task or stuck.', { age: age(s.last_event_ts) }) }));
   if (s.requests.length > 1) kids.push(el('div', { className: 'note', textContent: t('{n} more requests are queued behind this one.', { n: s.requests.length - 1 }) }));
@@ -1105,7 +1113,8 @@ function renderBench() {
 
     el('h3', { textContent: t('Reply') }),
     s.outgoing && el('div', { className: s.undelivered ? 'warn' : 'note' },
-      s.undelivered
+      s.outgoing.via === 'hook' ? t('Waiting for its turn to end, then it gets:')
+      : s.undelivered
         ? t('The message you sent has not been received yet ({why}):', { why: s.outgoing.via === 'tmux' ? t('its terminal may be stopped on another prompt, take a look') : t('the background process may not have started') })
         : t('Sent, waiting for it to receive:'),
       el('span', { className: 'prose', textContent: ` ${s.outgoing.text}` })),

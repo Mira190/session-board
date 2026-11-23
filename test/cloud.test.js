@@ -30,7 +30,7 @@ test('the same hooks report a session as cloud when they run in a cloud containe
   await post('/ingest/claude?host=x&only=cloud', { session_id: 'u3', hook_event_name: 'UserPromptSubmit', prompt: 'project hooks, run locally' }, { 'x-cloud-session': '' });
   const r = await rows();
   assert.deepEqual([r['in the cloud container'].runtime, r['in the cloud container'].host, r['in the cloud container'].url, r['in the cloud container'].reply],
-    ['cloud', 'claude-cloud', 'https://claude.ai/code/session_01ABCDEFGH23', 'cloud']);
+    ['cloud', 'claude-cloud', 'https://claude.ai/code/session_01ABCDEFGH23', 'hook'], 'mid-turn, so reachable through its own hooks');
   assert.deepEqual([r['on the laptop itself'].runtime, r['on the laptop itself'].cloud_id], ['local', null]);
   assert.equal(r['project hooks, run locally'], undefined);
   await hub.close();
@@ -243,4 +243,50 @@ test('extra repositories: a watch list, and the ones pushed to lately according 
   await lately();
   assert.equal(calls, 1, 'asked at most every ten minutes');
   assert.deepEqual(await recentRepos({ exec: async () => null })(), [], 'no gh, no login: nothing, quietly');
+});
+
+test('control through hooks: a queued message is handed over at turn end, and a stop is delivered on the next hook, also through the drop box', async () => {
+  const hub = createHub({ localHost: 'laptop' });
+  const main = await hub.listen(0, '127.0.0.1');
+  const drop = await hub.listenDropBox(0, '127.0.0.1', 'a-long-drop-box-token');
+  const M = `http://127.0.0.1:${main.port}`;
+  // The session is a cloud one: everything it sends comes in through the drop box.
+  const hook = async (body) => (await fetch(`http://127.0.0.1:${drop.port}/ingest/claude`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer a-long-drop-box-token', 'x-cloud-session': 'cse_01CONTROL00001' },
+    body: JSON.stringify({ session_id: 'c', ...body }) })).json();
+  const board = (path, body) => fetch(M + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const row = async () => (await (await fetch(M + '/api/sessions')).json()).sessions[0];
+  const key = encodeURIComponent('claude:c');
+
+  assert.deepEqual(await hook({ hook_event_name: 'UserPromptSubmit', prompt: 'build the thing' }), {});
+  assert.deepEqual([(await row()).reply, (await row()).can_stop], ['hook', true], 'mid-turn: reachable through its own hooks');
+  assert.deepEqual(await (await board(`/api/sessions/${key}/message`, { text: 'also add tests' })).json(), { via: 'hook' });
+  await board(`/api/sessions/${key}/message`, { text: 'and update the docs' });
+  assert.deepEqual(await hook({ hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: 't1' }), {}, 'nothing is said in the middle of a turn');
+  assert.equal((await row()).undelivered, false, 'a queued message is not "undelivered"');
+  // The turn ends: instead of stopping, the agent is given what was queued.
+  assert.deepEqual(await hook({ hook_event_name: 'Stop', last_assistant_message: 'built' }), { decision: 'block', reason: 'also add tests\n\nand update the docs' });
+  let s = await row();
+  assert.deepEqual([s.state, s.turns, s.queued.length, s.outgoing, s.last_prompt], ['working', 2, 0, null, 'also add tests\n\nand update the docs']);
+  assert.deepEqual(await hook({ hook_event_name: 'Stop', last_assistant_message: 'tests and docs done' }), {}, 'nothing queued: it stops as usual');
+  assert.equal((await row()).state, 'review');
+  // Once it is idle, hooks cannot wake it: the route changes to the CLI's --cloud.
+  assert.deepEqual([(await row()).reply, (await row()).can_stop], ['cloud', false]);
+
+  // Stop: the next thing it does is answered with "stop", once.
+  await hook({ hook_event_name: 'UserPromptSubmit', prompt: 'now refactor everything' });
+  await board(`/api/sessions/${key}/message`, { text: 'never mind' });
+  await board(`/api/sessions/${key}/stop`);
+  assert.equal((await row()).stop_requested, true);
+  assert.deepEqual(await hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: 't2', tool_input: { command: 'make' } }), { continue: false, stopReason: 'Stopped from session-board by the user.' });
+  s = await row();
+  assert.deepEqual([s.state, s.stop_requested, s.queued.length, s.unseen], ['idle', false, 0, false], 'stopped by you: not something to tell you about');
+  assert.deepEqual(await hook({ hook_event_name: 'UserPromptSubmit', prompt: 'carry on' }), {}, 'the stop was for that moment only');
+
+  // Stopping a session that is blocked on a request also answers the request, or it would never reach its next hook.
+  const asked = hook({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'deploy' } });
+  for (let i = 0; i < 200 && !(await row()).waiting?.decidable; i++) await new Promise((r) => setTimeout(r, 10));
+  await board(`/api/sessions/${key}/stop`);
+  assert.equal((await asked).hookSpecificOutput.decision.behavior, 'deny');
+  await hub.close();
 });

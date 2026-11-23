@@ -22,6 +22,13 @@ export const setLangPref = (v) => store.set(LANGS.includes(v) ? v : 'auto');
 export const lang = () => (langPref() === 'auto' ? systemLang() : langPref());
 
 const ZH = {
+  // ---- control through hooks
+  'It is mid-turn: this is handed to it when the turn ends, and it carries on from there.': '它这一轮还没结束：这条消息会在这一轮结束时交给它，它会接着做。',
+  'Waiting for its turn to end, then it gets:': '等它这一轮结束后交给它：',
+  'Stopping…': '正在叫停…',
+  'Stop it': '让它停下',
+  'Tells it to stop at its next step. What it has already done stays done.': '在它的下一步动作时叫停。已经做完的不会撤销。',
+
   'Its branch is the repository’s default branch, so there is nothing to compare it against.': '它的分支就是仓库的默认分支，没有可以比较的基线。',
 
   // ---- cloud branches
