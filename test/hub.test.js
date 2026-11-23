@@ -128,7 +128,7 @@ test('permission requests are answered from the board, by rule, or handed back',
   assert.equal((await post(`/api/requests/${id}`, { decision: 'allow', remember: true })).status, 200);
   assert.equal((await (await pending).json()).hookSpecificOutput.decision.behavior, 'allow');
   assert.equal((await post(`/api/requests/${id}`, { decision: 'allow' })).status, 410, 'cannot answer twice');
-  assert.deepEqual((await current()).auto_allow, ['Bash']);
+  assert.deepEqual(hub.store.get('claude:p').auto_allow, ['Bash']);
 
   // "Allow for this session" now answers without asking.
   assert.equal((await (await ask('Bash', 'git status')).json()).hookSpecificOutput.decision.behavior, 'allow');
@@ -217,7 +217,16 @@ test('backfill imports history once; replies go by tmux or headless or not at al
   const key = encodeURIComponent(s.key);
   assert.deepEqual(await (await post(`/api/sessions/${key}/message`, { text: 'also add /readyz' })).json(), { via: 'headless' });
   assert.deepEqual(launched, [['claude', ['-p', 'also add /readyz', '--resume', 'sess-1'], dir]]);
-  assert.equal(hub.store.get(s.key).state, 'working');
+  // Sent is not delivered: the state moves only when the agent's own hook reports the prompt.
+  assert.equal(hub.store.get(s.key).state, 'ended');
+  assert.equal(hub.store.get(s.key).outgoing.text, 'also add /readyz');
+  const again = await (await post(`/api/sessions/${key}/message`, { text: 'also add /readyz', command_id: 'c1' })).json();
+  assert.deepEqual(await (await post(`/api/sessions/${key}/message`, { text: 'also add /readyz', command_id: 'c1' })).json(), again);
+  assert.equal(launched.length, 2, 'a retried command is not sent twice');
+  await post('/ingest/claude?host=laptop', { session_id: 'sess-1', hook_event_name: 'UserPromptSubmit', prompt: 'something typed in the terminal' });
+  assert.ok(hub.store.get(s.key).outgoing, 'a different prompt does not confirm ours');
+  await post('/ingest/claude?host=laptop', { session_id: 'sess-1', hook_event_name: 'UserPromptSubmit', prompt: 'also add /readyz' });
+  assert.deepEqual([hub.store.get(s.key).state, hub.store.get(s.key).outgoing], ['working', null]);
 
   await post('/ingest/claude?host=laptop', { session_id: 'live', cwd: dir, hook_event_name: 'Stop' });
   const live = await post(`/api/sessions/${encodeURIComponent('claude:live')}/message`, { text: 'hi' });

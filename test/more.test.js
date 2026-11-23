@@ -32,7 +32,8 @@ test('an event that names itself is applied once, even across a restart', async 
   let s = (await get('/api/sessions')).sessions[0];
   assert.equal(s.turns, 1, 'a re-delivered prompt is not a second turn');
   assert.equal(s.subagents, 1);
-  assert.deepEqual(s.files, ['/w/a.js']);
+  assert.equal(s.files_count, 1);
+  assert.deepEqual(hub.store.get('claude:d').files, ['/w/a.js']);
   assert.equal((await get(`/api/sessions/${encodeURIComponent('claude:d')}/events`)).length, 3);
   await hub.close();
   ({ hub, post, get } = await start({ dbPath }));
@@ -213,5 +214,119 @@ test('one decision for the same request in many sessions; standing rules; drasti
   const [id] = await held(1);
   await post(`/api/requests/${id}`, { decision: 'deny' });
   assert.equal((await (await waits).json()).hookSpecificOutput.decision.behavior, 'deny');
+  await hub.close();
+});
+
+test('filing is separate from state: seen, snooze that wakes early, and undo', async () => {
+  let t = 1_000_000;
+  const { hub, post, get } = await start({ now: () => t });
+  const hook = (name, extra = {}) => post('/ingest/claude', { session_id: 'f', hook_event_name: name, ...extra });
+  const key = encodeURIComponent('claude:f');
+  const row = async () => (await get('/api/sessions')).sessions.find((s) => s.session_id === 'f');
+  const queue = async () => (await get('/api/sessions')).queue;
+
+  await hook('UserPromptSubmit', { prompt: 'go' });
+  t += 1000; await hook('Stop', { last_assistant_message: 'done' });
+  assert.equal((await row()).unseen, true);
+  t += 1000; await post(`/api/sessions/${key}/seen`, {});
+  assert.deepEqual([(await row()).unseen, (await row()).state], [false, 'review'], 'looking at it is not accepting it');
+  await post(`/api/sessions/${key}/unseen`, {});
+  assert.equal((await row()).unseen, true, 'mark unread');
+
+  // Snooze takes it out of the queue until the time, or until it needs you sooner.
+  await post(`/api/sessions/${key}/snooze`, { minutes: 60 });
+  assert.deepEqual([await queue(), (await row()).snoozed, (await row()).state], [[], true, 'review']);
+  t += 61 * 60_000;
+  assert.deepEqual([await queue(), (await row()).snoozed], [['claude:f'], false], 'back when the time is up');
+  await post(`/api/sessions/${key}/snooze`, { minutes: 60 });
+  t += 1000; await hook('StopFailure', { error: 'server_error' });
+  assert.deepEqual([await queue(), (await row()).snoozed], [['claude:f'], false], 'a failure wakes it early');
+  await post(`/api/sessions/${key}/snooze`, { minutes: 60 });
+  await post(`/api/sessions/${key}/unsnooze`, {});
+  assert.equal((await row()).snoozed, false);
+
+  // Every filing action has its reverse.
+  await post(`/api/sessions/${key}/ack`, {});
+  assert.equal((await row()).state, 'idle');
+  await post(`/api/sessions/${key}/unack`, {});
+  assert.deepEqual([(await row()).state, (await row()).error], ['failed', 'server_error'], 'undo restores what was acknowledged');
+  await post(`/api/sessions/${key}/archive`, {});
+  assert.equal(await row(), undefined);
+  await post(`/api/sessions/${key}/unarchive`, {});
+  assert.equal((await row()).state, 'failed');
+  await hub.close();
+});
+
+test('a board row stays small; the open session gets the full detail; requests say how they can be answered', async () => {
+  const { hub, post, get } = await start({ localHost: 'laptop' });
+  const long = 'x'.repeat(5000);
+  const hook = (name, extra = {}) => post('/ingest/claude?host=laptop', { session_id: 'r', cwd: '/nowhere', hook_event_name: name, ...extra });
+  await hook('UserPromptSubmit', { prompt: long });
+  for (let i = 0; i < 300; i++) await hook('PreToolUse', { tool_name: 'Edit', tool_use_id: `e${i}`, tool_input: { file_path: `/nowhere/src/deeply/nested/module-${i}/index.ts` } });
+  await hook('Stop', { last_assistant_message: long });
+  const row = (await get('/api/sessions')).sessions[0];
+  assert.ok(JSON.stringify(row).length < 2500, `row is ${JSON.stringify(row).length} bytes`);
+  assert.equal(row.files_count, 300);
+  assert.equal(row.files, undefined);
+  const detail = await get(`/api/sessions/${encodeURIComponent('claude:r')}/detail`);
+  assert.equal(detail.files.length, 300);
+  assert.equal(detail.last_message.length, 1200);
+
+  // Not held by us and no way to message it: only its own terminal can answer.
+  await post('/ingest/claude?host=laptop', { session_id: 'r', hook_event_name: 'Notification', notification_type: 'permission_prompt' });
+  assert.equal((await get('/api/sessions')).sessions[0].waiting.capability, 'terminal');
+  const asked = hook('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'ls' } });
+  const live = await until(async () => { const s = (await get('/api/sessions')).sessions[0]; return s.requests.find((r) => r.capability === 'live'); });
+  await post(`/api/requests/${live.id}`, { decision: 'allow' });
+  await asked;
+  await hub.close();
+});
+
+test('replay of a real recorded hook sequence (Claude Code 2.1.330, a question answered through the permission channel)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const lines = readFileSync(new URL('./fixtures/claude-2.1.330-askuserquestion.jsonl', import.meta.url), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const { hub, post, get } = await start({});
+  const row = async () => (await get('/api/sessions')).sessions[0];
+  const seen = [];
+  let asked;
+  for (const payload of lines) {
+    const sent = post('/ingest/claude', payload);
+    if (payload.hook_event_name === 'PermissionRequest') {
+      asked = sent; // held open, exactly as it was for the real session
+      await until(async () => (await row()).waiting?.decidable);
+    } else await sent;
+    const s = await row();
+    seen.push(`${payload.hook_event_name}:${s.state}${s.waiting ? `(${s.waiting.kind})` : ''}`);
+  }
+  assert.deepEqual(seen, [
+    'UserPromptSubmit:working',
+    'PreToolUse:needs_input(question)',
+    'PermissionRequest:needs_input(question)',
+    'Notification:needs_input(question)',
+    'PostToolUse:working',
+    'Stop:review',
+  ]);
+  assert.deepEqual(await (await asked).json(), {}, 'answered in the terminal: the board\'s hold is released with no opinion');
+  const s = await row();
+  assert.equal(s.turns, 1);
+  assert.equal(hub.store.get(s.key).requests.length, 0);
+  await hub.close();
+});
+
+test('the board will not type into a terminal that is showing a permission or question prompt', async () => {
+  const typed = [];
+  const { hub, post, get } = await start({ localHost: 'laptop' });
+  const hook = (name, extra = {}, q = '') => post(`/ingest/claude?host=laptop${q}`, { session_id: 't', cwd: '/nowhere', hook_event_name: name, ...extra });
+  await hook('SessionStart', { source: 'startup' }, '&tmux_socket=/tmp/sock&tmux_pane=%251');
+  const row = async () => (await get('/api/sessions')).sessions[0];
+  assert.equal((await row()).reply, 'tmux');
+  await hook('Notification', { notification_type: 'permission_prompt' });
+  assert.deepEqual([(await row()).reply, (await row()).reply_blocked], [null, true]);
+  const res = await post(`/api/sessions/${encodeURIComponent('claude:t')}/message`, { text: 'hello' });
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /would answer it/);
+  assert.equal(hub.store.get('claude:t').outgoing, null, 'nothing was recorded as sent');
+  await hook('PostToolUse', { tool_name: 'Bash' });
+  assert.deepEqual([(await row()).reply, (await row()).reply_blocked], ['tmux', false], 'typing is allowed again once the prompt is gone');
   await hub.close();
 });

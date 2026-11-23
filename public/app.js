@@ -49,14 +49,46 @@ function age(ts) {
 }
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 
-function column(s) {
+function rawColumn(s) {
+  if (s.snoozed) return 'rest'; // filed away until later, whatever its state
   if (s.state === 'needs_input' || s.state === 'failed' || s.state === 'unknown') return 'attention';
   if (s.state === 'review') return 'review';
   if (s.state === 'working') return 'working';
   return 'rest';
 }
 
+// A session that leaves the queue for "working" and comes straight back (one
+// request answered, the next one already open) should not jump around: the
+// move away is shown only once it has held for a moment.
+const HOLD_MS = 400;
+const placed = new Map(); // key -> { col, leaving }
+function column(s) {
+  const raw = rawColumn(s);
+  const p = placed.get(s.key);
+  const settledAway = !p || p.col === raw || raw !== 'working' || (p.col !== 'attention' && p.col !== 'review');
+  if (settledAway) {
+    placed.set(s.key, { col: raw, leaving: 0 });
+    return raw;
+  }
+  const t = performance.now();
+  if (!p.leaving) {
+    p.leaving = t;
+    setTimeout(render, HOLD_MS + 20);
+  }
+  if (t - p.leaving < HOLD_MS) return p.col;
+  placed.set(s.key, { col: raw, leaving: 0 });
+  return raw;
+}
+
 function describe(s) {
+  if (s.snoozed) {
+    const at = new Date(s.snoozed_until - skew).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    return { ...describeState(s), tone: 'rest', what: `稍后处理（到 ${at}）` };
+  }
+  return describeState(s);
+}
+
+function describeState(s) {
   switch (s.state) {
     case 'needs_input':
       if (s.waiting?.kind === 'pr') {
@@ -160,16 +192,33 @@ const answer = (s) => {
   if (Object.keys(answers).length < s.waiting.questions.length) return say(s.key, '每个问题都要选一个或填一个答案。');
   return act(s, () => call(`/api/requests/${s.waiting.id}`, { decision: 'answer', answers }));
 };
-const ack = (s) => act(s, () => call(`/api/sessions/${encodeURIComponent(s.key)}/ack`, {}));
-const archive = (s) => act(s, () => call(`/api/sessions/${encodeURIComponent(s.key)}/archive`, {}));
+// Every filing action can be taken back for a few seconds.
+let toastTimer = 0;
+function toast(text, undo) {
+  const box = $('#toast');
+  clearTimeout(toastTimer);
+  box.replaceChildren(text, ...(undo ? [el('button', { textContent: '撤销', onclick: async () => { box.hidden = true; await undo().catch(() => {}); } })] : []));
+  box.hidden = false;
+  toastTimer = setTimeout(() => { box.hidden = true; }, 5000);
+}
+const file = (s, verb, reverse, text, body = {}) => act(s, async () => {
+  const k = encodeURIComponent(s.key);
+  await call(`/api/sessions/${k}/${verb}`, body);
+  toast(text, () => call(`/api/sessions/${k}/${reverse}`, {}).then(() => select(s.key, true)));
+});
+const ack = (s) => file(s, 'ack', 'unack', s.state === 'review' ? '已验收。' : '已知悉。');
+const archive = (s) => file(s, 'archive', 'unarchive', '已归档。');
+const tomorrow = () => { const d = new Date(Date.now() + skew); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d.getTime(); };
+const snooze = (s, body, label) => file(s, 'snooze', 'unsnooze', `已推迟到${label}。期间它有新情况会提前回来。`, body);
+const markUnread = (s) => call(`/api/sessions/${encodeURIComponent(s.key)}/unseen`, {}).then(() => { reading = null; advance(s.key); }).catch((e) => say(s.key, e.message));
 
 async function send(s) {
   const text = (drafts.get(s.key) || '').trim();
   if (!text) return;
   try {
-    const out = await call(`/api/sessions/${encodeURIComponent(s.key)}/message`, { text });
+    // The id makes a retry or double click harmless.
+    await call(`/api/sessions/${encodeURIComponent(s.key)}/message`, { text, command_id: crypto.randomUUID() });
     drafts.delete(s.key);
-    say(s.key, out.via === 'tmux' ? '已打进它的 tmux 窗口。' : '已在后台接着这个会话再跑一轮。');
     advance(s.key);
   } catch (err) {
     say(s.key, err.message);
@@ -195,7 +244,7 @@ const GROUPS = [
   ['working', '工作中', '不需要你，除非它安静太久。'],
   ['rest', '空闲 / 已结束', '等你派下一件事，或已退出。'],
 ];
-const MANY = 30; // past this many sessions, quiet groups start folded
+const MANY = 12; // past this many sessions, the working group starts folded
 
 let filter = '';
 const repoOf = (s) => s.repo || (s.cwd || '').split('/').pop() || '(未知项目)';
@@ -205,7 +254,8 @@ const visible = () => (filter ? snap.sessions.filter(matches) : snap.sessions);
 const folded = (name) => {
   const saved = prefs.get(`fold:${name}`);
   if (saved) return saved === '1';
-  return (name === 'working' || name === 'rest') && snap.sessions.length > MANY;
+  // The list is an inbox: what needs nothing from you stays out of the way.
+  return name === 'rest' || (name === 'working' && snap.sessions.length > MANY);
 };
 
 // Move/insert only what differs, so focus and scroll survive live updates.
@@ -240,6 +290,7 @@ const cardSig = (s) => JSON.stringify([
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
+  s.unseen, s.snoozed && s.snoozed_until, column(s),
 ]);
 
 function card(s) {
@@ -254,7 +305,7 @@ function card(s) {
       s.runtime === 'cloud' && el('span', { textContent: '云端' }),
       s.subagents > 0 && el('span', { textContent: `${s.subagents} 个子 agent` }),
     ),
-    el('div', { className: 'title', textContent: s.title || '(还没有任务描述)' }),
+    el('div', { className: 'title' }, s.unseen && el('span', { className: 'dot', title: '还没看过' }), s.title || '(还没有任务描述)'),
     el('div', { className: 'status' },
       el('span', { className: 'what', textContent: d.what + (s.requests.length > 1 ? `（共 ${s.requests.length} 个请求）` : '') }),
       ageSpan(s, d),
@@ -573,6 +624,7 @@ function diffView(diff) {
 
 function replyBox(s) {
   if (!s.reply) {
+    if (s.reply_blocked) return el('p', { className: 'note', textContent: '它的终端正停在上面那个请求上：现在往里打字会被当成对那个请求的回答，所以先处理请求，再回复。' });
     if (s.runtime === 'cloud' || !s.local) return el('p', { className: 'note', textContent: '这个会话不在本机上，只能在它自己的界面里回复。' });
     return el('div', {},
       el('p', { className: 'note', textContent: '它开在一个看板没法输入的终端里（不是 tmux）。在 tmux 里启动的会话可以直接从这里回复。' }),
@@ -664,6 +716,16 @@ function nowBlock(s, d) {
   } else if (column(s) === 'rest') {
     actions.append(el('button', { textContent: '归档', onclick: () => archive(s) }));
   }
+  // Not now: out of the queue until later, back early if it needs you.
+  const deferrable = !s.snoozed && (s.state === 'review' || s.state === 'failed' || s.state === 'unknown' || s.waiting?.kind === 'pr');
+  if (deferrable) {
+    actions.append(
+      el('button', { textContent: '1 小时后再说', onclick: () => snooze(s, { minutes: 60 }, ' 1 小时后') }),
+      el('button', { textContent: '明早再说', onclick: () => snooze(s, { until: tomorrow() }, '明早 9 点') }),
+      el('button', { textContent: '标为未读', title: '保持在队列里，稍后再看', onclick: () => markUnread(s) }),
+    );
+  }
+  if (s.snoozed) actions.append(el('button', { className: 'primary', textContent: '现在处理', onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/unsnooze`, {}).catch((e) => say(s.key, e.message)) }));
   if (s.quiet) kids.push(el('div', { className: 'warn', textContent: `${age(s.last_event_ts)} 没有任何动静：进程还在，可能在跑长任务，也可能卡住了。` }));
   if (s.requests.length > 1) kids.push(el('div', { className: 'note', textContent: `后面还有 ${s.requests.length - 1} 个请求在排队。` }));
   if (actions.childNodes.length) kids.push(actions);
@@ -672,7 +734,7 @@ function nowBlock(s, d) {
 
 function renderBench() {
   const bench = $('#bench');
-  const s = byKey(selected);
+  let s = byKey(selected);
   if (!s) {
     bench.replaceChildren(el('div', { className: 'blank' },
       el('b', { textContent: snap.sessions.length ? '没有人在等你' : '还没有会话' }),
@@ -680,13 +742,18 @@ function renderBench() {
         : '启动任意一个 Claude Code 或 Codex 会话，它会自动出现在这里。'));
     return;
   }
+  const row = s;
+  const more = extra.get(row.key) || {};
+  // The row carries clipped text; the detail request brings the rest.
+  const detail = more.full || {};
+  s = { ...row, files: detail.files || [], auto_allow: detail.auto_allow || [],
+    last_prompt: detail.last_prompt ?? row.last_prompt, last_message: detail.last_message ?? row.last_message };
   const d = describe(s);
-  const more = extra.get(s.key) || {};
   // Typing must survive live re-renders.
   const active = document.activeElement;
   const typing = active?.id && active.matches('input[type="text"], textarea')
     ? { id: active.id, start: active.selectionStart, end: active.selectionEnd } : null;
-  const scope = scopes.get(s.key) || (s.files.length ? 'session' : 'all');
+  const scope = scopes.get(s.key) || (s.files_count ? 'session' : 'all');
 
   const diff = more.diff;
   const changed = diff?.available && (diff.status || diff.diff);
@@ -710,7 +777,7 @@ function renderBench() {
     diff?.available && el('h3', {}, diff.scope === 'session'
       ? `这个会话改过的 ${diff.attributed} 个文件（相对上一次提交；它用命令行改的不在内）`
       : '整个工作区的改动（相对上一次提交，不只是这个会话改的）'),
-    diff?.available && s.files.length > 0 && el('div', { className: 'actions', style: 'margin-top:0' },
+    diff?.available && s.files_count > 0 && el('div', { className: 'actions', style: 'margin-top:0' },
       el('button', { textContent: scope === 'session' ? '看整个工作区' : '只看这个会话改的', onclick: () => { scopes.set(s.key, scope === 'session' ? 'all' : 'session'); render(); } })),
     diff?.available && !changed && el('p', { className: 'note', textContent: '没有未提交的改动。' }),
     changed && el('div', { className: 'box code', textContent: [diff.stat, diff.status].filter(Boolean).join('\n\n') }),
@@ -718,6 +785,11 @@ function renderBench() {
       el('summary', { textContent: diff.truncated ? '完整 diff（太长，已截断）' : '完整 diff' }), diffView(diff.diff)),
 
     el('h3', { textContent: '回复' }),
+    s.outgoing && el('div', { className: s.undelivered ? 'warn' : 'note' },
+      s.undelivered
+        ? `发出的消息还没被它接收（${s.outgoing.via === 'tmux' ? '终端可能停在别的提示上，去看一眼' : '后台进程可能没启动起来'}）：`
+        : '已发送，等它接收：',
+      el('span', { className: 'prose', textContent: ` ${s.outgoing.text}` })),
     replyBox(s),
 
     s.auto_allow.length > 0 && el('h3', { textContent: '这个会话里自动允许的工具' }),
@@ -745,19 +817,34 @@ function renderBench() {
 // Diff and event history are fetched when a session is opened and again
 // whenever it changes state.
 async function loadExtra(s) {
-  const scope = scopes.get(s.key) || (s.files.length ? 'session' : 'all');
+  const scope = scopes.get(s.key) || (s.files_count ? 'session' : 'all');
   const sig = `${s.state}:${s.last_event_ts}:${scope}`;
   const have = extra.get(s.key);
   if (have?.sig === sig) return;
   extra.set(s.key, { ...have, sig });
   const key = encodeURIComponent(s.key);
-  const [diff, events] = await Promise.all([
+  const [diff, events, full] = await Promise.all([
     call(`/api/sessions/${key}/diff?scope=${scope}`).catch(() => null),
     call(`/api/sessions/${key}/events`).catch(() => null),
+    call(`/api/sessions/${key}/detail`).catch(() => null),
   ]);
-  extra.set(s.key, { sig, diff, events });
+  extra.set(s.key, { sig, diff, events, full });
   if (selected === s.key) render();
 }
+
+// Looking at a session marks it seen (stored by the hub, so every device
+// agrees), but only after a moment and only while the page is in view.
+let reading = null;
+function noteReading() {
+  const s = byKey(selected);
+  const want = s?.unseen && !document.hidden && $('#app').dataset.view !== 'board' ? s.key : null;
+  if (reading?.key === want) return;
+  clearTimeout(reading?.timer);
+  reading = want && { key: want, timer: setTimeout(() => {
+    if (selected === want && !document.hidden) call(`/api/sessions/${encodeURIComponent(want)}/seen`, {}).catch(() => {});
+  }, 1500) };
+}
+document.addEventListener('visibilitychange', () => noteReading());
 
 function select(key, byHuman) {
   selected = key;
@@ -789,9 +876,10 @@ function paint() {
   const s = byKey(selected);
   // The workbench is rebuilt only when what it shows has changed.
   const more = extra.get(selected) || {};
-  const benchSig = JSON.stringify([s, more.sig, !!more.diff, !!more.events, notice, scopes.get(selected), snap.sessions.length > 0]);
+  const benchSig = JSON.stringify([s, more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
   if (benchSig !== paint.bench) { paint.bench = benchSig; renderBench(); }
   if (s) loadExtra(s);
+  noteReading();
 
   const count = { attention: 0, review: 0, working: 0 };
   for (const x of snap.sessions) if (column(x) in count) count[column(x)] += 1;

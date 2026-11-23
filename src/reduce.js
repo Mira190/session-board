@@ -38,6 +38,12 @@ function blank(ev) {
     start_head: null, // commit the working tree was on when first seen
     settled: null, // why the hub closed a review on its own ('merged')
     pr_alert: null, // the PR problem already raised, so it is raised once
+    // Filing is kept apart from state: these record what the human did with
+    // the session, not what the agent is doing.
+    seen_ts: 0, // when the human last looked at it
+    snoozed_until: null, // out of the queue until then, unless it needs them sooner
+    acked: null, // { phase, since } before the last acknowledgement, for undo
+    outgoing: null, // { text, via, ts } a reply sent from the board, not yet confirmed received
     pr: null, // { number, url, title, state: open|merged|closed, draft, checks, review, base, head_sha }
     github: null, // "owner/repo", when a sender tells us (cloud sessions)
     tmux: null, // { socket, pane } when the agent runs inside tmux
@@ -202,11 +208,10 @@ export function reduce(prev, ev) {
       break;
 
     case 'prompt.submitted': {
-      // A message sent from the board is recorded at once, and then reported
-      // again by the agent's own hook when it picks it up: one turn, not two.
-      const echo = s.board_prompt && !d.via && clip(d.prompt, 600) === s.last_prompt;
-      s.board_prompt = d.via === 'board';
-      if (!echo) s.turns += 1;
+      // "Sent" is not "received": a reply from the board counts as delivered
+      // only when the agent's own hook reports that very prompt.
+      if (s.outgoing && clip(d.prompt, 600) === s.outgoing.text) s.outgoing = null;
+      s.turns += 1;
       s.last_prompt = clip(d.prompt, 600);
       if (!s.title && d.prompt) s.title = clip(String(d.prompt).split('\n')[0], 120);
       s.background = 0;
@@ -328,11 +333,47 @@ export function reduce(prev, ev) {
     case 'human.acknowledged':
       // Dismissing a PR alert is its own act: the work itself stays in review.
       if (s.requests.some((r) => r.kind === 'pr')) s.requests = s.requests.filter((r) => r.kind !== 'pr');
-      else if (['review', 'failed', 'unknown'].includes(s.phase)) enter(s, s.exited ? 'ended' : 'idle', ts);
+      else if (['review', 'failed', 'unknown'].includes(s.phase)) {
+        s.acked = { phase: s.phase, since: s.phase_since, error: s.error };
+        enter(s, s.exited ? 'ended' : 'idle', ts);
+      }
+      break;
+
+    case 'human.unacknowledged': // undo
+      if (s.acked && (s.phase === 'idle' || s.phase === 'ended')) {
+        s.phase = s.acked.phase;
+        s.phase_since = s.acked.since;
+        s.error = s.acked.error;
+        s.acked = null;
+      }
       break;
 
     case 'human.archived':
       s.archived = true;
+      break;
+
+    case 'human.unarchived':
+      s.archived = false;
+      break;
+
+    case 'human.seen':
+      s.seen_ts = ts;
+      break;
+
+    case 'human.unseen':
+      s.seen_ts = 0;
+      break;
+
+    case 'human.snoozed':
+      s.snoozed_until = Number(d.until) || null;
+      break;
+
+    case 'human.unsnoozed':
+      s.snoozed_until = null;
+      break;
+
+    case 'reply.sent':
+      s.outgoing = { text: clip(d.text, 600), via: d.via, ts };
       break;
 
     case 'session.settled':
@@ -378,20 +419,26 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.exited = false;
     s.imported = false;
   }
   if (s.phase !== 'failed') s.rate_limited = false;
-  return derive(s);
+  derive(s);
+  // Snoozing covers what was on the table when the human snoozed. Anything
+  // new (a request, a failure, a fresh result) brings the session back early.
+  if (prev && ev.type !== 'human.snoozed' && (s.state !== prev.state || s.since !== prev.since)) s.snoozed_until = null;
+  if (s.phase !== 'idle' && s.phase !== 'ended') s.acked = null;
+  return s;
 }
 
 // Attention ordering. Deliberately simple and explainable: a fixed tier per
 // kind of request, then longest-waiting first. (Olsen & Goodrich: a poor
 // attention ranking can be worse than plain round-robin.)
-export function attentionTier(s) {
+export function attentionTier(s, now = 0) {
   if (s.archived) return null;
+  if (s.snoozed_until && now < s.snoozed_until) return null;
   // Blocked agents first (a permission is the cheapest to clear), then broken
   // ones, then pull requests that need attention, then finished work.
   if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? 0 : s.waiting?.kind === 'pr' ? 3 : 1;
@@ -400,8 +447,8 @@ export function attentionTier(s) {
   return null;
 }
 
-export function attentionQueue(sessions) {
+export function attentionQueue(sessions, now = 0) {
   return sessions
-    .filter((s) => attentionTier(s) !== null)
-    .sort((a, b) => attentionTier(a) - attentionTier(b) || a.since - b.since);
+    .filter((s) => attentionTier(s, now) !== null)
+    .sort((a, b) => attentionTier(a, now) - attentionTier(b, now) || a.since - b.since);
 }
