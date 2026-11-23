@@ -253,3 +253,8 @@ dialog h3 { margin: 0 0 6px; font-size: 16px; }
   background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 10px; box-shadow: var(--shadow); font-size: 13px; max-width: calc(100vw - 32px); }
 #toast[hidden] { display: none; }
 #toast button { background: none; border: 1px solid currentColor; color: inherit; padding: 1px 10px; }
+
+/* ---- rules for kinds of commands ---- */
+.cmds { margin: 4px 0 0; padding: 0 0 0 16px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
+.rules-row { margin-top: 8px; }
+.rules-row button { font-size: 12px; padding: 2px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

@@ -190,7 +190,7 @@ test('one decision for the same request in many sessions; standing rules; drasti
   assert.equal(s4.waiting.risky, true);
 
   const out = await (await post('/api/requests/batch', { ids: ids.filter((id) => id !== s4.waiting.id), decision: 'allow', remember: true })).json();
-  assert.deepEqual(out, { decided: 3, rule: { tool: 'Bash', detail: 'npm install' } });
+  assert.deepEqual(out, { decided: 3, rule: { tool: 'Bash', detail: 'npm install', mode: 'exact' } });
   for (const p of pending) assert.equal((await (await p).json()).hookSpecificOutput.decision.behavior, 'allow');
 
   // The rule answers the next identical request anywhere, with no human involved.

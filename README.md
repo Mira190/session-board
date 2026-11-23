@@ -31,18 +31,12 @@
 需要 Node 22.5 以上，没有任何依赖。
 
 ```bash
-node bin/session-board.js serve
+node bin/session-board.js up
 ```
 
-```bash
-node bin/session-board.js install claude
-```
+这一条命令会给本机找到的 agent（Claude Code、Codex）装好 hooks，然后启动 hub。打开 <http://127.0.0.1:4590>，之后在任何终端、任何目录启动的会话都会自动出现。
 
-```bash
-node bin/session-board.js install codex
-```
-
-然后打开 <http://127.0.0.1:4590>。之后在任何终端、任何目录启动的会话都会自动出现。
+想分开做，也可以用 `serve`、`install claude`、`install codex`。
 
 - 想先看效果：hub 运行时执行 `node bin/session-board.js demo`。
 - 装 hooks 之前就存在的会话：点“导入历史”，或执行 `node bin/session-board.js backfill`。
@@ -101,6 +95,8 @@ node bin/session-board.js install codex
 ![150 个会话时的办公室](docs/office-fleet.png)
 
 - **决定一次，处处生效**：多个会话请求完全相同的命令时，队列顶部出现一张合并卡片，一次全部允许或拒绝。也可以选“以后也自动允许”，变成对所有会话生效的规则，在顶部“自动规则”里随时撤销。
+- **按一类命令决定**：命令的参数总在变（`git push origin 分支A`、`分支B`…），所以三个以上会话请求同一类命令时也会合并成一张卡片，可以设成“`git push …` 加任意参数都自动允许”。单个请求上也有“这一条”和“这一类”两个按钮。新规则会立刻放行已经在等的同类请求。
+- **“一类”规则的护栏**：带 `;`、`&&`、`|`、`>`、`$(` 的命令不会匹配，所以 `git push x; curl … | sh` 不算 `git push …`；`bash`、`node`、`sudo` 这类解释器不能单独设成一类；高风险写法永远逐个确认。
 - **高风险命令不走捷径**：看起来有破坏性的命令（`rm -rf`、强制推送、`sudo`、管道进 shell 等）会标出来，不会被合并，也不能设成规则，只能逐个确认。这是一个提醒用的模式匹配，不是安全边界。
 - **不需要你的分组自动折叠**：超过 30 个会话时，“工作中”折叠成按项目的汇总（如 `shop-api 12 · web-app 8`），点标题展开。
 - **筛选**：按 `/` 输入项目、标题、机器或分支，三个视图同时过滤。
@@ -109,6 +105,22 @@ node bin/session-board.js install codex
 性能上做了三件事：给浏览器的实时更新改成只发变化的会话；页面只重画内容变了的卡片；同一个仓库的 PR 一次查完，git 子进程限制并发。
 
 在这台开发机上用模拟数据量过：200 个会话并发、1 万条事件，hub 每秒处理约 4000 条，发给一个页面的数据从 8 MB 降到 1.4 MB，重启重放 30 毫秒；150 个会话持续更新时页面最慢一帧 17 毫秒。**没有用上百个真实 agent 测过**，真实场景下每个 agent 的 hook 开销、GitHub 限流都还没验证。
+
+## 离开电脑时推送到手机
+
+浏览器通知要开着页面才有。设置下面任意一个，hub 会在**没有任何看板页面处于可见状态**时，把“有会话在等你”推出去：
+
+```bash
+SESSION_BOARD_NTFY=https://ntfy.sh/你的主题 node bin/session-board.js up
+```
+
+- `SESSION_BOARD_NTFY`：[ntfy](https://ntfy.sh) 的主题地址（可自建）。`SESSION_BOARD_WEBHOOK`：向任意地址 POST 一段 JSON。
+- 默认只推权限、提问、出错、失联和 PR 问题；做完待验收不推。用 `SESSION_BOARD_NOTIFY_ON` 改。
+- **默认不带命令原文**：只说哪个会话、需要什么。命令和问题里可能有代码或密钥，而推送服务是别人的机器。确实想带上，设 `SESSION_BOARD_NOTIFY_DETAIL=1`。
+- 同时来很多个会合并成一条；几秒内自己解决了的不推。
+- 通知里的链接指向看板上的那个会话。手机要能访问到看板才点得开，用 `SESSION_BOARD_PUBLIC_URL` 指定手机可达的地址。
+
+只用本地的模拟服务测过，没有真的推到 ntfy。
 
 ## PR 状态和自动验收
 
@@ -172,7 +184,6 @@ T3 Code 好用，靠的不是功能多，而是几条纪律（详见[拆解笔�
 1. 用真实 Codex 验证整列能力。
 2. 对着真实 GitHub 验证 PR 状态。
 3. 把命令行造成的改动也归属到会话（每个任务一个 worktree）。
-4. 手机推送。
 5. 事件日志快照：现在重启时重放全部事件，几十万条以内没问题，再多需要快照。
 6. 让一个分诊 agent 通过 MCP 预读队列，给每个请求写一句摘要和建议。
 
