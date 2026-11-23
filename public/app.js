@@ -204,6 +204,147 @@ function renderLists(groups) {
   if (focused) $(`.card[data-key="${CSS.escape(focused)}"]`)?.focus();
 }
 
+// ----------------------------------------------------------------- office --
+// The same snapshot drawn as a room. Positions follow state only:
+//   at its own desk        -> working / idle (nothing for you to do)
+//   queued at your desk    -> needs you; the queue order is the attention order
+//   paper in your in-tray  -> finished, waiting for review
+// Agent nodes are kept between renders so a state change shows as a walk.
+
+const SPRITE = `<svg width="44" height="52" viewBox="0 0 22 26" aria-hidden="true">
+  <rect x="10" y="0" width="2" height="3" fill="#8a8f96"/><rect x="9" y="0" width="4" height="1" fill="#8a8f96"/>
+  <rect x="5" y="3" width="12" height="9" fill="#d5d8dc"/><rect x="6" y="5" width="10" height="4" fill="#2b2f36"/>
+  <rect class="eye" x="8" y="6" width="2" height="2"/><rect class="eye" x="12" y="6" width="2" height="2"/>
+  <rect class="body" x="5" y="13" width="12" height="8"/>
+  <rect class="body arm-l" x="2" y="14" width="2" height="6"/><rect class="body arm-r" x="18" y="14" width="2" height="6"/>
+  <rect class="leg-l" x="6" y="21" width="4" height="5" fill="#4a4e55"/><rect class="leg-r" x="12" y="21" width="4" height="5" fill="#4a4e55"/>
+</svg>`;
+const DESK = `<svg width="120" height="64" viewBox="0 0 60 32" aria-hidden="true">
+  <g class="smoke" fill="#8a8f96"><rect x="27" y="0" width="3" height="3"/><rect x="31" y="3" width="2" height="2"/></g>
+  <rect x="20" y="6" width="20" height="13" fill="#5b6068"/><rect class="screen" x="22" y="8" width="16" height="9"/>
+  <rect x="28" y="19" width="4" height="3" fill="#5b6068"/>
+  <rect x="2" y="22" width="56" height="5" fill="#b08a5e"/><rect x="5" y="27" width="4" height="5" fill="#8a6a45"/><rect x="51" y="27" width="4" height="5" fill="#8a6a45"/>
+</svg>`;
+const MY_DESK = `<svg width="150" height="70" viewBox="0 0 75 35" aria-hidden="true">
+  <rect x="0" y="14" width="75" height="7" fill="#8a6a45"/><rect x="4" y="21" width="5" height="14" fill="#6d5236"/><rect x="66" y="21" width="5" height="14" fill="#6d5236"/>
+  <rect x="48" y="6" width="22" height="8" fill="none" stroke="#5b6068" stroke-width="2"/>
+</svg>`;
+
+const CELL = { w: 150, h: 128 };
+const LOBBY = 150; // height of the strip in front of your desk
+const QUEUE = { w: 84, h: 104 }; // one standing place in the queue
+const agentNodes = new Map();
+
+const bubbleFor = (s) => {
+  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? '要权限' : '有问题问你';
+  if (s.state === 'failed') return s.rate_limited ? '被限流了' : '出错了';
+  if (s.state === 'unknown') return '失联';
+  return null;
+};
+
+function renderOffice() {
+  const office = $('#office');
+  const floor = $('.floor', office);
+  const present = snap.sessions.filter((s) => s.state !== 'ended').sort((a, b) => a.created_ts - b.created_ts);
+  const width = Math.max(320, office.clientWidth - 38);
+  const cols = Math.max(2, Math.floor((width - 16) / CELL.w));
+  const rows = Math.max(1, Math.ceil(present.length / cols));
+  const deskTop = 26;
+  const lobbyTop = deskTop + rows * CELL.h + 8;
+  // The queue stands beside your desk, wrapping into more rows when the room
+  // is narrow; on a phone it forms up above the desk instead.
+  const queue = snap.queue.map(byKey).filter((s) => s && column(s) === 'attention');
+  const queued = new Map(queue.map((s, i) => [s.key, i]));
+  const narrow = width < 560;
+  const queueX = narrow ? 34 : 236;
+  const perRow = Math.max(1, Math.floor((width - queueX - 8) / QUEUE.w));
+  const queueRows = Math.max(1, Math.ceil(queue.length / perRow));
+  const lobby = LOBBY + (queueRows - 1) * QUEUE.h + (narrow && queue.length ? QUEUE.h + 30 : 0);
+  const height = Math.max(lobbyTop + lobby, Math.min(office.clientHeight - 60, lobbyTop + lobby + 90));
+  floor.style.height = `${height}px`;
+  const myY = height - 92;
+  const queueSlot = (q) => ({
+    x: queueX + (q % perRow) * QUEUE.w,
+    y: myY - 2 - (narrow ? QUEUE.h : 0) - (queueRows - 1 - Math.floor(q / perRow)) * QUEUE.h,
+  });
+  const seat = new Map();
+  $('.desks', floor).replaceChildren(
+    el('div', { className: 'zone', style: `top:${height - lobby}px;height:${lobby}px` }),
+    el('div', { className: 'zone-label', style: `left:14px;top:6px`, textContent: '工位' }),
+    el('div', { className: 'zone-label', style: `left:14px;top:${height - lobby + 6}px`, textContent: '你的桌前：排队等你的' }),
+    ...present.map((s, i) => {
+      const x = 12 + (i % cols) * CELL.w;
+      const y = deskTop + Math.floor(i / cols) * CELL.h;
+      seat.set(s.key, { x: x + 4, y: y + 2 }); // standing behind the desk, beside the monitor
+      const d = describe(s);
+      const node = el('button', {
+          className: 'desk', type: 'button', style: `left:${x}px;top:${y}px`, title: `${s.title || s.session_id}：${d.what}`,
+          dataset: { state: s.state, away: String(queued.has(s.key)) }, onclick: () => select(s.key, true),
+        },
+        s.state === 'review' ? el('span', { className: 'flag', textContent: '做完了' })
+          : s.quiet ? el('span', { className: 'flag quiet', textContent: `${age(s.last_event_ts)}没动静` })
+            : s.subagents > 0 ? el('span', { className: 'flag', textContent: `+${s.subagents} 帮手` }) : null,
+      );
+      node.insertAdjacentHTML('beforeend', DESK);
+      node.append(el('span', { className: 'plate' }, s.title || '(还没有任务)',
+        el('small', { textContent: [s.runtime === 'cloud' ? '云端' : null, agentName(s), s.repo || (s.cwd || '').split('/').pop()].filter(Boolean).join(' · ') })));
+      return node;
+    }),
+    ...(present.length ? [] : [el('div', { className: 'empty-office', textContent: '办公室里还没有人。启动任意一个 Claude Code 或 Codex 会话，它会自己走进来。' })]),
+  );
+
+  // Your desk, with the in-tray of finished work.
+  const reviews = present.filter((s) => s.state === 'review').sort((a, b) => a.since - b.since);
+  const you = $('.you', floor);
+  you.style.cssText = `left:18px;top:${myY}px`;
+  you.innerHTML = MY_DESK;
+  you.append(
+    el('div', { className: 'plate', textContent: '你' }),
+    el('div', { className: 'tray', style: 'left:96px;bottom:54px' },
+      reviews.slice(0, 5).map((s) => el('button', {
+        className: 'paper', type: 'button', title: `待验收：${s.title || s.session_id}`,
+        ariaLabel: `待验收：${s.title || s.session_id}`, ariaCurrent: String(s.key === selected), onclick: () => select(s.key, true),
+      })),
+      reviews.length > 5 && el('span', { className: 'paper more', textContent: `+${reviews.length - 5}` })),
+    reviews.length > 0 && el('div', { className: 'tray-label', style: 'left:96px;bottom:86px', textContent: `待验收 ${reviews.length}` }),
+  );
+
+  // Agents: kept across renders so moving between desk and queue animates.
+  const layer = $('.agents', floor);
+  const alive = new Set(present.map((s) => s.key));
+  for (const [key, node] of agentNodes) {
+    if (!alive.has(key)) { node.remove(); agentNodes.delete(key); }
+  }
+  for (const s of present) {
+    const d = describe(s);
+    const q = queued.get(s.key);
+    const pos = q === undefined ? seat.get(s.key) : queueSlot(q);
+    let node = agentNodes.get(s.key);
+    const target = `translate(${Math.round(pos.x)}px, ${Math.round(pos.y)}px)`;
+    if (!node) {
+      node = el('button', { className: 'agent', type: 'button', onclick: () => select(s.key, true) });
+      node.innerHTML = `<span class="ring"></span>${SPRITE}`;
+      node.append(el('span', { className: 'bubble' }), el('span', { className: 'tag' }));
+      node.addEventListener('transitionend', () => node.classList.remove('walking'));
+      node.style.transform = `translate(${width + 20}px, ${Math.round(pos.y)}px)`; // walks in from the door
+      layer.append(node);
+      agentNodes.set(s.key, node);
+      node.getBoundingClientRect(); // commit the start position before moving
+    }
+    if (node.style.transform !== target) {
+      node.classList.add('walking');
+      node.style.transform = target;
+    }
+    Object.assign(node.dataset, { agent: s.agent, tone: d.tone, state: s.state, queued: String(q !== undefined) });
+    node.setAttribute('aria-current', String(s.key === selected));
+    node.setAttribute('aria-label', `${agentName(s)}：${s.title || s.session_id}，${d.what}`);
+    node.title = `${s.title || s.session_id}：${d.what}`;
+    const label = bubbleFor(s);
+    $('.bubble', node).replaceChildren(...(label ? [label, el('small', { textContent: `等了 ${age(s.since)}` })] : []));
+    $('.tag', node).textContent = s.title || s.session_id;
+  }
+}
+
 // -------------------------------------------------------------- workbench --
 
 function diffView(diff) {
@@ -351,7 +492,7 @@ function select(key, byHuman) {
   selected = key;
   if (byHuman) {
     pinned = true;
-    setView('inbox');
+    if ($('#app').dataset.view === 'board') setView('inbox'); // the board has no workbench
   }
   render();
   $(`.card[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: 'nearest' });
@@ -367,6 +508,7 @@ function render() {
   }
   const groups = grouped();
   renderLists(groups);
+  if ($('#app').dataset.view === 'office') renderOffice();
   renderBench();
   const s = byKey(selected);
   if (s) loadExtra(s);
@@ -420,7 +562,9 @@ function setView(view) {
   $('#app').dataset.view = view;
   $('#view-inbox').setAttribute('aria-pressed', String(view === 'inbox'));
   $('#view-board').setAttribute('aria-pressed', String(view === 'board'));
+  $('#view-office').setAttribute('aria-pressed', String(view === 'office'));
   prefs.set('view', view);
+  if (view === 'office') renderOffice();
 }
 
 function connect() {
@@ -438,6 +582,8 @@ function connect() {
 
 $('#view-inbox').onclick = () => setView('inbox');
 $('#view-board').onclick = () => setView('board');
+$('#view-office').onclick = () => setView('office');
+addEventListener('resize', () => $('#app').dataset.view === 'office' && renderOffice());
 $('#backfill').onclick = async (e) => {
   const button = e.currentTarget;
   button.disabled = true;
@@ -477,6 +623,6 @@ for (const id of ['notify', 'sound']) {
     prefs.set(id, box.checked ? '1' : '0');
   };
 }
-setView(prefs.get('view') === 'board' ? 'board' : 'inbox');
+setView(['board', 'office'].includes(prefs.get('view')) ? prefs.get('view') : 'inbox');
 setInterval(() => { if (document.activeElement?.id !== 'reply') render(); }, 5000); // keep timers ticking
 connect();
