@@ -22,6 +22,7 @@ export class Store {
     this.insert = this.db.prepare('INSERT INTO events (ts, key, type, body) VALUES (?, ?, ?, ?)');
     this.sessions = new Map();
     this.seqs = new Map(); // `${session}|${source}` -> highest sequence accepted
+    this.receipts = new Set(); // `${session}|${event id}` already applied
     this.listeners = new Set();
     this.rebuild();
   }
@@ -30,10 +31,12 @@ export class Store {
   rebuild() {
     this.sessions.clear();
     this.seqs.clear();
+    this.receipts.clear();
     for (const row of this.db.prepare('SELECT body FROM events ORDER BY id').iterate()) {
       const ev = JSON.parse(row.body);
       if (ev.late) continue;
       const key = sessionKey(ev);
+      if (ev.eid) this.receipts.add(`${key}|${ev.eid}`);
       this.inOrder(key, ev);
       this.sessions.set(key, reduce(this.sessions.get(key), ev));
     }
@@ -53,6 +56,13 @@ export class Store {
 
   append(ev) {
     const key = sessionKey(ev);
+    // Idempotent ingestion: an event that names itself is applied once, however
+    // many times it is delivered. The event row is its own receipt.
+    if (ev.eid) {
+      const receipt = `${key}|${ev.eid}`;
+      if (this.receipts.has(receipt)) return this.sessions.get(key);
+      this.receipts.add(receipt);
+    }
     if (!this.inOrder(key, ev)) {
       this.insert.run(ev.ts, key, ev.type, JSON.stringify({ ...ev, late: true }));
       return this.sessions.get(key);

@@ -16,7 +16,10 @@ export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null
     transcript: p.transcript_path || null,
     ...(seq != null ? { seq, source } : {}),
   };
-  const ev = (type, data = {}) => [{ ...base, type, data }];
+  // Events that carry an id of their own can be recognised if delivered twice.
+  const eid = p.tool_use_id && /ToolUse/.test(p.hook_event_name) ? `${p.hook_event_name}:${p.tool_use_id}`
+    : p.hook_event_name === 'UserPromptSubmit' && p.prompt_id ? `prompt:${p.prompt_id}` : null;
+  const ev = (type, data = {}) => [{ ...base, ...(eid ? { eid } : {}), type, data }];
 
   switch (p.hook_event_name) {
     case 'SessionStart':

@@ -190,3 +190,14 @@ main[data-view="office"] #office { display: block; }
   main[data-view="office"] { display: block; }
   #office { padding: 12px 16px; overflow: visible; }
 }
+
+/* ---- answering an agent's multiple-choice question ---- */
+.questions fieldset { border: 0; padding: 0; margin: 10px 0 0; min-width: 0; }
+.questions legend { padding: 0; font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+.options { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.option { text-align: left; padding: 6px 12px; max-width: 100%; }
+.option b { display: block; }
+.option span { display: block; font-size: 12px; color: var(--muted); }
+.option[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.questions input { font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; width: min(100%, 420px); }
+.questions input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
