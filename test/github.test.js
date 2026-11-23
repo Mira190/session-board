@@ -123,3 +123,76 @@ test('a squash-merged PR settles the review, but only for the commit this sessio
   assert.equal(s().pr.number, 12);
   await hub.close();
 });
+
+test('a failing check or requested changes joins the queue once, below blocked agents, and can be dismissed', async () => {
+  let t = 1_000_000;
+  let answer;
+  const hub = createHub({ localHost: 'laptop', now: () => t, github: { findPr: async () => answer } });
+  const { port } = await hub.listen(0, '127.0.0.1');
+  const base = `http://127.0.0.1:${port}`;
+  const post = (path, body) => fetch(base + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const hook = (id, name, extra = {}) => post('/ingest/claude?host=laptop', { session_id: id, hook_event_name: name, ...extra });
+  const pr = (over) => post('/ingest/event', { agent: 'claude', session_id: 'a', type: 'pr.updated',
+    data: { pr: { number: 5, url: 'u', title: 'Add thing', state: 'open', head_sha: 'h1', checks: 'passing', review: null, ...over } } });
+  const s = () => hub.store.get('claude:a');
+  const queue = async () => (await (await fetch(base + '/api/sessions')).json()).queue;
+
+  await hook('a', 'UserPromptSubmit', { prompt: 'add thing' });
+  await pr({ checks: 'failing' });
+  assert.equal(s().state, 'working', 'not raised mid-turn: the agent may be fixing it');
+  await hook('a', 'Stop', { last_assistant_message: 'pushed' });
+  assert.equal(s().state, 'review');
+
+  await pr({ checks: 'pending' });
+  assert.equal(s().state, 'review', 'pending is not a problem');
+  await pr({ checks: 'failing' });
+  assert.deepEqual([s().state, s().waiting.kind, s().waiting.detail], ['needs_input', 'pr', 'checks']);
+
+  // Ordering: a blocked agent outranks a broken PR, which outranks plain review.
+  await hook('r', 'Stop', { last_assistant_message: 'done' });
+  await hook('f', 'StopFailure', { error: 'server_error' });
+  assert.deepEqual(await queue(), ['claude:f', 'claude:a', 'claude:r']);
+
+  // Dismiss: the alert goes, the work is still awaiting review, and the same problem stays quiet.
+  const key = encodeURIComponent('claude:a');
+  await post(`/api/sessions/${key}/ack`, {});
+  assert.equal(s().state, 'review');
+  await pr({ checks: 'failing', title: 'Add thing (edited)' });
+  assert.equal(s().state, 'review', 'same commit, same problem: raised once');
+  await pr({ checks: 'failing', head_sha: 'h2' });
+  assert.equal(s().waiting.kind, 'pr', 'a new commit failing is a new problem');
+  await pr({ checks: 'passing', head_sha: 'h2' });
+  assert.equal(s().state, 'review', 'fixed: it leaves the queue by itself');
+  await pr({ checks: 'failing', review: 'changes_requested', head_sha: 'h2' });
+  assert.equal(s().waiting.detail, 'checks+review');
+  await pr({ state: 'merged', checks: null });
+  assert.equal(s().state, 'review', 'a merged PR has no problems');
+
+  // Sending the agent off to fix it clears the alert.
+  await pr({ review: 'changes_requested', head_sha: 'h3' });
+  assert.equal(s().waiting.kind, 'pr');
+  await hook('a', 'UserPromptSubmit', { prompt: 'address the review' });
+  assert.deepEqual([s().state, s().requests.length], ['working', 0]);
+  await hub.close();
+});
+
+test('a problem that appeared mid-turn is raised when the turn ends, if it is still there', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'sb-late-'));
+  const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { encoding: 'utf8' });
+  git('init', '-q', '-b', 'feature'); writeFileSync(join(repo, 'a'), '1'); git('add', '-A'); git('commit', '-qm', 'i');
+  const answer = { number: 8, url: 'u', title: 't', state: 'open', draft: false, head_sha: 'h', base: 'main', checks: 'failing', review: null, updated: 1 };
+  const hub = createHub({ localHost: 'laptop', github: { findPr: async () => answer } });
+  const { port } = await hub.listen(0, '127.0.0.1');
+  const hook = (name, extra = {}) => fetch(`http://127.0.0.1:${port}/ingest/claude?host=laptop`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ session_id: 'w', cwd: repo, hook_event_name: name, ...extra }) });
+  const s = () => hub.store.get('claude:w');
+  const until = async (fn) => { for (let i = 0; i < 300; i++) { if (await fn()) return; await new Promise((r) => setTimeout(r, 10)); } assert.fail('timed out'); };
+  await hook('UserPromptSubmit', { prompt: 'go' });
+  await until(() => s().branch);
+  await hub.refreshPr('claude:w', { force: true });
+  assert.deepEqual([s().state, s().pr.checks, s().pr_alert], ['working', 'failing', null], 'known, but held back while it works');
+  await hook('Stop', { last_assistant_message: 'done' });
+  await until(() => s().waiting?.kind === 'pr');
+  assert.equal(s().state, 'needs_input');
+  await hub.close();
+});
