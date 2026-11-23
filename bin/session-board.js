@@ -141,7 +141,11 @@ async function main() {
     // Links in phone notifications must point somewhere the phone can reach.
     const boardUrl = (process.env.SESSION_BOARD_PUBLIC_URL || url).replace(/\/$/, '');
     const { triageDir } = await import('../src/triage.js');
-    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl, ignoreCwds: [triageDir(home())] });
+    // Cloud sessions through git: on unless switched off. Looks at the remotes
+    // of the repositories Claude Code has been used in on this machine.
+    const { claudeProjectDirs } = await import('../src/cloudgit.js');
+    const cloudGit = process.env.SESSION_BOARD_CLOUD_GIT === 'off' ? null : { cacheRoot: join(home(), 'git'), dirs: () => claudeProjectDirs() };
+    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl, ignoreCwds: [triageDir(home())], cloudGit });
     await hub.listen(Number(opt.port), opt.bind);
     writeEndpoint({ url, token });
     console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
@@ -176,6 +180,9 @@ async function main() {
       };
       console.log((await poll()) ? 'Codex cloud tasks: on (listed through the codex CLI every 2 minutes)' : 'Codex cloud tasks: `codex cloud list` did not work (logged in?); will keep trying');
       setInterval(poll, 120_000).unref();
+    }
+    if (cloudGit) {
+      hub.scanCloudBranches().then((r) => r.sessions && console.log(`cloud sessions found through git: ${r.sessions} across ${r.remotes} repositor${r.remotes === 1 ? 'y' : 'ies'}`)).catch(() => {});
     }
     const lost = await hub.reconcile().catch(() => 0);
     if (lost) console.log(`${lost} session(s) had no agent process left and were marked unknown`);

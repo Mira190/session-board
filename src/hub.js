@@ -16,6 +16,8 @@ import { createGitHub } from './github.js';
 import { ruleMatches, ruleProblem, stemOf } from './rules.js';
 import { createNotifier } from './notify.js';
 import { groupTasks } from './tasks.js';
+import { readRemote, claudeProjectDirs, remoteOf } from './cloudgit.js';
+import { parseRemote } from './github.js';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -117,6 +119,7 @@ export function createHub({
   notifier = null, // injectable; built from the environment by default
   boardUrl = '',
   ignoreCwds = [], // sessions running here are not shown (the triage runner's own)
+  cloudGit = null, // { cacheRoot, dirs: () => [...] } turns on finding cloud sessions through git
   launch = (cmd, args, cwd) => spawn(cmd, args, { cwd, detached: true, stdio: 'ignore' }).unref(),
 } = {}) {
   const store = new Store(dbPath);
@@ -682,6 +685,43 @@ export function createHub({
     return out;
   }
 
+  // Cloud sessions through git: for each repository this machine knows, read
+  // the remote's claude/ branches. A session is "recently active" for a while
+  // after its last commit; after that git cannot tell working from waiting.
+  const RECENT_MS = 30 * 60 * 1000;
+  async function scanCloudBranches() {
+    if (!cloudGit) return { remotes: 0, sessions: 0 };
+    const dirs = new Set([...store.list().filter((s) => isLocal(s) && s.cwd).map((s) => s.cwd), ...(cloudGit.dirs ? cloudGit.dirs() : [])]);
+    const remotes = new Set();
+    for (const dir of [...dirs].slice(0, 60)) {
+      const url = await remoteOf(dir);
+      if (url) remotes.add(url);
+    }
+    let found = 0;
+    for (const url of [...remotes].slice(0, 30)) {
+      const branches = await readRemote(url, cloudGit.cacheRoot);
+      if (!branches) continue;
+      const slug = parseRemote(url);
+      const repo = url.replace(/\.git\/?$/, '').split(/[/:]/).pop();
+      const byCloud = new Map(store.list().filter((x) => x.cloud_id).map((x) => [x.cloud_id, x]));
+      for (const b of branches) {
+        const have = byCloud.get(b.cloud_id);
+        const ref = have ? { agent: have.agent, session_id: have.session_id } : { agent: 'claude', session_id: `session_${b.cloud_id}` };
+        const recent = now() - b.ts < RECENT_MS;
+        const s = store.append({
+          ...ref, ts: now(), host: 'claude-cloud', runtime: 'cloud', cloud_id: b.cloud_id,
+          eid: `git:${b.sha}:${recent}`, type: 'cloud.branch',
+          data: { branch: b.branch, repo, github: slug ? `${slug.owner}/${slug.repo}` : null, subject: b.subject, ts: b.ts, commits: b.commits, recent, url: `https://claude.ai/code/session_${b.cloud_id}` },
+        });
+        if (s) refreshPr(s).catch(() => {});
+        found += 1;
+      }
+    }
+    return { remotes: remotes.size, sessions: found };
+  }
+  const cloudScanner = cloudGit ? setInterval(() => scanCloudBranches().catch(() => {}), 3 * 60_000) : null;
+  cloudScanner?.unref();
+
   // --- upkeep -----------------------------------------------------------------
   // Reconciliation: a session we show as active, on this machine, silent for a
   // while, with no agent process behind it, is marked unknown instead of
@@ -989,6 +1029,7 @@ export function createHub({
       const { days } = await body();
       return json(res, 200, await backfill({ days: Number(days) > 0 ? Number(days) : 7 }));
     }
+    if (path === '/api/cloud-scan' && req.method === 'POST') return json(res, 200, await scanCloudBranches());
     if (path === '/api/reconcile' && req.method === 'POST') {
       return json(res, 200, { lost: await reconcile(), settled: await settle() });
     }
@@ -1174,6 +1215,7 @@ export function createHub({
     snapshot,
     ingest,
     reconcile,
+    scanCloudBranches,
     settle,
     refreshPr: (key, opts) => refreshPr(store.get(key), opts),
     backfill,
@@ -1184,6 +1226,7 @@ export function createHub({
       new Promise((ok) => {
         clearInterval(tick);
         clearInterval(reconciler);
+        clearInterval(cloudScanner);
         clearTimeout(pending);
         clearTimeout(orphanTimer);
         for (const id of [...held.keys()]) release(id);

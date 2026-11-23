@@ -22,6 +22,11 @@ export const setLangPref = (v) => store.set(LANGS.includes(v) ? v : 'auto');
 export const lang = () => (langPref() === 'auto' ? systemLang() : langPref());
 
 const ZH = {
+  // ---- cloud sessions found through git
+  '　Found through git: its commits and pull request are visible, but not whether it is waiting for you.': '　通过 git 发现：能看到它的提交和 PR，但看不出它是否在等你。',
+  'Committed recently': '最近有提交',
+  'No commits lately: finished, waiting for you, or on a long task': '有一阵没提交了：可能做完了、在等你，或在跑长任务',
+
   // ---- cloud sessions
   'Sent to the cloud session through the Claude Code CLI on this machine.': '通过本机的 Claude Code 命令行发给这个云端会话。',
   'Open in claude.ai': '在 claude.ai 打开',

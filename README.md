@@ -189,15 +189,32 @@ With it, the header shows the 5-hour and weekly windows with their reset times (
 
 There are two sanctioned ways to get cloud sessions onto the board. Neither touches a private API, and both need a hub the cloud can reach.
 
+### Out of the box: cloud sessions found through git
+
+Nothing to set up. A cloud session works on a `claude/…` branch and signs each commit with a link to itself (`Claude-Session: https://claude.ai/code/session_…`). Both can be read from your machine with the git access you already have.
+
+So once the hub is running, it looks at the remotes of the repositories Claude Code has been used in on this machine, every three minutes, and puts the cloud sessions it finds on the board:
+
+- **Visible**: which cloud sessions exist, the branch each is on, what its last commit did and when, a link back to it on claude.ai, and its pull request (open, checks failing, changes requested, merged). PR problems join the queue as usual, and a merged PR counts as accepted.
+- **Not visible**: whether it is waiting for you. A session whose last commit is under 30 minutes old shows as "Committed recently"; after that the board says plainly "finished, waiting for you, or on a long task" rather than guess.
+- **Your repositories are not touched**: the hub keeps a small cache of its own per remote (commit records only, no file contents). Your clones gain no branches and no objects.
+- **Turn it off** with `SESSION_BOARD_CLOUD_GIT=off`.
+
+Limits: only sessions that have pushed a commit can be found; a session with commit attribution switched off is not recognised; and the repository has to be one Claude Code was used in on this machine (or one with a local session in it).
+
+Verified: on this project's own repository, a hub started with no configuration found two cloud sessions from the real remote in 0.6 seconds, with the same session ids as the official list, and nothing changed in the local repository.
+
+To know whether a session is waiting for you, the cloud has to report in, by one of the routes below.
+
 ### Security first: do not expose the board itself
 
 A cloud session runs in Anthropic's container; `127.0.0.1` there is the container, not your computer. So for the cloud to report, there has to be a channel. But **the board can approve commands and type into your terminals**: put the whole thing on the internet and whoever has the address and token can drive your agents.
 
-There are three levels, from least exposed to most:
+Beyond the git route above, there are three levels, from least exposed to most:
 
 | Setup | What is exposed | What you get |
 |---|---|---|
-| Listen on this machine only (default) | Nothing | Everything for local sessions; cloud sessions are not visible |
+| Listen on this machine only (default) | Nothing | Everything for local sessions; cloud sessions show their commits and PR through git, but not whether they are waiting |
 | Sync over Remote Control (`cloud-reporter --local`) | Nothing: the request is made on your own computer, over a connection you approve | A snapshot of every cloud session's state; each sync costs a turn |
 | The drop box (`serve --drop-port`) behind a tunnel | One write-only port | Live events from cloud sessions, whose permission requests you can answer on the board |
 

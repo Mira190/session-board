@@ -47,6 +47,8 @@ function blank(ev) {
     cloud_id: null, // the vendor's id for a cloud session
     url: null, // where to open it in the vendor's own UI
     activity: null, // what a cloud session says it is doing right now
+    listed: false, // seen in the vendor's session list (which knows its state better than git does)
+    last_commit_ts: 0, // newest commit on its branch, for sessions known through git
     hooked: false, // its own hooks report to us (so a coarse cloud listing must not drive its state)
     task_reason: null, // why task_manual was set: 'parent' when a parent session spawned it
     repo_id: null, // what identifies the repository across worktrees (remote, or the shared git dir)
@@ -209,7 +211,7 @@ export function reduce(prev, ev) {
   }
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted'].includes(ev.type)) s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'cloud.snapshot', 'cloud.branch', 'files.attributed', 'context.compacted'].includes(ev.type)) s.archived = false;
 
   const working = () => enter(s, 'working', ts);
 
@@ -424,11 +426,30 @@ export function reduce(prev, ev) {
       s.task_reason = d.reason || null;
       break;
 
+    case 'cloud.branch': {
+      // Seen through git: a claude/ branch whose commits name this session.
+      s.runtime = 'cloud';
+      if (d.url) s.url = d.url;
+      if (d.repo && !s.repo) s.repo = d.repo;
+      if (d.github) s.github = d.github;
+      if (d.branch) s.branch = d.branch;
+      s.last_commit_ts = d.ts || s.last_commit_ts;
+      if (!s.title_manual && !s.listed && !s.hooked && d.subject) s.title = clip(d.subject, 120);
+      if (s.hooked || s.listed) break; // better sources decide its state
+      s.last_message = clip(d.subject, 1200);
+      // Git says what it did and when, not whether it is waiting for anyone.
+      if (d.recent) enter(s, 'working', ts);
+      else if (s.phase !== 'idle' && s.phase !== 'ended') enter(s, 'idle', ts);
+      s.activity = d.recent ? null : 'quiet';
+      break;
+    }
+
     case 'cloud.snapshot': {
       // One row of the vendor's own session list. Coarser than hooks: it says
       // which bucket the session is in, not what it is waiting for.
       if (d.title && !s.title_manual) s.title = clip(d.title, 120);
       s.runtime = 'cloud';
+      s.listed = true;
       if (d.url) s.url = d.url;
       if (d.summary) s.last_message = clip(d.summary, 1200);
       s.activity = d.activity ? clip(d.activity, 200) : null;
@@ -521,7 +542,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.last_work_ts = ts;
     if (ev.type !== 'heartbeat' && ev.type !== 'notification') s.hooked = true;

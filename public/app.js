@@ -109,6 +109,7 @@ function describeState(s) {
     case 'review':
       return { tone: 'review', what: s.exited ? t('Finished and exited, awaiting review') : t('Finished, awaiting review'), detail: s.last_message, verb: 'waiting {age}' };
     case 'working':
+      if (s.runtime === 'cloud' && !s.hooked && !s.listed) return { tone: 'working', what: t('Committed recently'), detail: s.last_message, verb: '{age}' };
       if (s.activity && !s.current_tool) return { tone: 'working', what: t('Working'), detail: s.activity, verb: '{age}' };
       if (s.background) return { tone: 'working', what: t('Waiting on its own background task ({task})', { task: s.background }), detail: s.last_message, verb: '{age}' };
       return {
@@ -121,6 +122,9 @@ function describeState(s) {
     case 'ended':
       return { tone: 'rest', what: s.settled === 'merged' ? t('Merged, counted as accepted') : s.imported ? t('Past session (imported)') : t('Ended'), detail: s.last_message, verb: '' };
     default:
+      if (s.activity === 'quiet' && !s.hooked && !s.listed && s.settled !== 'merged') {
+        return { tone: 'rest', what: t('No commits lately: finished, waiting for you, or on a long task'), detail: s.last_message, verb: '{age}' };
+      }
       return { tone: 'rest', what: s.settled === 'merged' ? t('Merged, counted as accepted') : t('Idle, waiting for work'), detail: s.last_message, verb: '{age}' };
   }
 }
@@ -364,7 +368,7 @@ const cardSig = (s) => JSON.stringify([
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
-  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.activity, s.hooked, s.context_pct >= 85 && s.context_pct, s.task?.why,
+  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.activity, s.hooked, s.listed, s.context_pct >= 85 && s.context_pct, s.task?.why,
 ]);
 
 function card(s) {
@@ -1063,7 +1067,8 @@ function renderBench() {
       el('a', { href: s.pr.url, target: '_blank', rel: 'noreferrer', textContent: prLine(s.pr) }),
       s.pr.title ? `　${s.pr.title}` : '', s.pr.base ? ` → ${s.pr.base}` : ''),
     s.url && el('p', { className: 'pr' }, el('a', { href: s.url, target: '_blank', rel: 'noreferrer', textContent: t('Open in claude.ai') }),
-      !s.hooked ? t('　Known from your cloud session list: state only, no detail of what it is waiting for.') : ''),
+      s.hooked ? '' : s.listed ? t('　Known from your cloud session list: state only, no detail of what it is waiting for.')
+        : t('　Found through git: its commits and pull request are visible, but not whether it is waiting for you.')),
     notice?.key === s.key && el('div', { className: 'warn', textContent: notice.text }),
     taskStrip(s),
     nowBlock(s, d),

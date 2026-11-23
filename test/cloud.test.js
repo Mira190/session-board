@@ -112,3 +112,63 @@ test('the drop box takes deliveries and nothing else: nothing can be read or dec
   assert.equal(last.status, 429);
   await hub.close();
 });
+
+test('cloud sessions are found through git alone: branches, the session each commit names, and nothing changed in the user\'s clone', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, writeFileSync, realpathSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { readRemote } = await import('../src/cloudgit.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'sb-cg-')));
+  const g = (cwd, ...a) => execFileSync('git', ['-C', cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { encoding: 'utf8' }).trim();
+  const origin = join(root, 'origin.git'); const work = join(root, 'cloud-container'); const mine = join(root, 'my-clone');
+  execFileSync('git', ['init', '--bare', '-q', '-b', 'main', origin]);
+  execFileSync('git', ['clone', '-q', origin, work]);
+  const commit = (branch, file, msg, session) => {
+    g(work, 'checkout', '-q', '-B', branch); writeFileSync(join(work, file), msg);
+    g(work, 'add', '-A'); g(work, 'commit', '-qm', session ? `${msg}\n\nClaude-Session: https://claude.ai/code/session_${session}` : msg);
+    g(work, 'push', '-q', '-f', 'origin', branch);
+  };
+  commit('main', 'readme', 'init');
+  commit('claude/first-task', 'a', 'Add the importer', '01AAAAAAAAAAAA');
+  commit('claude/first-task', 'a2', 'Importer tests', '01AAAAAAAAAAAA');
+  commit('claude/second-task', 'b', 'Rework the cache', '01BBBBBBBBBBBB');
+  commit('claude/hand-made', 'c', 'A branch a person pushed with this prefix');
+  commit('feature/not-claude', 'd', 'Unrelated', '01CCCCCCCCCCCC');
+  execFileSync('git', ['clone', '-q', origin, mine]);
+  const before = g(mine, 'for-each-ref') + g(mine, 'count-objects', '-v');
+
+  const branches = await readRemote(origin, join(root, 'cache'));
+  assert.deepEqual(branches.map((b) => [b.branch, b.cloud_id, b.commits, b.subject]).sort(), [
+    ['claude/first-task', '01AAAAAAAAAAAA', 2, 'Importer tests'],
+    ['claude/second-task', '01BBBBBBBBBBBB', 1, 'Rework the cache'],
+  ], 'only claude/ branches whose commits name a session');
+  assert.equal(await readRemote(join(root, 'nowhere.git'), join(root, 'cache')), null, 'an unreachable remote is "could not read"');
+
+  // Through the hub: discovered from a clone the hub knows, without touching it.
+  let t = Date.now();
+  const hub = createHub({ localHost: 'laptop', now: () => t, cloudGit: { cacheRoot: join(root, 'cache2'), dirs: () => [mine] }, github: { findPr: async () => undefined } });
+  assert.deepEqual(await hub.scanCloudBranches(), { remotes: 1, sessions: 2 });
+  const s = (id) => hub.store.get(`claude:session_${id}`);
+  assert.deepEqual([s('01AAAAAAAAAAAA').state, s('01AAAAAAAAAAAA').title, s('01AAAAAAAAAAAA').branch, s('01AAAAAAAAAAAA').runtime, s('01AAAAAAAAAAAA').url],
+    ['working', 'Importer tests', 'claude/first-task', 'cloud', 'https://claude.ai/code/session_01AAAAAAAAAAAA'], 'a commit minutes ago: recently active');
+  assert.equal(g(mine, 'for-each-ref') + g(mine, 'count-objects', '-v'), before, 'the user\'s clone has no new refs and no new objects');
+
+  // Later, with no new commits, git can no longer tell working from waiting, and the board says so rather than guess.
+  t += 31 * 60_000;
+  await hub.scanCloudBranches();
+  assert.deepEqual([s('01AAAAAAAAAAAA').state, s('01AAAAAAAAAAAA').activity], ['idle', 'quiet']);
+  commit('claude/first-task', 'a3', 'Fix review comments', '01AAAAAAAAAAAA');
+  t = Date.now();
+  await hub.scanCloudBranches();
+  assert.deepEqual([s('01AAAAAAAAAAAA').state, s('01AAAAAAAAAAAA').title], ['working', 'Fix review comments']);
+
+  // The vendor's list, when it arrives, knows better and takes over; git no longer moves the state.
+  const { port } = await hub.listen(0, '127.0.0.1');
+  await fetch(`http://127.0.0.1:${port}/ingest/cloud`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify([{ id: 'session_01AAAAAAAAAAAA', title: 'Build the importer', status_bucket: 'SESSION_STATUS_BUCKET_BLOCKED', task_summary: 'needs your call on the schema' }]) });
+  t += 31 * 60_000;
+  await hub.scanCloudBranches();
+  assert.deepEqual([s('01AAAAAAAAAAAA').state, s('01AAAAAAAAAAAA').title, hub.store.list().length], ['needs_input', 'Build the importer', 2], 'same session, not a second one');
+  await hub.close();
+});
