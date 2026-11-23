@@ -15,6 +15,7 @@ const { values: opt, positionals } = parseArgs({
     sessions: { type: 'string' },
     triage: { type: 'boolean', default: false },
     once: { type: 'boolean', default: false },
+    'push-test': { type: 'boolean', default: false },
     model: { type: 'string' },
     interval: { type: 'string', default: '20' },
     'dry-run': { type: 'boolean', default: false },
@@ -29,6 +30,7 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board serve                     start the hub and the board UI
   session-board install <claude|codex>    add hooks to the agent's config
   session-board uninstall <claude|codex>  remove them again
+  session-board doctor [--push-test]      check on this machine that every piece actually works
   session-board status                    is the hub up, are the hooks in place
   session-board backfill [--days 7]       import sessions that predate the hooks
   session-board mcp                       MCP server (stdio) so agents can read the board
@@ -176,6 +178,13 @@ async function main() {
       if (opt.once) return;
       await new Promise((r) => setTimeout(r, Math.max(5, Number(opt.interval)) * 1000));
     }
+  }
+
+  if (cmd === 'doctor') {
+    const { doctor } = await import('../src/doctor.js');
+    const { url, token } = await endpoint();
+    const { failed } = await doctor({ url, token, pushTest: opt['push-test'] });
+    process.exit(failed ? 1 : 0);
   }
 
   if (cmd === 'status') {

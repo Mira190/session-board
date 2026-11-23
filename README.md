@@ -38,6 +38,14 @@ node bin/session-board.js up
 
 想分开做，也可以用 `serve`、`install claude`、`install codex`。
 
+装好后跑一次自检，它会在你的机器上实际走一遍每条链路，并告诉你哪里不通、怎么修：
+
+```bash
+node bin/session-board.js doctor
+```
+
+它检查：hub 是否可达、hook 事件能否到达看板、在看板做的决定能否回到 agent、命令桥能否找到 hub、两家 agent 的 hooks 是否装好且指向正确、有没有 tmux、GitHub 登录状态、手机推送是否配置（加 `--push-test` 真发一条）。
+
 - 想先看效果：hub 运行时执行 `node bin/session-board.js demo`。
 - 装 hooks 之前就存在的会话：点“导入历史”，或执行 `node bin/session-board.js backfill`。
 - 检查安装情况：`node bin/session-board.js status`。
