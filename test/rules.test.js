@@ -62,7 +62,7 @@ test('phone push: only when away, once per thing, merged when many, without the 
   const sent = [];
   const fetcher = async (url, init) => { sent.push({ url, title: decodeURIComponent(init.headers.Title || ''), priority: init.headers.Priority, click: init.headers.Click, body: init.body }); return { ok: true }; };
   let present = false;
-  const mk = (env) => createNotifier({ env: { SESSION_BOARD_NTFY: 'https://ntfy.example/t', ...env }, fetcher, boardUrl: 'http://board', isPresent: () => present, delayMs: 0 });
+  const mk = (env) => createNotifier({ env: { SESSION_BOARD_NTFY: 'https://ntfy.example/t', SESSION_BOARD_LANG: 'zh', ...env }, fetcher, boardUrl: 'http://board', isPresent: () => present, delayMs: 0 });
   const s = (key, over = {}) => ({ key, session_id: key, title: `task ${key}`, repo: 'api', host: 'mac', state: 'needs_input', since: 1, waiting: { kind: 'permission', detail: 'cat .env' }, ...over });
   const settle = () => new Promise((r) => setTimeout(r, 15));
 
@@ -76,6 +76,11 @@ test('phone push: only when away, once per thing, merged when many, without the 
   assert.equal(sent.length, 1, 'finished work does not push by default');
   n.consider(s('a', { state: 'failed', since: 3, waiting: null, error: 'boom' })); await settle();
   assert.equal(sent.at(-1).title, '出错停下了：task a');
+
+  sent.length = 0;
+  n = mk({ SESSION_BOARD_LANG: 'en' });
+  n.consider(s('e')); await settle();
+  assert.equal(sent[0].title, 'Needs permission: task e', 'English wording when the language is English');
 
   sent.length = 0; present = true;
   n.consider(s('b')); await settle();
