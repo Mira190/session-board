@@ -2,6 +2,8 @@
 // Layout: a list of sessions on the left, and on the right one "workbench"
 // where the selected session can be read, answered, reviewed and replied to
 // without leaving the page.
+import { t, lang, langPref, setLangPref, translatePage } from '/i18n.js';
+
 const $ = (sel, root = document) => root.querySelector(sel);
 const el = (tag, { dataset, ...props } = {}, ...kids) => {
   const node = Object.assign(document.createElement(tag), props);
@@ -17,7 +19,7 @@ const call = async (path, body) => {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
   const out = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(out.error || `请求失败 (${res.status})`);
+  if (!res.ok) throw new Error(out.error || t('Request failed ({status})', { status: res.status }));
   return out;
 };
 
@@ -42,11 +44,13 @@ const byKey = (key) => all.get(key);
 
 function age(ts) {
   const s = Math.max(0, Math.round((Date.now() + skew - ts) / 1000));
-  if (s < 60) return `${s} 秒`;
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟`;
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分`;
-  return `${Math.floor(s / 86400)} 天`;
+  if (s < 60) return t('{n}s', { n: s });
+  if (s < 3600) return t('{n}m', { n: Math.floor(s / 60) });
+  if (s < 86400) return t('{h}h {m}m', { h: Math.floor(s / 3600), m: Math.floor((s % 3600) / 60) });
+  return t('{n}d', { n: Math.floor(s / 86400) });
 }
+// verb is one of the "…{age}" phrases, or empty for "<age> ago".
+const ageText = (verb, since) => t(verb || '{age} ago', { age: age(since) });
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 
 function rawColumn(s) {
@@ -83,7 +87,7 @@ function column(s) {
 function describe(s) {
   if (s.snoozed) {
     const at = new Date(s.snoozed_until - skew).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    return { ...describeState(s), tone: 'rest', what: `稍后处理（到 ${at}）` };
+    return { ...describeState(s), tone: 'rest', what: t('Snoozed until {at}', { at }) };
   }
   return describeState(s);
 }
@@ -92,30 +96,30 @@ function describeState(s) {
   switch (s.state) {
     case 'needs_input':
       if (s.waiting?.kind === 'pr') {
-        return { tone: 'urgent', what: prWhat(s.waiting.detail), detail: s.pr ? `PR #${s.pr.number}　${s.pr.title || ''}` : null, verb: '已' };
+        return { tone: 'urgent', what: prWhat(s.waiting.detail), detail: s.pr ? `PR #${s.pr.number}　${s.pr.title || ''}` : null, verb: '{age}' };
       }
       return s.waiting?.kind === 'permission'
-        ? { tone: 'urgent', what: `要权限${s.waiting.tool ? '：' + s.waiting.tool : ''}`, detail: s.waiting.detail, code: true, verb: '已等' }
-        : { tone: 'urgent', what: '在问你', detail: s.waiting?.detail, verb: '已等' };
+        ? { tone: 'urgent', what: s.waiting.tool ? t('Needs permission: {tool}', { tool: s.waiting.tool }) : t('Needs permission'), detail: s.waiting.detail, code: true, verb: 'waiting {age}' }
+        : { tone: 'urgent', what: t('Asking you'), detail: s.waiting?.detail, verb: 'waiting {age}' };
     case 'failed':
-      return { tone: 'urgent', what: s.rate_limited ? '被限流或额度用完，停下了' : '出错停下了', detail: s.error, verb: '已停' };
+      return { tone: 'urgent', what: s.rate_limited ? t('Stopped: rate limited or out of quota') : t('Stopped on an error'), detail: s.error, verb: 'stopped {age}' };
     case 'unknown':
-      return { tone: 'urgent', what: '失联：找不到它的进程了', detail: s.error, verb: '已' };
+      return { tone: 'urgent', what: t('Lost: its process is gone'), detail: s.error, verb: '{age}' };
     case 'review':
-      return { tone: 'review', what: s.exited ? '做完并退出了，待验收' : '做完了，待验收', detail: s.last_message, verb: '已等' };
+      return { tone: 'review', what: s.exited ? t('Finished and exited, awaiting review') : t('Finished, awaiting review'), detail: s.last_message, verb: 'waiting {age}' };
     case 'working':
-      if (s.background) return { tone: 'working', what: `等它自己的后台任务（${s.background}）`, detail: s.last_message, verb: '已' };
+      if (s.background) return { tone: 'working', what: t('Waiting on its own background task ({task})', { task: s.background }), detail: s.last_message, verb: '{age}' };
       return {
         tone: 'working',
-        what: s.current_tool ? `在用 ${s.current_tool.tool}` : '在想',
+        what: s.current_tool ? t('Using {tool}', { tool: s.current_tool.tool }) : t('Thinking'),
         detail: s.current_tool?.detail || s.last_prompt,
         code: !!s.current_tool?.detail,
-        verb: '已',
+        verb: '{age}',
       };
     case 'ended':
-      return { tone: 'rest', what: s.settled === 'merged' ? '已合并，自动算作验收' : s.imported ? '历史会话（导入）' : '已结束', detail: s.last_message, verb: '' };
+      return { tone: 'rest', what: s.settled === 'merged' ? t('Merged, counted as accepted') : s.imported ? t('Past session (imported)') : t('Ended'), detail: s.last_message, verb: '' };
     default:
-      return { tone: 'rest', what: s.settled === 'merged' ? '已合并，自动算作验收' : '空闲，等你派活', detail: s.last_message, verb: '已' };
+      return { tone: 'rest', what: s.settled === 'merged' ? t('Merged, counted as accepted') : t('Idle, waiting for work'), detail: s.last_message, verb: '{age}' };
   }
 }
 
@@ -125,13 +129,23 @@ const resumeCommand = (s) => {
   const cd = s.cwd ? `cd ${JSON.stringify(s.cwd)} && ` : '';
   return s.agent === 'claude' ? `${cd}claude --resume ${s.session_id}` : `${cd}codex resume ${s.session_id}`;
 };
-const prWhat = (problem) => ({ checks: 'PR 检查失败', review: 'PR 被要求修改', 'checks+review': 'PR 检查失败，并被要求修改' }[problem] || 'PR 需要处理');
-const prFixText = (s) => `PR #${s.pr.number} ${{ checks: '的检查失败了，请查看失败原因', review: '被评审要求修改，请查看评审意见', 'checks+review': '的检查失败了，并且被评审要求修改，请查看失败原因和评审意见' }[s.waiting.detail] || '需要处理，请查看'}，修好后推送。`;
-const PR_STATE = { open: '开着', merged: '已合并', closed: '已关闭（未合并）' };
-const PR_CHECKS = { passing: '检查通过', failing: '检查失败', pending: '检查进行中' };
-const PR_REVIEW = { approved: '已批准', changes_requested: '要求修改', review_required: '等评审' };
+const prWhat = (problem) => ({
+  checks: t('PR checks failing'), review: t('PR changes requested'), 'checks+review': t('PR checks failing and changes requested'),
+}[problem] || t('PR needs attention'));
+const prFixText = (s) => {
+  const n = s.pr.number;
+  switch (s.waiting.detail) {
+    case 'checks': return t('PR #{n}: the checks failed. Look at why, fix it, and push.', { n });
+    case 'review': return t('PR #{n}: a reviewer requested changes. Read the review comments, fix them, and push.', { n });
+    case 'checks+review': return t('PR #{n}: the checks failed and a reviewer requested changes. Look at both, fix them, and push.', { n });
+    default: return t('PR #{n} needs attention. Take a look, fix it, and push.', { n });
+  }
+};
+const PR_STATE = { open: t('Open'), merged: t('Merged'), closed: t('Closed (not merged)') };
+const PR_CHECKS = { passing: t('Checks passing'), failing: t('Checks failing'), pending: t('Checks running') };
+const PR_REVIEW = { approved: t('Approved'), changes_requested: t('Changes requested'), review_required: t('Review required') };
 const prLine = (pr) => [
-  `PR #${pr.number}`, pr.draft && pr.state === 'open' ? '草稿' : PR_STATE[pr.state],
+  `PR #${pr.number}`, pr.draft && pr.state === 'open' ? t('Draft') : PR_STATE[pr.state],
   pr.state === 'open' ? PR_CHECKS[pr.checks] : null, pr.state === 'open' ? PR_REVIEW[pr.review] : null,
 ].filter(Boolean).join(' · ');
 const prTone = (pr) => (pr.state === 'merged' ? 'ok' : pr.checks === 'failing' || pr.review === 'changes_requested' ? 'bad' : '');
@@ -140,8 +154,8 @@ const usageLine = (s) => {
   if (!u) return null;
   return [
     u.model,
-    u.context_tokens ? `上下文 ${tokens(u.context_tokens)}` : null,
-    u.output_tokens ? `输出 ${tokens(u.output_tokens)}` : null,
+    u.context_tokens ? t('context {n}', { n: tokens(u.context_tokens) }) : null,
+    u.output_tokens ? t('output {n}', { n: tokens(u.output_tokens) }) : null,
     u.cost_usd != null ? `$${u.cost_usd.toFixed(2)}` : null,
   ].filter(Boolean).join(' · ');
 };
@@ -189,7 +203,7 @@ function answersFor(s) {
 }
 const answer = (s) => {
   const answers = answersFor(s);
-  if (Object.keys(answers).length < s.waiting.questions.length) return say(s.key, '每个问题都要选一个或填一个答案。');
+  if (Object.keys(answers).length < s.waiting.questions.length) return say(s.key, t('Pick or type an answer for every question.'));
   return act(s, () => call(`/api/requests/${s.waiting.id}`, { decision: 'answer', answers }));
 };
 // Every filing action can be taken back for a few seconds.
@@ -197,7 +211,7 @@ let toastTimer = 0;
 function toast(text, undo) {
   const box = $('#toast');
   clearTimeout(toastTimer);
-  box.replaceChildren(text, ...(undo ? [el('button', { textContent: '撤销', onclick: async () => { box.hidden = true; await undo().catch(() => {}); } })] : []));
+  box.replaceChildren(text, ...(undo ? [el('button', { textContent: t('Undo'), onclick: async () => { box.hidden = true; await undo().catch(() => {}); } })] : []));
   box.hidden = false;
   toastTimer = setTimeout(() => { box.hidden = true; }, 5000);
 }
@@ -206,10 +220,10 @@ const file = (s, verb, reverse, text, body = {}) => act(s, async () => {
   await call(`/api/sessions/${k}/${verb}`, body);
   toast(text, () => call(`/api/sessions/${k}/${reverse}`, {}).then(() => select(s.key, true)));
 });
-const ack = (s) => file(s, 'ack', 'unack', s.state === 'review' ? '已验收。' : '已知悉。');
-const archive = (s) => file(s, 'archive', 'unarchive', '已归档。');
+const ack = (s) => file(s, 'ack', 'unack', s.state === 'review' ? t('Accepted.') : t('Noted.'));
+const archive = (s) => file(s, 'archive', 'unarchive', t('Archived.'));
 const tomorrow = () => { const d = new Date(Date.now() + skew); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d.getTime(); };
-const snooze = (s, body, label) => file(s, 'snooze', 'unsnooze', `已推迟到${label}。期间它有新情况会提前回来。`, body);
+const snooze = (s, body, label) => file(s, 'snooze', 'unsnooze', t('Snoozed until {label}. It comes back early if something new happens.', { label }), body);
 const markUnread = (s) => call(`/api/sessions/${encodeURIComponent(s.key)}/unseen`, {}).then(() => { reading = null; advance(s.key); }).catch((e) => say(s.key, e.message));
 
 async function send(s) {
@@ -228,7 +242,7 @@ async function send(s) {
 function copy(text, button) {
   navigator.clipboard?.writeText(text).then(() => {
     const old = button.textContent;
-    button.textContent = '已复制';
+    button.textContent = t('Copied');
     setTimeout(() => (button.textContent = old), 1200);
   });
 }
@@ -239,15 +253,15 @@ function copy(text, button) {
 // into a per-project summary; identical requests are offered as one decision.
 
 const GROUPS = [
-  ['attention', '等你回应', '权限、提问、失败、失联、PR 出问题。越靠上越该先处理。'],
-  ['review', '待验收', 'agent 说做完了，你还没看。'],
-  ['working', '工作中', '不需要你，除非它安静太久。'],
-  ['rest', '空闲 / 已结束', '等你派下一件事，或已退出。'],
+  ['attention', t('Needs you'), t('Permissions, questions, failures, lost sessions, PR problems. Higher means more urgent.')],
+  ['review', t('To review'), t('The agent says it is done and you have not looked yet.')],
+  ['working', t('Working'), t('Does not need you, unless it has been quiet too long.')],
+  ['rest', t('Idle / ended'), t('Waiting for your next job, or already exited.')],
 ];
 const MANY = 12; // past this many sessions, the working group starts folded
 
 let filter = '';
-const repoOf = (s) => s.repo || (s.cwd || '').split('/').pop() || '(未知项目)';
+const repoOf = (s) => s.repo || (s.cwd || '').split('/').pop() || t('(unknown project)');
 const matches = (s) => !filter ||
   [s.title, s.repo, s.cwd, s.host, s.agent, s.branch].filter(Boolean).join(' ').toLowerCase().includes(filter);
 const visible = () => (filter ? snap.sessions.filter(matches) : snap.sessions);
@@ -276,17 +290,17 @@ function reconcile(container, items) {
 }
 
 const ageSpan = (s, d) => el('span', {
-  className: 'age', dataset: { since: s.since, verb: d.verb }, textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前`,
+  className: 'age', dataset: { since: s.since, verb: d.verb }, textContent: ageText(d.verb, s.since),
 });
 function tickAges() {
   for (const n of document.querySelectorAll('.age[data-since]')) {
     const since = Number(n.dataset.since);
-    n.textContent = n.dataset.verb ? `${n.dataset.verb} ${age(since)}` : `${age(since)}前`;
+    n.textContent = ageText(n.dataset.verb, since);
   }
 }
 
 // A triage agent's note: advice, clearly marked as such.
-const SUGGEST = { allow: '建议允许', deny: '建议拒绝', look: '需要你看', none: '' };
+const SUGGEST = { allow: t('Suggest allow'), deny: t('Suggest deny'), look: t('Needs a look'), none: '' };
 const triageLine = (s) => s.triage && el('div', { className: `triage ${s.triage.suggestion}` },
   SUGGEST[s.triage.suggestion] && el('b', { textContent: SUGGEST[s.triage.suggestion] }), s.triage.summary);
 
@@ -318,9 +332,9 @@ function taskCard(entry) {
   const tone = describe(entry.lead).tone;
   const agents = [...new Set(entry.members.map(agentName))].join(' + ');
   return el('div', { className: 'card task', dataset: { tone } },
-    el('div', { className: 'meta' }, el('span', { className: 'tasktag', textContent: `任务 · ${entry.members.length} 个会话` }),
+    el('div', { className: 'meta' }, el('span', { className: 'tasktag', textContent: t('Task · {n} sessions', { n: entry.members.length }) }),
       el('span', { className: 'where', textContent: [agents, repoOf(entry.lead)].join(' · ') })),
-    el('div', { className: 'title', textContent: entry.lead.title || '(还没有任务描述)' }),
+    el('div', { className: 'title', textContent: entry.lead.title || t('(no task description yet)') }),
     el('div', { className: 'members' }, entry.members.map((m) => {
       const d = describe(m);
       return el('button', {
@@ -351,19 +365,19 @@ function card(s) {
     el('div', { className: 'meta' },
       el('span', { className: `badge ${s.agent}`, textContent: agentName(s) }),
       el('span', { className: 'where', textContent: where(s) }),
-      s.runtime === 'cloud' && el('span', { textContent: '云端' }),
-      s.subagents > 0 && el('span', { textContent: `${s.subagents} 个子 agent` }),
+      s.runtime === 'cloud' && el('span', { textContent: t('Cloud') }),
+      s.subagents > 0 && el('span', { textContent: t('{n} subagents', { n: s.subagents }) }),
     ),
-    el('div', { className: 'title' }, s.unseen && el('span', { className: 'dot', title: '还没看过' }), s.title || '(还没有任务描述)'),
+    el('div', { className: 'title' }, s.unseen && el('span', { className: 'dot', title: t('Not seen yet') }), s.title || t('(no task description yet)')),
     el('div', { className: 'status' },
-      el('span', { className: 'what', textContent: d.what + (s.requests.length > 1 ? `（共 ${s.requests.length} 个请求）` : '') }),
+      el('span', { className: 'what', textContent: d.what + (s.requests.length > 1 ? t(' ({n} requests)', { n: s.requests.length }) : '') }),
       ageSpan(s, d),
     ),
-    s.waiting?.risky && el('div', { className: 'warn', textContent: '高风险命令，请单独确认' }),
+    s.waiting?.risky && el('div', { className: 'warn', textContent: t('Risky command, confirm on its own') }),
     d.detail && el('div', { className: 'peek', textContent: d.detail.split('\n')[0] }),
     triageLine(s),
     s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
-    s.quiet && el('div', { className: 'warn', textContent: '超过 10 分钟没有任何动静' }),
+    s.quiet && el('div', { className: 'warn', textContent: t('No activity for over 10 minutes') }),
   );
 }
 
@@ -396,7 +410,9 @@ async function decideBatch(group, decision, remember = false) {
   try {
     const out = await call('/api/requests/batch', { ids: group.map((s) => s.waiting.id), decision, remember });
     pinned = false;
-    toast(out.rule ? `已处理 ${out.decided} 个，以后${out.rule.mode === 'prefix' ? `“${out.rule.detail} …”这一类` : '这条命令'}自动允许。` : `已处理 ${out.decided} 个。`,
+    toast(out.rule ? (out.rule.mode === 'prefix'
+      ? t('Handled {n}. “{cmd} …” commands are now allowed automatically.', { n: out.decided, cmd: out.rule.detail })
+      : t('Handled {n}. This command is now allowed automatically.', { n: out.decided })) : t('Handled {n}.', { n: out.decided }),
       out.rule && (() => fetch(api('/api/rules'), { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(out.rule) })));
   } catch (err) {
     say(selected, err.message);
@@ -410,23 +426,23 @@ function batchCard(group) {
     const rule = { tool: w.tool, detail: group.stem, mode: 'prefix' };
     const cmds = [...new Set(group.map((s) => s.waiting.detail.split('\n')[0]))];
     return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
-      el('div', { className: 'status' }, el('span', { className: 'what', textContent: `${group.length} 个会话在请求同一类命令：${w.tool}` })),
+      el('div', { className: 'status' }, el('span', { className: 'what', textContent: t('{n} sessions are asking for the same kind of command: {tool}', { n: group.length, tool: w.tool }) })),
       el('div', { className: 'peek code', textContent: `${group.stem} …` }),
-      el('ul', { className: 'cmds' }, cmds.slice(0, 4).map((c) => el('li', { textContent: c })), cmds.length > 4 && el('li', { textContent: `…另有 ${cmds.length - 4} 条` })),
+      el('ul', { className: 'cmds' }, cmds.slice(0, 4).map((c) => el('li', { textContent: c })), cmds.length > 4 && el('li', { textContent: t('…and {n} more', { n: cmds.length - 4 }) })),
       el('div', { className: 'actions' },
-        el('button', { className: 'primary', textContent: `全部允许（${group.length}）`, onclick: () => decideBatch(group, 'allow') }),
-        el('button', { textContent: '全部允许，以后这一类也自动允许', title: `以后“${group.stem} ”加任意参数都自动允许；带 ; | && 或高风险写法的仍会问你。可在“自动规则”里撤销`, onclick: () => decideBatch(group, 'allow', rule) }),
-        el('button', { className: 'danger', textContent: '全部拒绝', onclick: () => decideBatch(group, 'deny') }),
+        el('button', { className: 'primary', textContent: t('Allow all ({n})', { n: group.length }), onclick: () => decideBatch(group, 'allow') }),
+        el('button', { textContent: t('Allow all, and auto-allow this kind from now on'), title: t('From now on “{stem} ” with any arguments is allowed automatically; commands with ; | && or risky forms still ask. Undo in “Auto rules”.', { stem: group.stem }), onclick: () => decideBatch(group, 'allow', rule) }),
+        el('button', { className: 'danger', textContent: t('Deny all'), onclick: () => decideBatch(group, 'deny') }),
       ));
   }
   return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
-    el('div', { className: 'status' }, el('span', { className: 'what', textContent: `${group.length} 个会话在请求同一件事：${w.tool}` })),
+    el('div', { className: 'status' }, el('span', { className: 'what', textContent: t('{n} sessions are asking for the same thing: {tool}', { n: group.length, tool: w.tool }) })),
     el('div', { className: 'peek code', textContent: w.detail.split('\n')[0] }),
-    el('div', { className: 'meta', textContent: repos.slice(0, 4).join('、') + (repos.length > 4 ? ` 等 ${repos.length} 个项目` : '') }),
+    el('div', { className: 'meta', textContent: repos.length > 4 ? t('{list} and others ({n} projects)', { list: repos.slice(0, 4).join(t(', ')), n: repos.length }) : repos.join(t(', ')) }),
     el('div', { className: 'actions' },
-      el('button', { className: 'primary', textContent: `全部允许（${group.length}）`, onclick: () => decideBatch(group, 'allow') }),
-      el('button', { textContent: '全部允许，以后也自动允许', title: '只对完全相同的这条命令生效，可在“自动规则”里撤销', onclick: () => decideBatch(group, 'allow', true) }),
-      el('button', { className: 'danger', textContent: '全部拒绝', onclick: () => decideBatch(group, 'deny') }),
+      el('button', { className: 'primary', textContent: t('Allow all ({n})', { n: group.length }), onclick: () => decideBatch(group, 'allow') }),
+      el('button', { textContent: t('Allow all, and auto-allow from now on'), title: t('Applies to this exact command only. Undo in “Auto rules”.'), onclick: () => decideBatch(group, 'allow', true) }),
+      el('button', { className: 'danger', textContent: t('Deny all'), onclick: () => decideBatch(group, 'deny') }),
     ));
 }
 
@@ -445,7 +461,7 @@ const rollup = (list) => {
   const by = new Map();
   for (const s of list) by.set(repoOf(s), (by.get(repoOf(s)) || 0) + 1);
   const top = [...by].sort((a, b) => b[1] - a[1]);
-  return top.slice(0, 8).map(([r, n]) => `${r} ${n}`).join(' · ') + (top.length > 8 ? ` · 另有 ${top.length - 8} 个项目` : '');
+  return top.slice(0, 8).map(([r, n]) => `${r} ${n}`).join(' · ') + (top.length > 8 ? t(' · {n} more projects', { n: top.length - 8 }) : '');
 };
 
 function renderLists(groups) {
@@ -479,7 +495,7 @@ function renderLists(groups) {
     }
     if (!items.length && !fold) {
       items.push({ key: 'empty', sig: `${name}:${filter}`, make: () => el('div', {
-        className: 'empty', textContent: filter ? '没有匹配的会话。' : name === 'attention' ? '没有人在等你。' : '—' }) });
+        className: 'empty', textContent: filter ? t('No matching sessions.') : name === 'attention' ? t('Nobody is waiting for you.') : '—' }) });
     }
     reconcile($('.cards', sec), items);
   }
@@ -523,9 +539,9 @@ const QUEUE_ROWS = 2; // the queue never takes more rows than this
 const agentNodes = new Map();
 
 const bubbleFor = (s) => {
-  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? '要权限' : s.waiting?.kind === 'pr' ? prWhat(s.waiting.detail) : '有问题问你';
-  if (s.state === 'failed') return s.rate_limited ? '被限流了' : '出错了';
-  if (s.state === 'unknown') return '失联';
+  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? t('Needs permission') : s.waiting?.kind === 'pr' ? prWhat(s.waiting.detail) : t('Has a question');
+  if (s.state === 'failed') return s.rate_limited ? t('Rate limited') : t('Hit an error');
+  if (s.state === 'unknown') return t('Lost');
   return null;
 };
 
@@ -599,38 +615,38 @@ function renderOffice() {
   const more = overflow ? queueSlot(queued.size) : null;
   $('.scene', floor).replaceChildren(...[
     el('div', { className: 'zone', style: `top:0;height:${lobby}px` }),
-    el('div', { className: 'zone-label', style: 'left:14px;top:6px', textContent: '你的桌前：排队等你的' }),
+    el('div', { className: 'zone-label', style: 'left:14px;top:6px', textContent: t('At your desk: queued for you') }),
     ...roomBoxes.map((r) => el('div', { className: 'room', style: `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px` },
       el('div', { className: 'room-label' },
         el('b', { textContent: r.repo }),
-        r.wait > 0 && el('span', { className: 'n wait', textContent: `${r.wait} 等你` }),
-        r.review > 0 && el('span', { className: 'n review', textContent: `${r.review} 待验收` }),
-        el('span', { className: 'n', textContent: `${r.work}/${r.total} 在干活` })))),
+        r.wait > 0 && el('span', { className: 'n wait', textContent: t('{n} waiting', { n: r.wait }) }),
+        r.review > 0 && el('span', { className: 'n review', textContent: t('{n} to review', { n: r.review }) }),
+        el('span', { className: 'n', textContent: t('{n}/{total} working', { n: r.work, total: r.total }) })))),
     more && el('button', {
       className: 'queue-more', type: 'button', style: `left:${more.x}px;top:${more.y + 6}px`,
-      textContent: `+${overflow}`, title: `还有 ${overflow} 个在等你，在各自工位上举着牌子`, onclick: () => setView('inbox'),
+      textContent: `+${overflow}`, title: t('{n} more are waiting for you, holding up signs at their desks', { n: overflow }), onclick: () => setView('inbox'),
     }),
-    !present.length && el('div', { className: 'empty-office', textContent: filter ? '没有匹配的会话。' : '办公室里还没有人。启动任意一个 Claude Code 或 Codex 会话，它会自己走进来。' }),
+    !present.length && el('div', { className: 'empty-office', textContent: filter ? t('No matching sessions.') : t('Nobody is in the office yet. Start any Claude Code or Codex session and it will walk in by itself.') }),
   ].filter(Boolean));
 
   // Desks, keyed so that only changed ones are rebuilt.
   reconcile($('.desks', floor), desks.map(({ s, x: dx, y: dy }) => {
     const d = describe(s);
-    const flag = waitingAtDesk.has(s.key) ? ['wait', '!'] : s.state === 'review' ? ['done', compact ? '✓' : '做完了']
-      : s.quiet ? ['quiet', compact ? '…' : '很久没动静'] : !compact && s.subagents > 0 ? ['', `+${s.subagents} 帮手`] : null;
+    const flag = waitingAtDesk.has(s.key) ? ['wait', '!'] : s.state === 'review' ? ['done', compact ? '✓' : t('Done')]
+      : s.quiet ? ['quiet', compact ? '…' : t('Quiet for long')] : !compact && s.subagents > 0 ? ['', t('+{n} helpers', { n: s.subagents })] : null;
     return {
       key: s.key,
       sig: JSON.stringify([dx, dy, compact, s.state, queued.has(s.key), flag, s.title, s.agent, s.repo, s.runtime, d.what]),
       make: () => {
         const node = el('button', {
-            className: 'desk', type: 'button', style: `left:${dx}px;top:${dy}px`, title: `${s.title || s.session_id}：${d.what}`,
+            className: 'desk', type: 'button', style: `left:${dx}px;top:${dy}px`, title: t('{a}: {b}', { a: s.title || s.session_id, b: d.what }),
             dataset: { state: s.state, away: String(queued.has(s.key)) }, onclick: () => select(s.key, true),
           },
           flag && el('span', { className: `flag ${flag[0]}`, textContent: flag[1] }));
         node.insertAdjacentHTML('beforeend', DESK);
         if (!compact) {
-          node.append(el('span', { className: 'plate' }, s.title || '(还没有任务)',
-            el('small', { textContent: [s.runtime === 'cloud' ? '云端' : null, agentName(s)].filter(Boolean).join(' · ') })));
+          node.append(el('span', { className: 'plate' }, s.title || t('(no task yet)'),
+            el('small', { textContent: [s.runtime === 'cloud' ? t('Cloud') : null, agentName(s)].filter(Boolean).join(' · ') })));
         }
         return node;
       },
@@ -643,14 +659,14 @@ function renderOffice() {
   you.style.cssText = `left:18px;top:${myY}px`;
   you.innerHTML = MY_DESK;
   you.append(...[
-    el('div', { className: 'plate', textContent: '你' }),
+    el('div', { className: 'plate', textContent: t('You') }),
     el('div', { className: 'tray', style: 'left:96px;bottom:54px' },
       reviews.slice(0, 5).map((s) => el('button', {
-        className: 'paper', type: 'button', title: `待验收：${s.title || s.session_id}`,
-        ariaLabel: `待验收：${s.title || s.session_id}`, ariaCurrent: String(s.key === selected), onclick: () => select(s.key, true),
+        className: 'paper', type: 'button', title: t('To review: {title}', { title: s.title || s.session_id }),
+        ariaLabel: t('To review: {title}', { title: s.title || s.session_id }), ariaCurrent: String(s.key === selected), onclick: () => select(s.key, true),
       })),
       reviews.length > 5 && el('span', { className: 'paper more', textContent: `+${reviews.length - 5}` })),
-    reviews.length > 0 && el('div', { className: 'tray-label', style: 'left:96px;bottom:86px', textContent: `待验收 ${reviews.length}` }),
+    reviews.length > 0 && el('div', { className: 'tray-label', style: 'left:96px;bottom:86px', textContent: t('To review {n}', { n: reviews.length }) }),
   ].filter(Boolean));
 
   // Agents: kept across renders so moving between desk and queue animates.
@@ -683,10 +699,10 @@ function renderOffice() {
     if (node.dataset.sig === sig) continue;
     Object.assign(node.dataset, { sig, agent: s.agent, tone: d.tone, state: s.state, queued: String(q !== undefined), small: String(compact && q === undefined) });
     node.setAttribute('aria-current', String(s.key === selected));
-    node.setAttribute('aria-label', `${agentName(s)}：${s.title || s.session_id}，${d.what}`);
-    node.title = `${s.title || s.session_id}：${d.what}`;
+    node.setAttribute('aria-label', t('{agent}: {title}, {what}', { agent: agentName(s), title: s.title || s.session_id, what: d.what }));
+    node.title = t('{a}: {b}', { a: s.title || s.session_id, b: d.what });
     const label = q === undefined ? null : bubbleFor(s);
-    $('.bubble', node).replaceChildren(...(label ? [label, el('small', { className: 'age', dataset: { since: s.since, verb: '等了' }, textContent: `等了 ${age(s.since)}` })] : []));
+    $('.bubble', node).replaceChildren(...(label ? [label, el('small', { className: 'age', dataset: { since: s.since, verb: 'waited {age}' }, textContent: ageText('waited {age}', s.since) })] : []));
     $('.tag', node).textContent = s.title || s.session_id;
   }
 }
@@ -703,24 +719,24 @@ function diffView(diff) {
 
 function replyBox(s) {
   if (!s.reply) {
-    if (s.reply_blocked) return el('p', { className: 'note', textContent: '它的终端正停在上面那个请求上：现在往里打字会被当成对那个请求的回答，所以先处理请求，再回复。' });
-    if (s.runtime === 'cloud' || !s.local) return el('p', { className: 'note', textContent: '这个会话不在本机上，只能在它自己的界面里回复。' });
+    if (s.reply_blocked) return el('p', { className: 'note', textContent: t('Its terminal is stopped on the request above: anything typed there now would be taken as the answer to it. Handle the request first, then reply.') });
+    if (s.runtime === 'cloud' || !s.local) return el('p', { className: 'note', textContent: t('This session is not on this machine; reply from its own interface.') });
     return el('div', {},
-      el('p', { className: 'note', textContent: '它开在一个看板没法输入的终端里（不是 tmux）。在 tmux 里启动的会话可以直接从这里回复。' }),
+      el('p', { className: 'note', textContent: t('It runs in a terminal the board cannot type into (not tmux). Sessions started inside tmux can be replied to from here.') }),
       el('div', { className: 'actions' },
-        el('button', { textContent: '复制接入命令', title: resumeCommand(s), onclick: (e) => copy(resumeCommand(s), e.currentTarget) })),
+        el('button', { textContent: t('Copy attach command'), title: resumeCommand(s), onclick: (e) => copy(resumeCommand(s), e.currentTarget) })),
     );
   }
   const area = el('textarea', {
-    id: 'reply', placeholder: '告诉它下一步做什么…', value: drafts.get(s.key) || '',
+    id: 'reply', placeholder: t('Tell it what to do next…'), value: drafts.get(s.key) || '',
     oninput: (e) => drafts.set(s.key, e.target.value),
     onkeydown: (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(s); } },
   });
   return el('div', { className: 'reply' }, area,
     el('div', { className: 'actions' },
-      el('button', { className: 'primary', textContent: '发送', onclick: () => send(s) }),
+      el('button', { className: 'primary', textContent: t('Send'), onclick: () => send(s) }),
       el('span', { className: 'note', textContent: (s.reply === 'tmux'
-        ? '会直接打进它所在的 tmux 窗口。' : '它的进程已退出：会在后台接着同一个会话再跑一轮。') + ' Ctrl/⌘ + Enter 发送' }),
+        ? t('Goes straight into its tmux window.') : t('Its process has exited: this resumes the same session for another round in the background.')) + t(' Ctrl/⌘ + Enter to send') }),
     ));
 }
 
@@ -732,7 +748,7 @@ function questionForm(s) {
     const p = (mine[q.question] ||= { chosen: new Set(), other: '' });
     return el('fieldset', {},
       el('legend', { textContent: q.question }),
-      q.multiSelect && el('div', { className: 'note', textContent: '可以多选' }),
+      q.multiSelect && el('div', { className: 'note', textContent: t('Multiple choice') }),
       el('div', { className: 'options' }, q.options.map((o) => el('button', {
         type: 'button', className: 'option', ariaPressed: String(p.chosen.has(o.label)),
         onclick: () => {
@@ -742,7 +758,7 @@ function questionForm(s) {
         },
       }, el('b', { textContent: o.label }), o.description && el('span', { textContent: o.description })))),
       el('input', {
-        id: `other-${id}-${i}`, type: 'text', placeholder: '或者自己写一个答案…', value: p.other,
+        id: `other-${id}-${i}`, type: 'text', placeholder: t('Or write your own answer…'), value: p.other,
         oninput: (e) => { p.other = e.target.value; if (!q.multiSelect && p.other) p.chosen.clear(); },
         onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); answer(s); } },
       }),
@@ -758,7 +774,7 @@ async function ackTask(s, adopt) {
       ...out.archived.map((k) => call(`/api/sessions/${encodeURIComponent(k)}/unarchive`, {})),
       ...out.acked.map((k) => call(`/api/sessions/${encodeURIComponent(k)}/unack`, {})),
     ]);
-    toast(adopt ? `已采用这一版，验收 ${out.acked.length} 个，归档其余 ${out.archived.length} 个。` : `已验收这个任务的 ${out.acked.length} 个会话。`, undo);
+    toast(adopt ? t('Adopted this version: accepted {a}, archived the other {b}.', { a: out.acked.length, b: out.archived.length }) : t('Accepted {n} sessions of this task.', { n: out.acked.length }), undo);
     advance(s.key);
   } catch (err) {
     say(s.key, err.message);
@@ -770,18 +786,18 @@ function taskStrip(s) {
   if (!s.task || group.length < 2) return null;
   const reviewable = group.filter((m) => ['review', 'failed', 'unknown'].includes(m.state));
   return el('div', { className: 'taskstrip' },
-    el('div', { className: 'note', textContent: `同一个任务的 ${group.length} 个会话（同一句指令或同一个分支）。点一行切换，逐个对比后按任务验收。` }),
+    el('div', { className: 'note', textContent: t('{n} sessions of the same task (same instruction or same branch). Click a row to switch, compare them one by one, then accept by task.', { n: group.length }) }),
     el('div', { className: 'members' }, group.map((m) => {
       const d = describe(m);
       return el('button', { className: 'member wide', type: 'button', dataset: { tone: d.tone }, ariaCurrent: String(m.key === s.key), onclick: () => select(m.key, true) },
         el('span', { className: `badge ${m.agent}`, textContent: agentName(m) }),
         el('span', { className: 'what', textContent: d.what }),
-        el('span', { className: 'facts', textContent: [m.branch, m.files_count ? `改了 ${m.files_count} 个文件` : null, m.pr && prLine(m.pr), m.usage?.cost_usd != null ? `$${m.usage.cost_usd.toFixed(2)}` : null].filter(Boolean).join(' · ') }));
+        el('span', { className: 'facts', textContent: [m.branch, m.files_count ? t('{n} files changed', { n: m.files_count }) : null, m.pr && prLine(m.pr), m.usage?.cost_usd != null ? `$${m.usage.cost_usd.toFixed(2)}` : null].filter(Boolean).join(' · ') }));
     })),
     el('div', { className: 'actions' },
-      s.state === 'review' && el('button', { className: 'primary', textContent: '采用这一版，其余归档', title: '验收当前这个会话，把同任务里其他已停下的会话归档；还在干活的不动', onclick: () => ackTask(s, s.key) }),
-      reviewable.length > 0 && el('button', { textContent: `全部验收（${reviewable.length}）`, onclick: () => ackTask(s) }),
-      el('button', { textContent: '把这个会话拆出去', title: '它其实是另一件事', onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/task`, { join: null }).catch((e) => say(s.key, e.message)) }),
+      s.state === 'review' && el('button', { className: 'primary', textContent: t('Adopt this one, archive the rest'), title: t('Accept this session and archive the task’s other stopped sessions; ones still working are left alone'), onclick: () => ackTask(s, s.key) }),
+      reviewable.length > 0 && el('button', { textContent: t('Accept all ({n})', { n: reviewable.length }), onclick: () => ackTask(s) }),
+      el('button', { textContent: t('Split this session off'), title: t('It is actually a different task'), onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/task`, { join: null }).catch((e) => say(s.key, e.message)) }),
     ));
 }
 
@@ -791,71 +807,71 @@ function nowBlock(s, d) {
   const kids = [
     el('div', { className: 'status' },
       el('span', { className: 'what', textContent: d.what }),
-      el('span', { className: 'age', textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前` })),
+      el('span', { className: 'age', textContent: ageText(d.verb, s.since) })),
     !form && d.detail && el('div', { className: `box${d.code ? ' code' : ' prose'}`, textContent: d.detail }),
     form && questionForm(s),
     s.triage && el('div', { className: `triage big ${s.triage.suggestion}` },
-      el('b', { textContent: SUGGEST[s.triage.suggestion] || '分诊备注' }), s.triage.summary,
-      el('span', { className: 'note', textContent: '　分诊 agent 的建议，不是决定' })),
+      el('b', { textContent: SUGGEST[s.triage.suggestion] || t('Triage note') }), s.triage.summary,
+      el('span', { className: 'note', textContent: t(' Advice from the triage agent, not a decision') })),
   ];
   const actions = el('div', { className: 'actions' });
   if (s.state === 'needs_input' && s.waiting.kind === 'pr') {
     actions.append(...[
       s.reply && s.pr && el('button', {
-        className: 'primary', textContent: '让它去修', title: prFixText(s),
+        className: 'primary', textContent: t('Have it fix this'), title: prFixText(s),
         onclick: () => { drafts.set(s.key, prFixText(s)); send(s); },
       }),
-      s.pr && el('button', { textContent: '打开 PR', onclick: () => window.open(s.pr.url, '_blank', 'noreferrer') }),
-      el('button', { textContent: '知道了 (E)', title: '先不管；同一个问题不会再提醒', onclick: () => ack(s) }),
+      s.pr && el('button', { textContent: t('Open PR'), onclick: () => window.open(s.pr.url, '_blank', 'noreferrer') }),
+      el('button', { textContent: t('Got it (E)'), title: t('Leave it for now; the same problem will not remind you again'), onclick: () => ack(s) }),
     ].filter(Boolean));
   } else if (form) {
     actions.append(
-      el('button', { className: 'primary', textContent: '回答', onclick: () => answer(s) }),
-      el('button', { textContent: '交回终端', title: '不在这里回答，让它在自己的终端里问你', onclick: () => decide(s, 'terminal') }),
+      el('button', { className: 'primary', textContent: t('Answer'), onclick: () => answer(s) }),
+      el('button', { textContent: t('Hand back to terminal'), title: t('Do not answer here; let it ask in its own terminal'), onclick: () => decide(s, 'terminal') }),
     );
   } else if (asking) {
-    actions.append(el('span', { className: 'note', textContent: '这个提问现在只能在它自己的终端里回答。' }));
+    actions.append(el('span', { className: 'note', textContent: t('This question can only be answered in its own terminal right now.') }));
   } else if (s.state === 'needs_input' && s.waiting.kind === 'permission') {
     if (s.waiting.decidable) {
       actions.append(
-        el('button', { className: 'primary', textContent: '允许 (A)', onclick: () => decide(s, 'allow') }),
-        el('button', { className: 'danger', textContent: '拒绝 (D)', onclick: () => decide(s, 'deny') }),
-        s.waiting.tool && el('button', { textContent: `本会话都允许 ${s.waiting.tool}`, onclick: () => decide(s, 'allow', true) }),
-        el('button', { textContent: '交回终端', title: '不在这里决定，让它在自己的终端里问你', onclick: () => decide(s, 'terminal') }),
+        el('button', { className: 'primary', textContent: t('Allow (A)'), onclick: () => decide(s, 'allow') }),
+        el('button', { className: 'danger', textContent: t('Deny (D)'), onclick: () => decide(s, 'deny') }),
+        s.waiting.tool && el('button', { textContent: t('Allow {tool} for this session', { tool: s.waiting.tool }), onclick: () => decide(s, 'allow', true) }),
+        el('button', { textContent: t('Hand back to terminal'), title: t('Do not decide here; let it ask in its own terminal'), onclick: () => decide(s, 'terminal') }),
       );
       // Decide it for every session, now and later.
       if (!s.waiting.risky && s.waiting.tool && s.waiting.detail) {
         const always = (rule, label) => call('/api/rules', rule)
-          .then(() => { toast(`以后所有会话里${label}都自动允许。`, () => fetch(api('/api/rules'), { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rule) })); advance(s.key); })
+          .then(() => { toast(t('{label} will be allowed automatically in every session from now on.', { label }), () => fetch(api('/api/rules'), { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rule) })); advance(s.key); })
           .catch((e) => say(s.key, e.message));
         kids.push(el('div', { className: 'actions rules-row' },
-          el('span', { className: 'note', textContent: '所有会话以后都自动允许：' }),
-          el('button', { textContent: '这一条', title: s.waiting.detail, onclick: () => always({ tool: s.waiting.tool, detail: s.waiting.detail, mode: 'exact' }, '这条命令') }),
-          s.waiting.stem && el('button', { textContent: `${s.waiting.stem} …`, title: '带任意参数；带 ; | && 或高风险写法的仍会问你', onclick: () => always({ tool: s.waiting.tool, detail: s.waiting.stem, mode: 'prefix' }, `“${s.waiting.stem} …”`) }),
+          el('span', { className: 'note', textContent: t('Auto-allow in every session from now on:') }),
+          el('button', { textContent: t('This one'), title: s.waiting.detail, onclick: () => always({ tool: s.waiting.tool, detail: s.waiting.detail, mode: 'exact' }, t('this command')) }),
+          s.waiting.stem && el('button', { textContent: `${s.waiting.stem} …`, title: t('With any arguments; commands with ; | && or risky forms still ask'), onclick: () => always({ tool: s.waiting.tool, detail: s.waiting.stem, mode: 'prefix' }, `“${s.waiting.stem} …”`) }),
         ));
       }
     } else {
-      actions.append(el('span', { className: 'note', textContent: '这个请求现在只能在它自己的终端里回答（它发出时看板没开着，或已被交回终端）。' }));
+      actions.append(el('span', { className: 'note', textContent: t('This request can only be answered in its own terminal right now (the board was not open when it was sent, or it was handed back).') }));
     }
   } else if (s.state === 'review') {
-    actions.append(el('button', { className: 'primary', textContent: '已验收 (E)', onclick: () => ack(s) }));
+    actions.append(el('button', { className: 'primary', textContent: t('Accepted (E)'), onclick: () => ack(s) }));
   } else if (s.state === 'failed' || s.state === 'unknown') {
-    actions.append(el('button', { className: 'primary', textContent: '知道了 (E)', onclick: () => ack(s) }));
+    actions.append(el('button', { className: 'primary', textContent: t('Got it (E)'), onclick: () => ack(s) }));
   } else if (column(s) === 'rest') {
-    actions.append(el('button', { textContent: '归档', onclick: () => archive(s) }));
+    actions.append(el('button', { textContent: t('Archive'), onclick: () => archive(s) }));
   }
   // Not now: out of the queue until later, back early if it needs you.
   const deferrable = !s.snoozed && (s.state === 'review' || s.state === 'failed' || s.state === 'unknown' || s.waiting?.kind === 'pr');
   if (deferrable) {
     actions.append(
-      el('button', { textContent: '1 小时后再说', onclick: () => snooze(s, { minutes: 60 }, ' 1 小时后') }),
-      el('button', { textContent: '明早再说', onclick: () => snooze(s, { until: tomorrow() }, '明早 9 点') }),
-      el('button', { textContent: '标为未读', title: '保持在队列里，稍后再看', onclick: () => markUnread(s) }),
+      el('button', { textContent: t('In 1 hour'), onclick: () => snooze(s, { minutes: 60 }, t('1 hour from now')) }),
+      el('button', { textContent: t('Tomorrow morning'), onclick: () => snooze(s, { until: tomorrow() }, t('tomorrow 9:00')) }),
+      el('button', { textContent: t('Mark unread'), title: t('Keep it in the queue, look again later'), onclick: () => markUnread(s) }),
     );
   }
-  if (s.snoozed) actions.append(el('button', { className: 'primary', textContent: '现在处理', onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/unsnooze`, {}).catch((e) => say(s.key, e.message)) }));
-  if (s.quiet) kids.push(el('div', { className: 'warn', textContent: `${age(s.last_event_ts)} 没有任何动静：进程还在，可能在跑长任务，也可能卡住了。` }));
-  if (s.requests.length > 1) kids.push(el('div', { className: 'note', textContent: `后面还有 ${s.requests.length - 1} 个请求在排队。` }));
+  if (s.snoozed) actions.append(el('button', { className: 'primary', textContent: t('Handle now'), onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/unsnooze`, {}).catch((e) => say(s.key, e.message)) }));
+  if (s.quiet) kids.push(el('div', { className: 'warn', textContent: t('No activity for {age}: the process is still there; it may be on a long task or stuck.', { age: age(s.last_event_ts) }) }));
+  if (s.requests.length > 1) kids.push(el('div', { className: 'note', textContent: t('{n} more requests are queued behind this one.', { n: s.requests.length - 1 }) }));
   if (actions.childNodes.length) kids.push(actions);
   return el('div', { className: 'now', dataset: { tone: d.tone } }, kids);
 }
@@ -865,9 +881,9 @@ function renderBench() {
   let s = byKey(selected);
   if (!s) {
     bench.replaceChildren(el('div', { className: 'blank' },
-      el('b', { textContent: snap.sessions.length ? '没有人在等你' : '还没有会话' }),
-      snap.sessions.length ? '从左边选一个会话查看，或者去做别的事：有人需要你时这里会自动出现。'
-        : '启动任意一个 Claude Code 或 Codex 会话，它会自动出现在这里。'));
+      el('b', { textContent: snap.sessions.length ? t('Nobody is waiting for you') : t('No sessions yet') }),
+      snap.sessions.length ? t('Pick a session on the left to look at it, or go do something else: it shows up here by itself when someone needs you.')
+        : t('Start any Claude Code or Codex session and it will show up here by itself.')));
     return;
   }
   const row = s;
@@ -888,8 +904,8 @@ function renderBench() {
   bench.replaceChildren(...[
     el('div', { className: 'meta' },
       el('span', { className: `badge ${s.agent}`, textContent: agentName(s) }),
-      el('span', { className: 'where', textContent: [where(s), `第 ${s.turns} 轮`, usageLine(s)].filter(Boolean).join(' · ') }),
-      s.runtime === 'cloud' && el('span', { textContent: '☁ 云端' })),
+      el('span', { className: 'where', textContent: [where(s), t('turn {n}', { n: s.turns }), usageLine(s)].filter(Boolean).join(' · ') }),
+      s.runtime === 'cloud' && el('span', { textContent: t('☁ Cloud') })),
     el('h2', { textContent: s.title || s.session_id }),
     s.pr && el('p', { className: `pr ${prTone(s.pr)}` },
       el('a', { href: s.pr.url, target: '_blank', rel: 'noreferrer', textContent: prLine(s.pr) }),
@@ -898,42 +914,42 @@ function renderBench() {
     taskStrip(s),
     nowBlock(s, d),
 
-    s.last_prompt && el('h3', { textContent: '你上一次说的' }),
+    s.last_prompt && el('h3', { textContent: t('What you said last') }),
     s.last_prompt && el('div', { className: 'prose', textContent: s.last_prompt }),
-    s.last_message && s.state !== 'review' && el('h3', { textContent: '它上一次说的' }),
+    s.last_message && s.state !== 'review' && el('h3', { textContent: t('What it said last') }),
     s.last_message && s.state !== 'review' && el('div', { className: 'prose', textContent: s.last_message }),
 
     diff?.available && el('h3', {}, diff.scope === 'session'
-      ? `这个会话改过的 ${diff.attributed} 个文件（相对上一次提交；它用命令行改的不在内）`
-      : '整个工作区的改动（相对上一次提交，不只是这个会话改的）'),
+      ? t('Files this session changed: {n} (relative to the last commit; changes made through shell commands are not included)', { n: diff.attributed })
+      : t('All changes in the workspace (relative to the last commit, not only this session’s)')),
     diff?.available && s.files_count > 0 && el('div', { className: 'actions', style: 'margin-top:0' },
-      el('button', { textContent: scope === 'session' ? '看整个工作区' : '只看这个会话改的', onclick: () => { scopes.set(s.key, scope === 'session' ? 'all' : 'session'); render(); } })),
-    diff?.available && !changed && el('p', { className: 'note', textContent: '没有未提交的改动。' }),
+      el('button', { textContent: scope === 'session' ? t('See the whole workspace') : t('Only what this session changed'), onclick: () => { scopes.set(s.key, scope === 'session' ? 'all' : 'session'); render(); } })),
+    diff?.available && !changed && el('p', { className: 'note', textContent: t('No uncommitted changes.') }),
     changed && el('div', { className: 'box code', textContent: [diff.stat, diff.status].filter(Boolean).join('\n\n') }),
     changed && diff.diff && el('details', { open: s.state === 'review' },
-      el('summary', { textContent: diff.truncated ? '完整 diff（太长，已截断）' : '完整 diff' }), diffView(diff.diff)),
+      el('summary', { textContent: diff.truncated ? t('Full diff (too long, truncated)') : t('Full diff') }), diffView(diff.diff)),
 
-    el('h3', { textContent: '回复' }),
+    el('h3', { textContent: t('Reply') }),
     s.outgoing && el('div', { className: s.undelivered ? 'warn' : 'note' },
       s.undelivered
-        ? `发出的消息还没被它接收（${s.outgoing.via === 'tmux' ? '终端可能停在别的提示上，去看一眼' : '后台进程可能没启动起来'}）：`
-        : '已发送，等它接收：',
+        ? t('The message you sent has not been received yet ({why}):', { why: s.outgoing.via === 'tmux' ? t('its terminal may be stopped on another prompt, take a look') : t('the background process may not have started') })
+        : t('Sent, waiting for it to receive:'),
       el('span', { className: 'prose', textContent: ` ${s.outgoing.text}` })),
     replyBox(s),
 
-    s.auto_allow.length > 0 && el('h3', { textContent: '这个会话里自动允许的工具' }),
+    s.auto_allow.length > 0 && el('h3', { textContent: t('Tools auto-allowed in this session') }),
     s.auto_allow.length > 0 && el('div', {}, s.auto_allow.map((tool) =>
       el('span', { className: 'chip' }, tool, el('button', {
-        textContent: '✕', title: '不再自动允许',
+        textContent: '✕', title: t('Stop auto-allowing'),
         onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/rule`, { tool, allow: false }).catch((e) => say(s.key, e.message)),
       })))),
 
     more.events && el('details', {},
-      el('summary', { textContent: `事件记录（最近 ${more.events.length} 条）` }),
+      el('summary', { textContent: t('Event log (latest {n})', { n: more.events.length }) }),
       el('ul', { className: 'timeline' }, more.events.filter((e) => e.type !== 'meta.updated').map((e) => {
         const x = e.data || {};
         return el('li', {}, el('time', { textContent: new Date(e.ts).toLocaleTimeString() }),
-          el('span', { textContent: [e.type, x.tool, x.kind, x.decision, x.by, x.source, x.reason, x.error, e.late && '(迟到，未采用)'].filter(Boolean).join(' · ') }));
+          el('span', { textContent: [e.type, x.tool, x.kind, x.decision, x.by, x.source, x.reason, x.error, e.late && t('(late, not used)')].filter(Boolean).join(' · ') }));
       }))),
   ].filter(Boolean));
 
@@ -1020,10 +1036,11 @@ function paint() {
   const count = { attention: 0, review: 0, working: 0 };
   for (const x of snap.sessions) if (column(x) in count) count[column(x)] += 1;
   $('#summary').replaceChildren(
-    ...(count.attention ? [el('b', { textContent: `${count.attention} 个会话在等你` }), '，'] : ['没有会话在等你，']),
-    `${count.review} 个待验收，${count.working} 个在工作`, filter ? `（筛选后显示 ${visible().length} / ${snap.sessions.length}）` : '',
+    count.attention ? el('b', { textContent: t('{n} waiting for you', { n: count.attention }) }) : t('Nothing is waiting for you'),
+    t(', {r} to review, {w} working', { r: count.review, w: count.working }),
+    filter ? t(' (filtered: showing {v} / {t})', { v: visible().length, t: snap.sessions.length }) : '',
   );
-  $('#rules').textContent = `自动规则 ${snap.rules || 0}`;
+  $('#rules').textContent = t('Auto rules {n}', { n: snap.rules || 0 });
   document.title = `${count.attention ? `(${count.attention}) ` : ''}Session Board`;
 }
 
@@ -1076,8 +1093,8 @@ function setView(view) {
 function connect() {
   const es = new EventSource(api('/api/stream'));
   const conn = $('#conn');
-  es.onopen = () => { conn.textContent = '实时'; conn.className = 'conn ok'; };
-  es.onerror = () => { conn.textContent = '断开，重连中…'; conn.className = 'conn bad'; };
+  es.onopen = () => { conn.textContent = t('Live'); conn.className = 'conn ok'; };
+  es.onerror = () => { conn.textContent = t('Disconnected, reconnecting…'); conn.className = 'conn bad'; };
   es.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.sessions) { // full picture, on (re)connect
@@ -1103,11 +1120,11 @@ $('#backfill').onclick = async (e) => {
   button.disabled = true;
   try {
     const out = await call('/api/backfill', { days: 7 });
-    button.textContent = out.imported ? `导入了 ${out.imported} 个` : '没有新的历史会话';
+    button.textContent = out.imported ? t('Imported {n}', { n: out.imported }) : t('No new past sessions');
   } catch (err) {
     button.textContent = err.message;
   }
-  setTimeout(() => { button.textContent = '导入历史'; button.disabled = false; }, 2500);
+  setTimeout(() => { button.textContent = t('Import history'); button.disabled = false; }, 2500);
 };
 
 document.addEventListener('keydown', (e) => {
@@ -1134,15 +1151,28 @@ $('#filter').oninput = (e) => { filter = e.target.value.trim().toLowerCase(); re
 $('#rules').onclick = async () => {
   const dialog = $('#rules-dialog');
   const show = (rules) => $('article', dialog).replaceChildren(
-    el('h3', { textContent: '自动规则' }),
-    el('p', { className: 'note', textContent: '任何会话请求匹配的命令时自动允许。规则可以是完全相同的一条命令，或一类命令加任意参数。带 ; | && 这类连接符的命令不会匹配“一类”规则，看起来高风险的命令永远逐个确认。' }),
+    el('h3', { textContent: t('Auto rules') }),
+    el('p', { className: 'note', textContent: t('Commands that match are allowed automatically whenever any session asks. A rule is either one exact command or a kind of command with any arguments. Commands joined with ; | && never match a “kind” rule, and anything that looks risky is always confirmed one by one.') }),
     rules.length ? el('ul', { className: 'rules' }, rules.map((r) => el('li', {},
-      el('code', { textContent: `${r.tool}: ${r.detail}${r.mode === 'prefix' ? ' …（任意参数）' : ''}` }),
-      el('button', { textContent: '撤销', onclick: async () => show(await fetch(api('/api/rules'), {
+      el('code', { textContent: `${r.tool}: ${r.detail}${r.mode === 'prefix' ? t(' … (any arguments)') : ''}` }),
+      el('button', { textContent: t('Undo'), onclick: async () => show(await fetch(api('/api/rules'), {
         method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(r) }).then((x) => x.json())) }))))
-      : el('p', { className: 'empty', textContent: '还没有规则。' }),
-    el('div', { className: 'actions' }, el('button', { textContent: '关闭', onclick: () => dialog.close() })));
+      : el('p', { className: 'empty', textContent: t('No rules yet.') }),
+    el('div', { className: 'actions' }, el('button', { textContent: t('Close'), onclick: () => dialog.close() })));
   show(await call('/api/rules'));
+  dialog.showModal();
+};
+
+// Settings: currently just the language.
+$('#settings').onclick = () => {
+  const dialog = $('#settings-dialog');
+  const pick = el('select', { id: 'lang-select', onchange: (e) => { setLangPref(e.target.value); location.reload(); } },
+    ...[['auto', t('Follow system')], ['en', 'English'], ['zh', '简体中文']].map(([value, label]) => el('option', { value, textContent: label, selected: value === langPref() })));
+  $('article', dialog).replaceChildren(
+    el('h3', { textContent: t('Settings') }),
+    el('label', { className: 'setting' }, el('span', { textContent: t('Language') }), pick),
+    el('p', { className: 'note', textContent: t('Language changes apply right away. “Follow system” uses your browser’s language: Chinese if it is Chinese, English otherwise.') }),
+    el('div', { className: 'actions' }, el('button', { textContent: t('Close'), onclick: () => dialog.close() })));
   dialog.showModal();
 };
 
@@ -1169,6 +1199,7 @@ presence();
 let wanted = decodeURIComponent(location.hash.slice(1)) || null;
 addEventListener('hashchange', () => { wanted = decodeURIComponent(location.hash.slice(1)) || null; render(); });
 
+translatePage();
 setView(['board', 'office'].includes(prefs.get('view')) ? prefs.get('view') : 'inbox');
 setInterval(tickAges, 5000); // waiting timers tick without re-rendering anything // keep timers ticking
 connect();
