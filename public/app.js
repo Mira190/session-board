@@ -58,6 +58,9 @@ function column(s) {
 function describe(s) {
   switch (s.state) {
     case 'needs_input':
+      if (s.waiting?.kind === 'pr') {
+        return { tone: 'urgent', what: prWhat(s.waiting.detail), detail: s.pr ? `PR #${s.pr.number}　${s.pr.title || ''}` : null, verb: '已' };
+      }
       return s.waiting?.kind === 'permission'
         ? { tone: 'urgent', what: `要权限${s.waiting.tool ? '：' + s.waiting.tool : ''}`, detail: s.waiting.detail, code: true, verb: '已等' }
         : { tone: 'urgent', what: '在问你', detail: s.waiting?.detail, verb: '已等' };
@@ -89,6 +92,8 @@ const resumeCommand = (s) => {
   const cd = s.cwd ? `cd ${JSON.stringify(s.cwd)} && ` : '';
   return s.agent === 'claude' ? `${cd}claude --resume ${s.session_id}` : `${cd}codex resume ${s.session_id}`;
 };
+const prWhat = (problem) => ({ checks: 'PR 检查失败', review: 'PR 被要求修改', 'checks+review': 'PR 检查失败，并被要求修改' }[problem] || 'PR 需要处理');
+const prFixText = (s) => `PR #${s.pr.number} ${{ checks: '的检查失败了，请查看失败原因', review: '被评审要求修改，请查看评审意见', 'checks+review': '的检查失败了，并且被评审要求修改，请查看失败原因和评审意见' }[s.waiting.detail] || '需要处理，请查看'}，修好后推送。`;
 const PR_STATE = { open: '开着', merged: '已合并', closed: '已关闭（未合并）' };
 const PR_CHECKS = { passing: '检查通过', failing: '检查失败', pending: '检查进行中' };
 const PR_REVIEW = { approved: '已批准', changes_requested: '要求修改', review_required: '等评审' };
@@ -266,7 +271,7 @@ const QUEUE = { w: 84, h: 104 }; // one standing place in the queue
 const agentNodes = new Map();
 
 const bubbleFor = (s) => {
-  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? '要权限' : '有问题问你';
+  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? '要权限' : s.waiting?.kind === 'pr' ? prWhat(s.waiting.detail) : '有问题问你';
   if (s.state === 'failed') return s.rate_limited ? '被限流了' : '出错了';
   if (s.state === 'unknown') return '失联';
   return null;
@@ -444,7 +449,16 @@ function nowBlock(s, d) {
     form && questionForm(s),
   ];
   const actions = el('div', { className: 'actions' });
-  if (form) {
+  if (s.state === 'needs_input' && s.waiting.kind === 'pr') {
+    actions.append(...[
+      s.reply && s.pr && el('button', {
+        className: 'primary', textContent: '让它去修', title: prFixText(s),
+        onclick: () => { drafts.set(s.key, prFixText(s)); send(s); },
+      }),
+      s.pr && el('button', { textContent: '打开 PR', onclick: () => window.open(s.pr.url, '_blank', 'noreferrer') }),
+      el('button', { textContent: '知道了 (E)', title: '先不管；同一个问题不会再提醒', onclick: () => ack(s) }),
+    ].filter(Boolean));
+  } else if (form) {
     actions.append(
       el('button', { className: 'primary', textContent: '回答', onclick: () => answer(s) }),
       el('button', { textContent: '交回终端', title: '不在这里回答，让它在自己的终端里问你', onclick: () => decide(s, 'terminal') }),
@@ -684,7 +698,7 @@ document.addEventListener('keydown', (e) => {
     return;
   } else if (k === 'a' && s.waiting?.decidable) decide(s, 'allow');
   else if (k === 'd' && s.waiting?.decidable) decide(s, 'deny');
-  else if (k === 'e' && ['review', 'failed', 'unknown'].includes(s.state)) ack(s);
+  else if (k === 'e' && (['review', 'failed', 'unknown'].includes(s.state) || s.waiting?.kind === 'pr')) ack(s);
   else if (k === 'r' && $('#reply')) { e.preventDefault(); $('#reply').focus(); }
 });
 

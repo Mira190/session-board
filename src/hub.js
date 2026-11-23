@@ -9,7 +9,7 @@ import { basename, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.js';
 import { fromHook } from './adapters/hooks.js';
-import { attentionQueue } from './reduce.js';
+import { attentionQueue, prAlertKey } from './reduce.js';
 import { liveAgents, orphanReason } from './reconcile.js';
 import { scanHistory, usageFor } from './transcripts.js';
 import { createGitHub } from './github.js';
@@ -191,9 +191,13 @@ export function createHub({
     if (found === undefined) return false; // could not ask: keep what we knew
     const { updated, ...pr } = found || {};
     const next = found ? pr : null;
-    if (JSON.stringify(next) === JSON.stringify(s.pr)) return false;
+    const changed = JSON.stringify(next) !== JSON.stringify(s.pr);
+    // A problem noticed while the agent was mid-turn was held back; if it is
+    // still there now that the turn is over, say so.
+    const overdue = force && prAlertKey(next) && prAlertKey(next) !== s.pr_alert;
+    if (!changed && !overdue) return false;
     emit(s, 'pr.updated', { pr: next });
-    return true;
+    return changed;
   }
 
   function ingest(events) {

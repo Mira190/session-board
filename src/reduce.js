@@ -37,6 +37,7 @@ function blank(ev) {
     files: [], // files this session's edit tools were pointed at
     start_head: null, // commit the working tree was on when first seen
     settled: null, // why the hub closed a review on its own ('merged')
+    pr_alert: null, // the PR problem already raised, so it is raised once
     pr: null, // { number, url, title, state: open|merged|closed, draft, checks, review, base, head_sha }
     github: null, // "owner/repo", when a sender tells us (cloud sessions)
     tmux: null, // { socket, pane } when the agent runs inside tmux
@@ -92,6 +93,14 @@ function resolve(s, { id, kind, tool } = {}) {
   if (i >= 0) s.requests.splice(i, 1);
   return i >= 0;
 }
+
+// What is wrong with a pull request that the human should hear about, if anything.
+export function prProblem(pr) {
+  if (!pr || pr.state !== 'open') return null;
+  const parts = [pr.checks === 'failing' && 'checks', pr.review === 'changes_requested' && 'review'].filter(Boolean);
+  return parts.length ? parts.join('+') : null;
+}
+export const prAlertKey = (pr) => (prProblem(pr) ? `${pr.number}:${pr.head_sha || ''}:${prProblem(pr)}` : null);
 
 function derive(s) {
   const first = s.requests[0];
@@ -303,7 +312,9 @@ export function reduce(prev, ev) {
       break;
 
     case 'human.acknowledged':
-      if (['review', 'failed', 'unknown'].includes(s.phase)) enter(s, s.exited ? 'ended' : 'idle', ts);
+      // Dismissing a PR alert is its own act: the work itself stays in review.
+      if (s.requests.some((r) => r.kind === 'pr')) s.requests = s.requests.filter((r) => r.kind !== 'pr');
+      else if (['review', 'failed', 'unknown'].includes(s.phase)) enter(s, s.exited ? 'ended' : 'idle', ts);
       break;
 
     case 'human.archived':
@@ -325,12 +336,26 @@ export function reduce(prev, ev) {
       if (d.branch !== undefined) s.branch = d.branch;
       if (d.head && !s.start_head) s.start_head = d.head;
       if (d.github) s.github = d.github;
-      break;
-
-    case 'pr.updated':
-      s.pr = d.pr || null;
       if (d.title) s.title = clip(d.title, 120);
       break;
+
+    case 'pr.updated': {
+      s.pr = d.pr || null;
+      // A failing check or a "changes requested" review joins the queue as a
+      // request of its own: once per problem, and not while the agent is
+      // mid-turn (it may be fixing exactly this). It leaves when the problem
+      // does, when the human dismisses it, or when they send the agent off.
+      const key = prAlertKey(s.pr);
+      if (!key) {
+        s.requests = s.requests.filter((r) => r.kind !== 'pr');
+        s.pr_alert = null;
+      } else if (key !== s.pr_alert && s.phase !== 'working') {
+        s.requests = s.requests.filter((r) => r.kind !== 'pr');
+        s.requests.push({ id: null, kind: 'pr', tool: null, detail: prProblem(s.pr), ts, questions: null });
+        s.pr_alert = key;
+      }
+      break;
+    }
 
     case 'usage.updated':
       s.usage = { ...s.usage, ...d };
@@ -353,9 +378,11 @@ export function reduce(prev, ev) {
 // attention ranking can be worse than plain round-robin.)
 export function attentionTier(s) {
   if (s.archived) return null;
-  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? 0 : 1;
+  // Blocked agents first (a permission is the cheapest to clear), then broken
+  // ones, then pull requests that need attention, then finished work.
+  if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? 0 : s.waiting?.kind === 'pr' ? 3 : 1;
   if (s.state === 'failed' || s.state === 'unknown') return 2;
-  if (s.state === 'review') return 3;
+  if (s.state === 'review') return 4;
   return null;
 }
 
