@@ -33,6 +33,8 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board install <claude|codex>    add hooks to the agent's config
   session-board install claude --statusline   also report usage-limit windows to the board (subscribers)
   session-board remote <ssh-host>         bring sessions on another machine onto this board
+  session-board cloud-setup --url https://…   make this repository's Claude cloud sessions report to your hub
+  session-board cloud-reporter            how to list all your Claude cloud sessions on the board
   session-board codex-cloud               show how Codex cloud tasks are read (enable with SESSION_BOARD_CODEX_CLOUD=1)
   session-board uninstall <claude|codex>  remove them again
   session-board doctor [--push-test]      check on this machine that every piece actually works
@@ -73,6 +75,8 @@ async function hook(agent) {
       // a newer one from this bridge.
       seq: String(Math.round((performance.timeOrigin + performance.now()) * 1000)),
     });
+    // Inside a Claude Code cloud container: say which cloud session this is.
+    if (process.env.CLAUDE_CODE_REMOTE_SESSION_ID) q.set('cloud', process.env.CLAUDE_CODE_REMOTE_SESSION_ID);
     if (process.env.TMUX && process.env.TMUX_PANE) {
       q.set('tmux_socket', process.env.TMUX.split(',')[0]);
       q.set('tmux_pane', process.env.TMUX_PANE);
@@ -242,6 +246,53 @@ async function main() {
       console.log(`tunnel closed (ssh exited ${code}); retrying in 10s`);
       await new Promise((r) => setTimeout(r, 10_000));
     }
+  }
+
+  // Claude Code cloud sessions: hooks committed to the repository report from
+  // inside each cloud container to a hub the cloud can reach.
+  if (cmd === 'cloud-setup') {
+    const { plan, strip } = await import('../src/install.js');
+    const { existsSync, readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+    const publicUrl = (opt.url || process.env.SESSION_BOARD_PUBLIC_URL || '').replace(/\/$/, '');
+    if (!/^https:\/\//.test(publicUrl)) throw new Error('give the address the cloud can reach your hub at: session-board cloud-setup --url https://board.example.com');
+    const file = join(process.cwd(), '.claude', 'settings.json');
+    const before = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8') || '{}') : {};
+    const after = plan('claude', strip(structuredClone(before)), { url: publicUrl, host: 'claude-cloud', token: true, httpOnly: true, cloudOnly: true });
+    if (opt['dry-run']) console.log(JSON.stringify(after, null, 2));
+    else { mkdirSync(join(process.cwd(), '.claude'), { recursive: true }); writeFileSync(file, JSON.stringify(after, null, 2) + '\n'); }
+    const host = new URL(publicUrl).host;
+    console.log(`${opt['dry-run'] ? 'Would write' : 'Wrote'} ${file}
+
+Three things make it work:
+  1. Commit that file. Every cloud session of this repository then reports to ${publicUrl}.
+     Opened on your own machine the same hooks stay silent (they are marked cloud-only).
+  2. Run the hub where the cloud can reach it, with a token:
+       SESSION_BOARD_TOKEN=<a long random string> session-board serve --bind 0.0.0.0
+     behind HTTPS at ${publicUrl} (a small server, or a tunnel from your machine).
+  3. In the cloud environment's settings: allow the host ${host} in its network access,
+     and give sessions the same token as SESSION_BOARD_TOKEN (the hooks send it as a Bearer header).
+
+Then check with one cloud session: it should appear on the board marked as cloud, with a link back to claude.ai.
+Sessions of repositories without these hooks can still be listed: see \`session-board cloud-reporter\`.`);
+    return;
+  }
+
+  // The other route: a cloud session can read the account's whole session list
+  // with its built-in tool. This prints what to tell one to do with it.
+  if (cmd === 'cloud-reporter') {
+    const publicUrl = (opt.url || process.env.SESSION_BOARD_PUBLIC_URL || 'https://<your hub>').replace(/\/$/, '');
+    console.log(`Give this to a Claude Code cloud session (or make it a scheduled task there):
+
+  List my Claude Code cloud sessions with your session-listing tool (up to 100), then send that list,
+  exactly as the tool returned it, as the JSON body of one HTTP POST to
+  ${publicUrl}/ingest/cloud  with the header  Authorization: Bearer $SESSION_BOARD_TOKEN .
+  Send it with curl from a file; do not summarise or reformat it. Reply with only the number accepted.
+
+It shows every cloud session of your account on the board (state, what it is doing, unread, parent and
+children), including ones in repositories without hooks. It is a snapshot taken when that session runs,
+and each run costs that session a turn, so use it on demand or on a slow schedule. The hooks from
+\`session-board cloud-setup\` are the live, free route.`);
+    return;
   }
 
   if (cmd === 'codex-cloud') {

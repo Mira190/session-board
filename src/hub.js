@@ -35,6 +35,12 @@ export const SETTLE_MS = 2 * 60 * 1000;
 // before it is handed back to the agent's own prompt.
 export const HOLD_MS = 9 * 60 * 1000;
 const LOCAL_NAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+// "cse_01ABC…" and "session_01ABC…" name the same cloud session.
+export const cloudSuffix = (id) => {
+  const m = /^(?:cse|session)_([A-Za-z0-9]{8,})$/.exec(String(id || '').trim());
+  return m ? m[1] : null;
+};
+const BUCKET = { WORKING: 'working', BLOCKED: 'blocked', REVIEW_READY: 'review', COMPLETED: 'completed', FAILED: 'failed' };
 const SHELLS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh', 'nu', 'pwsh', 'login']);
 
 // Answering a question tool = allowing it with the answers filled in.
@@ -125,6 +131,8 @@ export function createHub({
   // taken as the answer to that prompt, so typing is refused until it clears.
   const promptOpen = (s) => s.requests.some((r) => r.kind === 'permission' || r.kind === 'question');
   const replyRoute = (s) => {
+    // A Claude cloud session takes messages through the CLI's own --cloud.
+    if (s.runtime === 'cloud' && s.agent === 'claude' && s.cloud_id) return 'cloud';
     if (!isLocal(s)) return null;
     // Codex has an official way to hand a message to an existing session
     // (`codex queue`), so it needs neither tmux nor a guess about the terminal.
@@ -556,6 +564,12 @@ export function createHub({
       }
       return done({ via: 'tmux' });
     }
+    if (route === 'cloud') {
+      const out = await new Promise((resolve) => execFile('claude', ['-p', text, '--cloud', `https://claude.ai/code/session_${s.cloud_id}`],
+        { timeout: 60_000 }, (err, stdout, stderr) => resolve({ err, text: `${stdout || ''}${stderr || ''}`.trim() })));
+      if (out.err) throw Object.assign(new Error(`could not reach the cloud session: ${out.text.split('\n').pop() || out.err.message}`), { status: 502 });
+      return done({ via: 'cloud' });
+    }
     if (route === 'queue') {
       const out = await new Promise((resolve) => execFile('codex', ['queue', '--thread', s.session_id, '--message', text, '--resume'],
         { cwd: s.cwd && existsSync(s.cwd) ? s.cwd : undefined, timeout: 20_000 }, (err, stdout, stderr) => resolve({ err, text: `${stdout || ''}${stderr || ''}`.trim() })));
@@ -821,9 +835,17 @@ export function createHub({
       const tmux = q.get('tmux_pane') && q.get('tmux_socket')
         ? { socket: q.get('tmux_socket'), pane: q.get('tmux_pane') }
         : null;
+      // A hook running inside a Claude Code cloud container names its cloud
+      // session in a header (empty everywhere else).
+      const cloudId = cloudSuffix(req.headers['x-cloud-session']) || cloudSuffix(q.get('cloud'));
+      // Hooks committed to a repository for its cloud sessions also load when
+      // the repository is opened locally, where the machine's own hooks
+      // already report. Those are marked only=cloud and ignored off-cloud.
+      if (q.get('only') === 'cloud' && !cloudId) return json(res, 200, {});
       const events = fromHook(hook[1], payload, {
-        host: q.get('host'),
+        host: cloudId ? 'claude-cloud' : q.get('host'),
         runtime: q.get('runtime'),
+        cloudId,
         now: now(),
         seq: q.has('seq') ? Number(q.get('seq')) : null,
         source: q.get('source'),
@@ -919,6 +941,39 @@ export function createHub({
       return json(res, 200, { acked, archived });
     }
 
+    if (path === '/ingest/cloud' && req.method === 'POST') {
+      // The vendor's own list of the account's cloud sessions, as a cloud
+      // session can read it. Accepts the list as that tool returns it.
+      const sent = await body();
+      const rows = Array.isArray(sent) ? sent : sent?.sessions || sent?.ccr?.data || sent?.data || [];
+      const byCloud = new Map(store.list().filter((x) => x.cloud_id).map((x) => [x.cloud_id, x]));
+      let taken = 0;
+      const parents = [];
+      for (const r of rows) {
+        const id = cloudSuffix(r?.id);
+        if (!id) continue;
+        const have = byCloud.get(id);
+        const ref = have ? { agent: have.agent, session_id: have.session_id } : { agent: 'claude', session_id: `session_${id}` };
+        const bucket = BUCKET[String(r.status_bucket || '').replace('SESSION_STATUS_BUCKET_', '')] ||
+          (/RUNNING/.test(r.session_status) ? 'working' : /IDLE/.test(r.session_status) ? 'completed' : null);
+        const data = {
+          bucket, title: r.title || null, unread: !!r.unread, url: `https://claude.ai/code/session_${id}`,
+          summary: r.post_turn_summary?.recent_action || null,
+          activity: r.task_summary || r.post_turn_summary?.needs_action || null,
+        };
+        const next = store.append({ ...ref, ts: now(), host: 'claude-cloud', runtime: 'cloud', cloud_id: id, eid: `snap:${JSON.stringify(data)}`, type: 'cloud.snapshot', data });
+        if (next) byCloud.set(id, next);
+        if (r.parent_session_id) parents.push([id, cloudSuffix(r.parent_session_id)]);
+        taken += 1;
+      }
+      // Sessions a parent session spawned belong with it.
+      for (const [child, parent] of parents) {
+        const c = byCloud.get(child);
+        const p = byCloud.get(parent);
+        if (c && p && c.task_manual !== p.key && c.task_manual !== 'solo') emit(c, 'task.assigned', { task: p.key, reason: 'parent' });
+      }
+      return json(res, 200, { accepted: taken });
+    }
     if (path === '/ingest/status' && req.method === 'POST') {
       // From the status line bridge: quota windows and context fill.
       const p = await body().catch(() => ({}));

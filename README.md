@@ -100,7 +100,7 @@ A few behaviors worth knowing:
 - **When several sessions share one folder, two commands running at the same moment cannot be told apart**: in a shared folder the board looks at the working tree before and after each shell command and credits the difference to the session that ran it. If two sessions' commands happen to overlap, changes in that interval are credited to both.
 - **PR status has not been verified against the real GitHub**: the development environment cannot reach GitHub, so it was tested only with a simulated API and simulated `gh` output.
 - **Rebase merges where the PR was deleted afterwards** are not detected; squash merges with no PR, pushed straight to the trunk, are not detected either.
-- **Cloud**: neither vendor has a public "list sessions / read status" interface, so it can only rely on hooks pushing outward.
+- **Cloud sessions need a hub the cloud can reach.** Both routes for Claude cloud sessions (below) post from the cloud to your hub; a hub on `127.0.0.1` cannot be reached. There is no way to list them from your own machine: the Claude Code CLI lists only local sessions.
 - **Quota windows need the status line bridge** (below), and only subscribers have that data; Codex's limits are not visible.
 - Session file formats are each vendor's internal formats and can change at any time; content that cannot be understood is skipped without an error, but cost and history import may stop working because of it.
 
@@ -184,6 +184,29 @@ With it, the header shows the 5-hour and weekly windows with their reset times (
 - Your own status line is kept: the bridge passes the data on, then runs your original command with the same input and shows its output. `uninstall claude --statusline` puts it back.
 - Only claude.ai subscribers get limit data; with an API key there is only context fill.
 - Verified with a real session: in this development environment it reported "week 27% used" with its reset time.
+
+## Claude Code cloud sessions
+
+There are two sanctioned ways to get cloud sessions onto the board. Neither touches a private API, and both need a hub the cloud can reach.
+
+**1. Each cloud session reports itself (live, no cost).** Hooks committed to the repository run inside every cloud session's container and post to your hub, exactly like local sessions, including permission requests you can answer from the board.
+
+```bash
+node bin/session-board.js cloud-setup --url https://your-hub.example.com
+```
+
+It writes `.claude/settings.json` in the current repository and prints the three things left to do: commit the file, run the hub at that address with a token, and in the cloud environment's settings allow that host and provide the token. The hooks are marked cloud-only, so opening the repository on your own machine does not double-report.
+
+How the hub knows a session is in the cloud: inside a cloud container Claude Code sets a variable with the session's cloud id, and the hooks send it in a header. The same hooks on a laptop send nothing there. The board then shows the session as cloud, with a link back to it on claude.ai.
+
+![Cloud sessions on the board](docs/cloud.png)
+
+**2. One cloud session reports the whole list (coarse, costs a turn).** A cloud session has a built-in tool that lists every cloud session of your account with its state, what it is doing, whether you have read it, and its parent. `node bin/session-board.js cloud-reporter` prints what to tell a session (or a scheduled task) so it posts that list to the hub. This also covers repositories without hooks. Sessions known only this way show their state, not what exactly they are waiting for; children are grouped under the session that started them.
+
+What was verified, and what was not:
+
+- In this project's own cloud session: the cloud id variable exists, hooks carry it, and the hub marks the session as cloud; without the variable the same hooks give a local session. A real session list from the built-in tool (seven sessions, with parents and unread marks) was read and mapped correctly, and the session that also had hooks was not duplicated.
+- Not verified: the network path from a cloud container to a hub on the internet (there was no public hub to test against), and replying to a cloud session from the board (it uses `claude -p … --cloud`, which was not run against a real session).
 
 ## Codex
 

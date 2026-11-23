@@ -37,7 +37,7 @@ export function groupTasks(sessions) {
   const byKey = new Map(sessions.map((s) => [s.key, s]));
   for (const s of ordered) {
     if (s.task_manual === 'solo') continue;
-    if (s.task_manual && byKey.has(s.task_manual)) union(s.key, s.task_manual, 'manual');
+    if (s.task_manual && byKey.has(s.task_manual)) union(s.key, s.task_manual, s.task_reason === 'parent' ? 'parent' : 'manual');
     const repo = s.repo_id || s.repo || s.cwd;
     if (!repo) continue;
     const prompt = norm(s.title_manual ? s.first_prompt?.split('\n')[0] : s.title);

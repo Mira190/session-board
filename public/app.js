@@ -95,6 +95,7 @@ function describe(s) {
 function describeState(s) {
   switch (s.state) {
     case 'needs_input':
+      if (s.runtime === 'cloud' && !s.hooked) return { tone: 'urgent', what: t('Waiting on you in claude.ai'), detail: s.waiting?.detail || s.activity, verb: 'waiting {age}' };
       if (s.waiting?.kind === 'pr') {
         return { tone: 'urgent', what: prWhat(s.waiting.detail), detail: s.pr ? `PR #${s.pr.number}　${s.pr.title || ''}` : null, verb: '{age}' };
       }
@@ -108,6 +109,7 @@ function describeState(s) {
     case 'review':
       return { tone: 'review', what: s.exited ? t('Finished and exited, awaiting review') : t('Finished, awaiting review'), detail: s.last_message, verb: 'waiting {age}' };
     case 'working':
+      if (s.activity && !s.current_tool) return { tone: 'working', what: t('Working'), detail: s.activity, verb: '{age}' };
       if (s.background) return { tone: 'working', what: t('Waiting on its own background task ({task})', { task: s.background }), detail: s.last_message, verb: '{age}' };
       return {
         tone: 'working',
@@ -362,7 +364,7 @@ const cardSig = (s) => JSON.stringify([
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
-  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.context_pct >= 85 && s.context_pct, s.task?.why,
+  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.activity, s.hooked, s.context_pct >= 85 && s.context_pct, s.task?.why,
 ]);
 
 function card(s) {
@@ -853,6 +855,7 @@ function replyBox(s) {
     el('div', { className: 'actions' },
       el('button', { className: 'primary', textContent: t('Send'), onclick: () => send(s) }),
       el('span', { className: 'note', textContent: (s.reply === 'tmux' ? t('Goes straight into its tmux window.')
+        : s.reply === 'cloud' ? t('Sent to the cloud session through the Claude Code CLI on this machine.')
         : s.reply === 'queue' ? t('Queued for the session through Codex’s own message queue.')
           : t('Its process has exited: this resumes the same session for another round in the background.')) + t(' Ctrl/⌘ + Enter to send') }),
     ));
@@ -930,7 +933,7 @@ function taskStrip(s) {
   const reviewable = group.filter((m) => ['review', 'failed', 'unknown'].includes(m.state));
   return el('div', { className: 'taskstrip' },
     el('div', { className: 'note', textContent: t('{n} sessions of one task, grouped because {why}. Click a row to switch between them, then accept by task.', {
-      n: group.length, why: (s.task.why || []).map((w) => ({ prompt: t('they were given the same instruction'), branch: t('one picked up the same branch after another'), manual: t('you joined them') }[w])).filter(Boolean).join(t(' and ')) || t('they look like the same work') }) }),
+      n: group.length, why: (s.task.why || []).map((w) => ({ prompt: t('they were given the same instruction'), branch: t('one picked up the same branch after another'), manual: t('you joined them'), parent: t('one session started the others') }[w])).filter(Boolean).join(t(' and ')) || t('they look like the same work') }) }),
     el('div', { className: 'members' }, group.map((m) => {
       const d = describe(m);
       return el('button', { className: 'member wide', type: 'button', dataset: { tone: d.tone }, ariaCurrent: String(m.key === s.key), onclick: () => select(m.key, true) },
@@ -1059,6 +1062,8 @@ function renderBench() {
     s.pr && el('p', { className: `pr ${prTone(s.pr)}` },
       el('a', { href: s.pr.url, target: '_blank', rel: 'noreferrer', textContent: prLine(s.pr) }),
       s.pr.title ? `　${s.pr.title}` : '', s.pr.base ? ` → ${s.pr.base}` : ''),
+    s.url && el('p', { className: 'pr' }, el('a', { href: s.url, target: '_blank', rel: 'noreferrer', textContent: t('Open in claude.ai') }),
+      !s.hooked ? t('　Known from your cloud session list: state only, no detail of what it is waiting for.') : ''),
     notice?.key === s.key && el('div', { className: 'warn', textContent: notice.text }),
     taskStrip(s),
     nowBlock(s, d),

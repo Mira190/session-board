@@ -44,6 +44,11 @@ function blank(ev) {
     snoozed_until: null, // out of the queue until then, unless it needs them sooner
     acked: null, // { phase, since } before the last acknowledgement, for undo
     outgoing: null, // { text, via, ts } a reply sent from the board, not yet confirmed received
+    cloud_id: null, // the vendor's id for a cloud session
+    url: null, // where to open it in the vendor's own UI
+    activity: null, // what a cloud session says it is doing right now
+    hooked: false, // its own hooks report to us (so a coarse cloud listing must not drive its state)
+    task_reason: null, // why task_manual was set: 'parent' when a parent session spawned it
     repo_id: null, // what identifies the repository across worktrees (remote, or the shared git dir)
     task_manual: null, // another session's key (joined by hand) or 'solo' (pulled out by hand)
     triage: null, // { for, summary, suggestion, ts } a triage agent's note on what is currently open
@@ -196,6 +201,12 @@ export function reduce(prev, ev) {
   if (ev.cwd && !s.cwd) s.cwd = ev.cwd;
   if (ev.transcript) s.transcript = ev.transcript;
   if (ev.host && s.host === 'local') s.host = ev.host;
+  if (ev.cloud_id && !s.cloud_id) {
+    s.cloud_id = ev.cloud_id;
+    s.url = `https://claude.ai/code/session_${ev.cloud_id}`;
+    s.host = 'claude-cloud';
+    s.runtime = 'cloud';
+  }
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
   if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted'].includes(ev.type)) s.archived = false;
@@ -410,7 +421,38 @@ export function reduce(prev, ev) {
 
     case 'task.assigned':
       s.task_manual = d.task || null;
+      s.task_reason = d.reason || null;
       break;
+
+    case 'cloud.snapshot': {
+      // One row of the vendor's own session list. Coarser than hooks: it says
+      // which bucket the session is in, not what it is waiting for.
+      if (d.title && !s.title_manual) s.title = clip(d.title, 120);
+      s.runtime = 'cloud';
+      if (d.url) s.url = d.url;
+      if (d.summary) s.last_message = clip(d.summary, 1200);
+      s.activity = d.activity ? clip(d.activity, 200) : null;
+      if (s.hooked) break; // its own hooks know better
+      if (d.bucket === 'working') enter(s, 'working', ts);
+      else if (d.bucket === 'blocked') {
+        enter(s, 'working', ts);
+        if (!s.requests.length) s.requests.push({ id: null, kind: 'question', tool: null, detail: d.activity || null, ts, questions: null, risky: false });
+      } else if (d.bucket === 'failed') {
+        s.requests = [];
+        enter(s, 'failed', ts);
+        s.error = 'failed in the cloud';
+      } else if (d.bucket === 'review' || (d.bucket === 'completed' && d.unread)) {
+        s.requests = [];
+        if (s.phase !== 'review') enter(s, 'review', ts);
+      } else if (d.bucket === 'completed') {
+        s.requests = [];
+        // Finished and already read in the vendor's UI: nothing left for you here.
+        if (s.phase !== 'idle') enter(s, 'idle', ts);
+        s.seen_ts = ts;
+      }
+      if (d.bucket !== 'blocked') s.requests = s.requests.filter((r) => r.kind === 'pr');
+      break;
+    }
 
     case 'triage.noted':
       // Advice about one specific open item; it is ignored once that item is gone.
@@ -479,9 +521,10 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.last_work_ts = ts;
+    if (ev.type !== 'heartbeat' && ev.type !== 'notification') s.hooked = true;
     s.exited = false;
     s.imported = false;
   }

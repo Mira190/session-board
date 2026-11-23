@@ -36,7 +36,7 @@ export function strip(config) {
 // `url` is baked into Claude Code's HTTP hooks. The command bridge (all of
 // Codex, and Claude's SessionStart) looks the hub up at call time instead,
 // unless `pin` says the hub lives somewhere this machine cannot discover.
-export function plan(agent, config, { url, host = hostname(), token = null, pin = false, httpOnly = false } = {}) {
+export function plan(agent, config, { url, host = hostname(), token = null, pin = false, httpOnly = false, cloudOnly = false } = {}) {
   const next = strip(structuredClone(config));
   next.hooks ||= {};
   const bridge = `node ${JSON.stringify(BIN)} hook ${agent} --host ${JSON.stringify(host)}` +
@@ -53,9 +53,12 @@ export function plan(agent, config, { url, host = hostname(), token = null, pin 
     const handler = agent === 'claude' && event !== 'SessionStart'
       ? {
           type: 'http',
-          url: `${url}/ingest/claude?host=${encodeURIComponent(host)}&board=${MARK}`,
+          url: `${url}/ingest/claude?host=${encodeURIComponent(host)}&board=${MARK}${cloudOnly ? '&only=cloud' : ''}`,
           timeout,
-          ...(token ? { headers: { Authorization: 'Bearer $SESSION_BOARD_TOKEN' }, allowedEnvVars: ['SESSION_BOARD_TOKEN'] } : {}),
+          // In a Claude Code cloud container this variable holds the session's
+          // cloud id; anywhere else it is empty. One config serves both.
+          headers: { 'X-Cloud-Session': '$CLAUDE_CODE_REMOTE_SESSION_ID', ...(token ? { Authorization: 'Bearer $SESSION_BOARD_TOKEN' } : {}) },
+          allowedEnvVars: ['CLAUDE_CODE_REMOTE_SESSION_ID', ...(token ? ['SESSION_BOARD_TOKEN'] : [])],
         }
       : { type: 'command', command: bridge, timeout };
     (next.hooks[event] ||= []).push({ hooks: [handler] });

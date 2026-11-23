@@ -17,7 +17,7 @@ function outcome(agent, p) {
 
 const text = (v) => (typeof v === 'string' ? v : v == null ? null : JSON.stringify(v));
 
-export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null, source = null, tmux = null } = {}) {
+export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null, source = null, tmux = null, cloudId = null } = {}) {
   if (!p || typeof p !== 'object' || !p.session_id || !p.hook_event_name) return [];
   const base = {
     ts: now,
@@ -27,6 +27,7 @@ export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null
     runtime: runtime || null,
     cwd: p.cwd || null,
     transcript: p.transcript_path || null,
+    ...(cloudId ? { cloud_id: cloudId, runtime: 'cloud' } : {}),
     ...(seq != null ? { seq, source } : {}),
   };
   // Events that carry an id of their own can be recognised if delivered twice.

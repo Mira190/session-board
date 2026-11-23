@@ -22,6 +22,14 @@ export const setLangPref = (v) => store.set(LANGS.includes(v) ? v : 'auto');
 export const lang = () => (langPref() === 'auto' ? systemLang() : langPref());
 
 const ZH = {
+  // ---- cloud sessions
+  'Sent to the cloud session through the Claude Code CLI on this machine.': '通过本机的 Claude Code 命令行发给这个云端会话。',
+  'Open in claude.ai': '在 claude.ai 打开',
+  '　Known from your cloud session list: state only, no detail of what it is waiting for.': '　来自你的云端会话列表：只有状态，没有它具体在等什么的细节。',
+  'one session started the others': '其中一个会话启动了其余的',
+  'Working': '在干活',
+  'Waiting on you in claude.ai': '在 claude.ai 上等你',
+
   // ---- quota, compare, join
   ' · {name} {used}% used': ' · {name}已用 {used}%',
   ', resets {at}': '，{at} 重置',
