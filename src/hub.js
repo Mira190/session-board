@@ -12,6 +12,7 @@ import { fromHook } from './adapters/hooks.js';
 import { attentionQueue } from './reduce.js';
 import { liveAgents, orphanReason } from './reconcile.js';
 import { scanHistory, usageFor } from './transcripts.js';
+import { createGitHub } from './github.js';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -39,6 +40,11 @@ const answerBody = (input, answers) => ({
     decision: { behavior: 'allow', updatedInput: { ...input, answers } },
   },
 });
+// Pull requests are re-read at most this often per session, except right after
+// a turn ends (the agent may just have pushed, opened or merged one).
+export const PR_POLL_MS = 2 * 60 * 1000;
+// ...and only while the session has seen activity this recently.
+const PR_WATCH_MS = 14 * 24 * 60 * 60 * 1000;
 // How long finished sessions stay on the board before the hub files them away.
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -84,6 +90,7 @@ export function createHub({
   holdMs = HOLD_MS,
   agents = liveAgents, // injectable for tests
   history = scanHistory,
+  github = createGitHub(),
   launch = (cmd, args, cwd) => spawn(cmd, args, { cwd, detached: true, stdio: 'ignore' }).unref(),
 } = {}) {
   const store = new Store(dbPath);
@@ -166,11 +173,39 @@ export function createHub({
     }
   }
 
+  // Pull request for the session's branch. The agent can open, push to or
+  // merge a PR with a shell command and nothing tells us, and a human can merge
+  // on github.com, so this is read at turn ends and then polled.
+  const prAsked = new Map();
+  async function refreshPr(s, { force = false } = {}) {
+    if (!s.branch || (!isLocal(s) && !s.github)) return false;
+    if (isLocal(s) && (!s.cwd || !existsSync(s.cwd))) return false;
+    if (!force && now() - (prAsked.get(s.key) || 0) < PR_POLL_MS) return false;
+    prAsked.set(s.key, now());
+    const [owner, repo] = (s.github || '').split('/');
+    const found = await github.findPr({
+      cwd: isLocal(s) ? s.cwd : null,
+      slug: owner && repo ? { owner, repo } : null,
+      branch: s.branch,
+    });
+    if (found === undefined) return false; // could not ask: keep what we knew
+    const { updated, ...pr } = found || {};
+    const next = found ? pr : null;
+    if (JSON.stringify(next) === JSON.stringify(s.pr)) return false;
+    emit(s, 'pr.updated', { pr: next });
+    return true;
+  }
+
   function ingest(events) {
     let last = null;
     for (const ev of events) {
       last = store.append(ev) || last;
-      if (last && USAGE_AT.has(ev.type)) refreshUsage(last).catch(() => {});
+      if (last && USAGE_AT.has(ev.type)) {
+        refreshUsage(last).catch(() => {});
+        const s = last;
+        // After the branch lookup that the same event triggers.
+        refreshGitMeta(s).catch(() => {}).then(() => refreshPr(store.get(s.key), { force: true })).catch(() => {});
+      }
     }
     if (last) refreshGitMeta(last).catch(() => {});
     return last;
@@ -330,7 +365,10 @@ export function createHub({
   //  - merged:   a reviewed-pending branch whose commits are now in the default
   //              branch has been accepted by whoever merged it.
   //  - inactive: a finished session nobody has touched for a week is archived.
-  // Squash and rebase merges rewrite commits, so they are not detected here.
+  // Squash and rebase merges rewrite commits, so git alone cannot see them: for
+  // those the pull request's own state is the evidence. A PR counts only when
+  // what was merged is exactly what this session left on its branch (same head
+  // commit), so an old merged PR from a reused branch name settles nothing.
   async function mergedInto(cwd, branch) {
     const base = (await git(cwd, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])) ||
       (await git(cwd, ['rev-parse', '--verify', '--quiet', '--abbrev-ref', 'main'])) ||
@@ -341,7 +379,19 @@ export function createHub({
     const merged = await run('git', ['-C', cwd, 'merge-base', '--is-ancestor', tip, base]);
     return merged == null ? null : { tip, base };
   }
+  async function pollPrs() {
+    let changed = 0;
+    for (const s of store.list()) {
+      if (s.archived || now() - s.last_event_ts > PR_WATCH_MS) continue;
+      // Worth asking while something can still change: work awaiting review,
+      // or a PR we know to be open.
+      if (s.state !== 'review' && s.pr?.state !== 'open') continue;
+      if (await refreshPr(s).catch(() => false)) changed += 1;
+    }
+    return changed;
+  }
   async function settle() {
+    await pollPrs();
     let settled = 0;
     for (const s of store.list()) {
       if (s.archived) continue;
@@ -349,11 +399,16 @@ export function createHub({
         emit(s, 'session.settled', { reason: 'inactive' });
         settled += 1;
       } else if (s.state === 'review' && isLocal(s) && s.cwd && s.branch && s.start_head && existsSync(s.cwd)) {
-        const m = await mergedInto(s.cwd, s.branch);
+        const tip = await git(s.cwd, ['rev-parse', '--verify', '--quiet', s.branch]);
         // The branch must have moved since we first saw it: a branch with no
         // new commits is trivially "in" the default branch.
-        if (m && m.tip !== s.start_head) {
-          emit(s, 'session.settled', { reason: 'merged', into: m.base });
+        if (!tip || tip === s.start_head) continue;
+        const m = await mergedInto(s.cwd, s.branch);
+        if (m) {
+          emit(s, 'session.settled', { reason: 'merged', into: m.base, by: 'git' });
+          settled += 1;
+        } else if (s.pr?.state === 'merged' && s.pr.head_sha === tip) {
+          emit(s, 'session.settled', { reason: 'merged', into: s.pr.base, by: 'pull request', pr: s.pr.number });
           settled += 1;
         }
       }
@@ -556,6 +611,7 @@ export function createHub({
     ingest,
     reconcile,
     settle,
+    refreshPr: (key, opts) => refreshPr(store.get(key), opts),
     backfill,
     decide,
     listen: (port, host) => new Promise((ok) => server.listen(port, host, () => ok(server.address()))),

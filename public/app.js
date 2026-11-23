@@ -77,9 +77,9 @@ function describe(s) {
         verb: '已',
       };
     case 'ended':
-      return { tone: 'rest', what: s.settled === 'merged' ? '分支已合并，自动算作验收' : s.imported ? '历史会话（导入）' : '已结束', detail: s.last_message, verb: '' };
+      return { tone: 'rest', what: s.settled === 'merged' ? '已合并，自动算作验收' : s.imported ? '历史会话（导入）' : '已结束', detail: s.last_message, verb: '' };
     default:
-      return { tone: 'rest', what: s.settled === 'merged' ? '分支已合并，自动算作验收' : '空闲，等你派活', detail: s.last_message, verb: '已' };
+      return { tone: 'rest', what: s.settled === 'merged' ? '已合并，自动算作验收' : '空闲，等你派活', detail: s.last_message, verb: '已' };
   }
 }
 
@@ -89,6 +89,14 @@ const resumeCommand = (s) => {
   const cd = s.cwd ? `cd ${JSON.stringify(s.cwd)} && ` : '';
   return s.agent === 'claude' ? `${cd}claude --resume ${s.session_id}` : `${cd}codex resume ${s.session_id}`;
 };
+const PR_STATE = { open: '开着', merged: '已合并', closed: '已关闭（未合并）' };
+const PR_CHECKS = { passing: '检查通过', failing: '检查失败', pending: '检查进行中' };
+const PR_REVIEW = { approved: '已批准', changes_requested: '要求修改', review_required: '等评审' };
+const prLine = (pr) => [
+  `PR #${pr.number}`, pr.draft && pr.state === 'open' ? '草稿' : PR_STATE[pr.state],
+  pr.state === 'open' ? PR_CHECKS[pr.checks] : null, pr.state === 'open' ? PR_REVIEW[pr.review] : null,
+].filter(Boolean).join(' · ');
+const prTone = (pr) => (pr.state === 'merged' ? 'ok' : pr.checks === 'failing' || pr.review === 'changes_requested' ? 'bad' : '');
 const usageLine = (s) => {
   const u = s.usage;
   if (!u) return null;
@@ -197,6 +205,7 @@ function card(s) {
       el('span', { className: 'age', textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前` }),
     ),
     d.detail && el('div', { className: 'peek', textContent: d.detail.split('\n')[0] }),
+    s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
     s.quiet && el('div', { className: 'warn', textContent: `${age(s.last_event_ts)} 没有任何动静` }),
   );
 }
@@ -492,6 +501,9 @@ function renderBench() {
       el('span', { className: 'where', textContent: [where(s), `第 ${s.turns} 轮`, usageLine(s)].filter(Boolean).join(' · ') }),
       s.runtime === 'cloud' && el('span', { textContent: '☁ 云端' })),
     el('h2', { textContent: s.title || s.session_id }),
+    s.pr && el('p', { className: `pr ${prTone(s.pr)}` },
+      el('a', { href: s.pr.url, target: '_blank', rel: 'noreferrer', textContent: prLine(s.pr) }),
+      s.pr.title ? `　${s.pr.title}` : '', s.pr.base ? ` → ${s.pr.base}` : ''),
     notice?.key === s.key && el('div', { className: 'warn', textContent: notice.text }),
     nowBlock(s, d),
 

@@ -79,7 +79,7 @@ test('review shows the session\'s own files; a merged branch settles itself; old
   git(repo, 'checkout', '-qb', 'feature');
 
   let t = Date.now();
-  const { hub, post, get } = await start({ localHost: 'laptop', now: () => t });
+  const { hub, post, get } = await start({ localHost: 'laptop', now: () => t, github: { findPr: async () => undefined } });
   const hook = (id, name, extra = {}) => post('/ingest/claude?host=laptop', { session_id: id, cwd: repo, hook_event_name: name, ...extra });
   await hook('m', 'UserPromptSubmit', { prompt: 'change a' });
   await until(() => hub.store.get('claude:m').start_head);
