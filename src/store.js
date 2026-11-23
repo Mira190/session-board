@@ -26,6 +26,10 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS events_key ON events (key, id);
     `);
+    // Older databases have rules without a mode: those are exact rules.
+    if (!this.db.prepare('PRAGMA table_info(rules)').all().some((c) => c.name === 'mode')) {
+      this.db.exec("ALTER TABLE rules ADD COLUMN mode TEXT NOT NULL DEFAULT 'exact'");
+    }
     this.insert = this.db.prepare('INSERT INTO events (ts, key, type, body) VALUES (?, ?, ?, ?)');
     this.sessions = new Map();
     this.seqs = new Map(); // `${session}|${source}` -> highest sequence accepted
@@ -100,10 +104,10 @@ export class Store {
 
   // Global rules: "this exact request is always fine, in any session".
   rules() {
-    return this.db.prepare('SELECT tool, detail, created FROM rules ORDER BY created').all();
+    return this.db.prepare('SELECT tool, detail, mode, created FROM rules ORDER BY created').all();
   }
-  addRule(tool, detail, created) {
-    this.db.prepare('INSERT OR IGNORE INTO rules (tool, detail, created) VALUES (?, ?, ?)').run(tool, detail, created);
+  addRule(tool, detail, created, mode = 'exact') {
+    this.db.prepare('INSERT OR REPLACE INTO rules (tool, detail, mode, created) VALUES (?, ?, ?, ?)').run(tool, detail, mode, created);
   }
   removeRule(tool, detail) {
     this.db.prepare('DELETE FROM rules WHERE tool = ? AND detail = ?').run(tool, detail);

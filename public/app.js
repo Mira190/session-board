@@ -327,14 +327,27 @@ function batches(sessions) {
     const k = `${w.tool}\n${w.detail}`;
     (groups.get(k) || groups.set(k, []).get(k)).push(s);
   }
-  return [...groups.values()].filter((g) => g.length > 1).sort((a, b) => b.length - a.length);
+  const exact = [...groups.values()].filter((g) => g.length > 1);
+  // What is left may still be the same kind of command with different
+  // arguments ("git push origin <branch>"): offer those as one decision too.
+  const taken = new Set(exact.flat().map((s) => s.key));
+  const kinds = new Map();
+  for (const s of sessions) {
+    const w = s.waiting;
+    if (taken.has(s.key) || s.state !== 'needs_input' || w?.kind !== 'permission' || !w.decidable || w.risky || !w.stem) continue;
+    const k = `${w.tool}\n${w.stem}`;
+    (kinds.get(k) || kinds.set(k, []).get(k)).push(s);
+  }
+  const alike = [...kinds.values()].filter((g) => g.length > 2).map((g) => Object.assign(g, { stem: g[0].waiting.stem }));
+  return [...exact, ...alike].sort((a, b) => b.length - a.length);
 }
 
 async function decideBatch(group, decision, remember = false) {
   try {
     const out = await call('/api/requests/batch', { ids: group.map((s) => s.waiting.id), decision, remember });
     pinned = false;
-    say(selected, out.rule ? `已处理 ${out.decided} 个，以后这条命令自动允许。` : `已处理 ${out.decided} 个。`);
+    toast(out.rule ? `已处理 ${out.decided} 个，以后${out.rule.mode === 'prefix' ? `“${out.rule.detail} …”这一类` : '这条命令'}自动允许。` : `已处理 ${out.decided} 个。`,
+      out.rule && (() => fetch(api('/api/rules'), { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(out.rule) })));
   } catch (err) {
     say(selected, err.message);
   }
@@ -343,6 +356,19 @@ async function decideBatch(group, decision, remember = false) {
 function batchCard(group) {
   const w = group[0].waiting;
   const repos = [...new Set(group.map(repoOf))];
+  if (group.stem) {
+    const rule = { tool: w.tool, detail: group.stem, mode: 'prefix' };
+    const cmds = [...new Set(group.map((s) => s.waiting.detail.split('\n')[0]))];
+    return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
+      el('div', { className: 'status' }, el('span', { className: 'what', textContent: `${group.length} 个会话在请求同一类命令：${w.tool}` })),
+      el('div', { className: 'peek code', textContent: `${group.stem} …` }),
+      el('ul', { className: 'cmds' }, cmds.slice(0, 4).map((c) => el('li', { textContent: c })), cmds.length > 4 && el('li', { textContent: `…另有 ${cmds.length - 4} 条` })),
+      el('div', { className: 'actions' },
+        el('button', { className: 'primary', textContent: `全部允许（${group.length}）`, onclick: () => decideBatch(group, 'allow') }),
+        el('button', { textContent: '全部允许，以后这一类也自动允许', title: `以后“${group.stem} ”加任意参数都自动允许；带 ; | && 或高风险写法的仍会问你。可在“自动规则”里撤销`, onclick: () => decideBatch(group, 'allow', rule) }),
+        el('button', { className: 'danger', textContent: '全部拒绝', onclick: () => decideBatch(group, 'deny') }),
+      ));
+  }
   return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
     el('div', { className: 'status' }, el('span', { className: 'what', textContent: `${group.length} 个会话在请求同一件事：${w.tool}` })),
     el('div', { className: 'peek code', textContent: w.detail.split('\n')[0] }),
@@ -395,7 +421,7 @@ function renderLists(groups) {
     const items = fold ? [] : list.map((s) => ({ key: s.key, sig: cardSig(s), make: () => card(s) }));
     if (name === 'attention' && !fold) {
       items.unshift(...batches(list).map((g) => ({
-        key: `batch:${g[0].waiting.tool}:${g[0].waiting.detail}`, sig: g.map((s) => s.waiting.id).join(','), make: () => batchCard(g),
+        key: `batch:${g[0].waiting.tool}:${g.stem ? `kind:${g.stem}` : g[0].waiting.detail}`, sig: g.map((s) => s.waiting.id).join(','), make: () => batchCard(g),
       })));
     }
     if (!items.length && !fold) {
@@ -706,6 +732,17 @@ function nowBlock(s, d) {
         s.waiting.tool && el('button', { textContent: `本会话都允许 ${s.waiting.tool}`, onclick: () => decide(s, 'allow', true) }),
         el('button', { textContent: '交回终端', title: '不在这里决定，让它在自己的终端里问你', onclick: () => decide(s, 'terminal') }),
       );
+      // Decide it for every session, now and later.
+      if (!s.waiting.risky && s.waiting.tool && s.waiting.detail) {
+        const always = (rule, label) => call('/api/rules', rule)
+          .then(() => { toast(`以后所有会话里${label}都自动允许。`, () => fetch(api('/api/rules'), { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rule) })); advance(s.key); })
+          .catch((e) => say(s.key, e.message));
+        kids.push(el('div', { className: 'actions rules-row' },
+          el('span', { className: 'note', textContent: '所有会话以后都自动允许：' }),
+          el('button', { textContent: '这一条', title: s.waiting.detail, onclick: () => always({ tool: s.waiting.tool, detail: s.waiting.detail, mode: 'exact' }, '这条命令') }),
+          s.waiting.stem && el('button', { textContent: `${s.waiting.stem} …`, title: '带任意参数；带 ; | && 或高风险写法的仍会问你', onclick: () => always({ tool: s.waiting.tool, detail: s.waiting.stem, mode: 'prefix' }, `“${s.waiting.stem} …”`) }),
+        ));
+      }
     } else {
       actions.append(el('span', { className: 'note', textContent: '这个请求现在只能在它自己的终端里回答（它发出时看板没开着，或已被交回终端）。' }));
     }
@@ -863,6 +900,13 @@ function render() {
 }
 
 function paint() {
+  if (wanted && all.has(wanted)) {
+    selected = wanted;
+    pinned = true;
+    wanted = null;
+    history.replaceState(null, '', location.pathname + location.search);
+    if ($('#app').dataset.view === 'board') setView('inbox');
+  }
   // Follow the queue until the human picks something; never yank a session
   // they chose out from under them.
   const current = byKey(selected);
@@ -999,9 +1043,9 @@ $('#rules').onclick = async () => {
   const dialog = $('#rules-dialog');
   const show = (rules) => $('article', dialog).replaceChildren(
     el('h3', { textContent: '自动规则' }),
-    el('p', { className: 'note', textContent: '任何会话请求完全相同的命令时自动允许。在“全部允许，以后也自动允许”时创建；看起来高风险的命令不能设为规则。' }),
+    el('p', { className: 'note', textContent: '任何会话请求匹配的命令时自动允许。规则可以是完全相同的一条命令，或一类命令加任意参数。带 ; | && 这类连接符的命令不会匹配“一类”规则，看起来高风险的命令永远逐个确认。' }),
     rules.length ? el('ul', { className: 'rules' }, rules.map((r) => el('li', {},
-      el('code', { textContent: `${r.tool}: ${r.detail}` }),
+      el('code', { textContent: `${r.tool}: ${r.detail}${r.mode === 'prefix' ? ' …（任意参数）' : ''}` }),
       el('button', { textContent: '撤销', onclick: async () => show(await fetch(api('/api/rules'), {
         method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(r) }).then((x) => x.json())) }))))
       : el('p', { className: 'empty', textContent: '还没有规则。' }),
@@ -1021,6 +1065,18 @@ for (const id of ['notify', 'sound']) {
     prefs.set(id, box.checked ? '1' : '0');
   };
 }
+// Tell the hub whether anyone is looking, so it knows when to push to a phone.
+const presence = () => fetch(api('/api/presence'), {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ visible: !document.hidden }), keepalive: true,
+}).catch(() => {});
+document.addEventListener('visibilitychange', presence);
+setInterval(() => !document.hidden && presence(), 30_000);
+presence();
+
+// A link from a notification opens that session: /#<session key>
+let wanted = decodeURIComponent(location.hash.slice(1)) || null;
+addEventListener('hashchange', () => { wanted = decodeURIComponent(location.hash.slice(1)) || null; render(); });
+
 setView(['board', 'office'].includes(prefs.get('view')) ? prefs.get('view') : 'inbox');
 setInterval(tickAges, 5000); // waiting timers tick without re-rendering anything // keep timers ticking
 connect();

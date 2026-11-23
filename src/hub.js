@@ -9,10 +9,12 @@ import { basename, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.js';
 import { fromHook } from './adapters/hooks.js';
-import { attentionQueue, prAlertKey, isRisky } from './reduce.js';
+import { attentionQueue, prAlertKey } from './reduce.js';
 import { liveAgents, orphanReason } from './reconcile.js';
 import { scanHistory, usageFor } from './transcripts.js';
 import { createGitHub } from './github.js';
+import { ruleMatches, ruleProblem, stemOf } from './rules.js';
+import { createNotifier } from './notify.js';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -104,6 +106,8 @@ export function createHub({
   agents = liveAgents, // injectable for tests
   history = scanHistory,
   github = createGitHub(),
+  notifier = null, // injectable; built from the environment by default
+  boardUrl = '',
   launch = (cmd, args, cwd) => spawn(cmd, args, { cwd, detached: true, stdio: 'ignore' }).unref(),
 } = {}) {
   const store = new Store(dbPath);
@@ -132,7 +136,11 @@ export function createHub({
   const full = (s) => ({
     ...s,
     requests: s.requests.map((r) => ({ ...r, decidable: !!r.id && held.has(r.id), capability: capability(s, r) })),
-    waiting: s.waiting && { ...s.waiting, decidable: !!s.waiting.id && held.has(s.waiting.id), capability: capability(s, s.waiting) },
+    waiting: s.waiting && {
+      ...s.waiting, decidable: !!s.waiting.id && held.has(s.waiting.id), capability: capability(s, s.waiting),
+      // The kind of command this is, when a rule for the whole kind is possible.
+      stem: s.waiting.kind === 'permission' ? stemOf(s.waiting.detail) : null,
+    },
     quiet: s.state === 'working' && now() - s.last_event_ts > QUIET_MS,
     local: isLocal(s),
     reply: replyRoute(s),
@@ -151,7 +159,12 @@ export function createHub({
     const { files, transcript, auto_allow, acked, start_head, pr_alert, ...row } = full(s);
     return { ...row, last_prompt: short(row.last_prompt), last_message: short(row.last_message), files_count: files.length };
   };
-  let rules = store.rules(); // global: [{ tool, detail }]
+  let rules = store.rules(); // global: [{ tool, detail, mode }]
+  // Someone is "present" while a board page has reported itself visible lately.
+  let lookedAt = 0;
+  const present = () => now() - lookedAt < 75_000;
+  const push = notifier || createNotifier({ boardUrl, isPresent: present });
+  store.onChange((s) => push.consider(s));
   const snapshot = () => {
     const sessions = store.list().filter((s) => !s.archived).map(view);
     return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length };
@@ -321,8 +334,7 @@ export function createHub({
     const s = ingest([event]);
     if (!s) return json(res, 200, {});
     const asked = s.requests.find((r) => r.id === id);
-    const standing = asked && !asked.risky &&
-      rules.some((r) => r.tool === asked.tool && r.detail === asked.detail);
+    const standing = asked && rules.some((r) => ruleMatches(r, asked.tool, asked.detail));
     if ((event.data.tool && s.auto_allow.includes(event.data.tool)) || standing) {
       emit(s, 'request.resolved', { id, decision: 'allow', by: standing ? 'standing rule' : 'rule' });
       return json(res, 200, decisionBody('allow'));
@@ -617,6 +629,11 @@ export function createHub({
       });
       return;
     }
+    if (path === '/api/presence' && req.method === 'POST') {
+      const { visible } = await body();
+      lookedAt = visible ? now() : 0;
+      return json(res, 200, { ok: true });
+    }
     if (path === '/api/backfill' && req.method === 'POST') {
       const { days } = await body();
       return json(res, 200, await backfill({ days: Number(days) > 0 ? Number(days) : 7 }));
@@ -628,16 +645,20 @@ export function createHub({
     // Decide once, apply everywhere: the same request open in many sessions is
     // answered in one call, optionally becoming a standing rule.
     if (path === '/api/requests/batch' && req.method === 'POST') {
+      // `remember` is a rule to add ({ tool, detail, mode }), or true for
+      // "exactly this command" taken from the first request.
       const { ids, decision: d, remember } = await body();
       if (!Array.isArray(ids) || !['allow', 'deny'].includes(d)) return json(res, 400, { error: 'ids and decision (allow|deny) required' });
       let rule = null;
       if (remember && d === 'allow') {
         const h = held.get(ids.find((id) => held.has(id)));
         const r = h && store.get(h.key).requests.find((x) => held.get(x.id) === h);
-        if (r?.tool && r.detail && !r.risky) {
-          store.addRule(r.tool, r.detail, now());
+        const wanted = remember === true ? r && { tool: r.tool, detail: r.detail, mode: 'exact' } : remember;
+        // The rule must cover the request it is being made from.
+        if (wanted && !ruleProblem(wanted) && r && ruleMatches(wanted, r.tool, r.detail)) {
+          store.addRule(wanted.tool, wanted.detail, now(), wanted.mode || 'exact');
           rules = store.rules();
-          rule = { tool: r.tool, detail: r.detail };
+          rule = { tool: wanted.tool, detail: wanted.detail, mode: wanted.mode || 'exact' };
         }
       }
       const done = ids.filter((id) => decide(id, d)).length;
@@ -645,11 +666,20 @@ export function createHub({
     }
     if (path === '/api/rules') {
       if (req.method === 'GET') return json(res, 200, rules);
-      const { tool, detail } = await body();
+      const { tool, detail, mode = 'exact' } = await body();
       if (typeof tool !== 'string' || typeof detail !== 'string') return json(res, 400, { error: 'tool and detail required' });
       if (req.method === 'POST') {
-        if (isRisky(detail)) return json(res, 400, { error: 'this looks drastic; it must be approved each time' });
-        store.addRule(tool, detail, now());
+        const problem = ruleProblem({ tool, detail, mode });
+        if (problem) return json(res, 400, { error: problem });
+        store.addRule(tool, detail, now(), mode);
+        // Requests already waiting that the new rule covers are answered now.
+        for (const [id, h] of [...held]) {
+          const r = store.get(h.key).requests.find((x) => x.id === id);
+          if (r && ruleMatches({ tool, detail, mode }, r.tool, r.detail)) {
+            release(id, decisionBody('allow'));
+            emit(store.get(h.key), 'request.resolved', { id, decision: 'allow', by: 'standing rule' });
+          }
+        }
       } else if (req.method === 'DELETE') store.removeRule(tool, detail);
       else return json(res, 405, { error: 'method not allowed' });
       rules = store.rules();

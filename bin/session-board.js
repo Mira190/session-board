@@ -21,6 +21,7 @@ const [cmd, arg] = positionals;
 
 const HELP = `session-board — one place for all your coding-agent sessions
 
+  session-board up                        install hooks for the agents found here, then serve
   session-board serve                     start the hub and the board UI
   session-board install <claude|codex>    add hooks to the agent's config
   session-board uninstall <claude|codex>  remove them again
@@ -33,6 +34,8 @@ const HELP = `session-board — one place for all your coding-agent sessions
 Options: --port 4590  --bind 127.0.0.1  --db <file>  --url <hub url>
          --host <label for this machine>  --dry-run
 Env:     SESSION_BOARD_TOKEN  require this bearer token on every request
+         SESSION_BOARD_NTFY   push to this ntfy topic URL when a session needs you and you are away
+         SESSION_BOARD_WEBHOOK  ...or POST JSON here; SESSION_BOARD_NOTIFY_DETAIL=1 includes the command text
          SESSION_BOARD_HOME   where the database and endpoint file live`;
 
 async function endpoint() {
@@ -85,7 +88,21 @@ async function main() {
     return serveMcp({ endpoint });
   }
 
-  if (cmd === 'serve') {
+  // `up`: the one command for a fresh machine. Wires in whichever agents are
+  // present, then serves.
+  if (cmd === 'up') {
+    const { install, configPath } = await import('../src/install.js');
+    const { existsSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    const url = `http://127.0.0.1:${opt.port}`;
+    for (const agent of ['claude', 'codex']) {
+      if (!existsSync(dirname(configPath(agent)))) { console.log(`${agent}: not found on this machine, skipped`); continue; }
+      const { changed, path } = install(agent, { url, host: opt.host, token: process.env.SESSION_BOARD_TOKEN || null });
+      console.log(`${agent}: hooks ${changed ? 'installed' : 'already in place'} (${path})`);
+      if (agent === 'codex' && changed) console.log('  Codex asks you to review new hooks: run /hooks inside Codex once.');
+    }
+  }
+  if (cmd === 'serve' || cmd === 'up') {
     const { createHub } = await import('../src/hub.js');
     const { writeEndpoint, home } = await import('../src/endpoint.js');
     const { install, status } = await import('../src/install.js');
@@ -96,11 +113,14 @@ async function main() {
       process.exit(1);
     }
     const db = opt.db || process.env.SESSION_BOARD_DB || join(home(), 'board.db');
-    const hub = createHub({ dbPath: db, token, localHost: opt.host });
-    await hub.listen(Number(opt.port), opt.bind);
     const url = `http://127.0.0.1:${opt.port}`;
+    // Links in phone notifications must point somewhere the phone can reach.
+    const boardUrl = (process.env.SESSION_BOARD_PUBLIC_URL || url).replace(/\/$/, '');
+    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl });
+    await hub.listen(Number(opt.port), opt.bind);
     writeEndpoint({ url, token });
     console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
+    if (process.env.SESSION_BOARD_NTFY || process.env.SESSION_BOARD_WEBHOOK) console.log('phone notifications: on (sent when no board page is in view)');
     // Claude Code's HTTP hooks carry the hub address; follow the hub if it moved.
     const claude = status('claude');
     if (claude.installed && claude.url !== url) {
