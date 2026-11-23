@@ -97,7 +97,7 @@ A few behaviors worth knowing:
 
 - **For live sessions not in tmux, the board cannot type into them.** Such sessions can only be watched and have permissions approved; replies have to go back to the terminal.
 - **Typing into tmux is only guarded against prompts the hooks can see** (permissions, questions). If the terminal is stopped at some other menu (for example the `/model` picker), the board does not know, and the text and Enter will be eaten by that menu; this case is discovered afterwards through the "not delivered" notice.
-- **Change attribution only recognizes editing tools**: files a session changes with tools such as Edit and Write are attributed to it; those changed through the command line (running scripts, `sed`) cannot be attributed, and you must click "See the whole workspace" to see them.
+- **When several sessions share one folder, changes cannot be told apart**: the default there is only the files its edit tools touched; shell-made changes need the "Since it started" view, which then also contains the other sessions' changes. One worktree per session avoids this.
 - **PR status has not been verified against the real GitHub**: the development environment cannot reach GitHub, so it was tested only with a simulated API and simulated `gh` output.
 - **Rebase merges where the PR was deleted afterwards** are not detected; squash merges with no PR, pushed straight to the trunk, are not detected either.
 - **Cloud**: neither vendor has a public "list sessions / read status" interface, so it can only rely on hooks pushing outward.
