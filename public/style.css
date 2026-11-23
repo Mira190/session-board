@@ -299,3 +299,16 @@ details.file pre.diff { margin: 0; border: 0; border-top: 1px solid var(--line);
 details.file > .note { padding: 0 10px 8px; margin: 0; }
 button.mini { font-size: 11px; padding: 0 8px; margin-left: 8px; font-weight: 400; vertical-align: middle; }
 .burn { color: var(--muted); }
+
+/* ---- quota, version comparison, manual task join ---- */
+.quota .q.warm { color: var(--accent); }
+.quota .q.hot { color: var(--urgent); font-weight: 600; }
+.quota, .quota .q { color: var(--muted); }
+.compare { margin-top: 8px; }
+.compare .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-top: 6px; }
+.compare .col { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; display: grid; gap: 6px; align-content: start; font-size: 13px; }
+.compare .col[data-current="true"] { border-color: var(--accent); }
+.compare .col .prose { max-height: 9em; overflow: auto; }
+.compare .col .facts { color: var(--muted); font-size: 12px; }
+select.join { font: inherit; font-size: 12px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 7px; padding: 3px 6px; max-width: 260px; }
+.taskjoin { margin-top: 8px; }

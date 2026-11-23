@@ -250,7 +250,7 @@ test('install merges with existing hooks and uninstall restores them', () => {
   assert.deepEqual(strip(codex), {});
 
   const path = join(mkdtempSync(join(tmpdir(), 'sb-cfg-')), 'settings.json');
-  assert.deepEqual(status('claude', path), { path, installed: false, url: null });
+  assert.deepEqual(status('claude', path), { path, installed: false, url: null, missing: [] });
   assert.equal(install('claude', { path, url: 'http://127.0.0.1:4590', host: 'laptop' }).changed, true);
   assert.equal(install('claude', { path, url: 'http://127.0.0.1:4590', host: 'laptop' }).changed, false, 'no rewrite when nothing changed');
   assert.equal(status('claude', path).url, 'http://127.0.0.1:4590');

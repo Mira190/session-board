@@ -168,3 +168,51 @@ test('quiet hours', () => {
   assert.equal(inQuietHours('', at(3)), false);
   assert.equal(inQuietHours('nonsense', at(3)), false);
 });
+
+test('in a shared folder, what a shell command changed is credited to the session that ran it', async () => {
+  const dir = repo();
+  const { hub, get, hook } = await start();
+  await hook('a', dir, 'UserPromptSubmit', { prompt: 'regenerate the lockfile please' });
+  await hook('b', dir, 'UserPromptSubmit', { prompt: 'tidy the changelog a little' });
+  const bash = async (id, sid, command, effect) => {
+    await hook(sid, dir, 'PreToolUse', { tool_name: 'Bash', tool_use_id: id, tool_input: { command } });
+    effect();
+    await hook(sid, dir, 'PostToolUse', { tool_name: 'Bash', tool_use_id: id, tool_input: { command }, tool_response: { stdout: '' } });
+  };
+  await bash('a1', 'a', 'node scripts/gen.js', () => { writeFileSync(join(dir, 'gen.txt'), 'regenerated\n'); writeFileSync(join(dir, 'new.lock'), 'lock\n'); });
+  await bash('b1', 'b', 'sed -i s/one/uno/ a.txt', () => writeFileSync(join(dir, 'a.txt'), 'uno\n'));
+  await until(() => hub.store.get('claude:a').files.length === 2 && hub.store.get('claude:b').files.length === 1);
+  assert.deepEqual(hub.store.get('claude:a').files.map((f) => f.replace(`${dir}/`, '')).sort(), ['gen.txt', 'new.lock']);
+  assert.deepEqual(hub.store.get('claude:b').files.map((f) => f.replace(`${dir}/`, '')), ['a.txt']);
+  const mine = await get(`/api/sessions/${encodeURIComponent('claude:b')}/diff?scope=session`);
+  assert.deepEqual(mine.files.map((f) => f.path), ['a.txt'], 'b reviews its own change, not a\'s');
+  assert.equal(git(dir, 'stash', 'list'), '', 'no stash entries were left behind');
+
+  // A session alone in its folder is not slowed down with snapshots.
+  const solo = repo();
+  await hook('c', solo, 'UserPromptSubmit', { prompt: 'work alone in this folder' });
+  await bash('c1', 'c', 'touch x', () => writeFileSync(join(solo, 'x'), ''));
+  await new Promise((r) => setTimeout(r, 150));
+  assert.deepEqual(hub.store.get('claude:c').files, []);
+  await hub.close();
+});
+
+test('usage-limit windows and context fill arrive through the status line bridge', async () => {
+  let t = 2_000_000_000_000;
+  const { hub, post, get, hook } = await start({ now: () => t });
+  await hook('q', '/nowhere', 'UserPromptSubmit', { prompt: 'anything at all really' });
+  assert.equal((await get('/api/sessions')).quota, null);
+  const reset5 = Math.round(t / 1000) + 3600;
+  await post('/ingest/status?agent=claude', { session_id: 'q', context_window: { used_percentage: 61.4 },
+    rate_limits: { five_hour: { used_percentage: 72.6, resets_at: reset5 }, seven_day: { used_percentage: 12, resets_at: reset5 + 86400 } } });
+  let snap = await get('/api/sessions');
+  assert.deepEqual(snap.quota.five_hour, { used: 73, resets_at: reset5 * 1000 });
+  assert.equal(snap.quota.seven_day.used, 12);
+  assert.equal(snap.sessions[0].context_pct, 61);
+  await post('/ingest/status?agent=claude', { session_id: 'q', context_window: { used_percentage: 62 } });
+  assert.equal((await get('/api/sessions')).quota.five_hour.used, 73, 'an update without limits does not erase them');
+  t += 3601_000;
+  snap = await get('/api/sessions');
+  assert.deepEqual([snap.quota.five_hour, snap.quota.seven_day.used], [null, 12], 'a window past its reset time is dropped');
+  await hub.close();
+});

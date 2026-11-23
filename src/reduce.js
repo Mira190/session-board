@@ -270,6 +270,11 @@ export function reduce(prev, ev) {
       working();
       break;
 
+    case 'files.attributed':
+      // Files that changed while one of this session's shell commands ran.
+      for (const f of d.files || []) if (!s.files.includes(f) && s.files.length < MAX_FILES) s.files.push(f);
+      break;
+
     case 'context.compacted':
       s.compactions += 1;
       break;
@@ -474,8 +479,9 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
+    s.last_work_ts = ts;
     s.exited = false;
     s.imported = false;
   }

@@ -16,6 +16,8 @@ const { values: opt, positionals } = parseArgs({
     triage: { type: 'boolean', default: false },
     once: { type: 'boolean', default: false },
     'push-test': { type: 'boolean', default: false },
+    statusline: { type: 'boolean', default: false },
+    'http-only': { type: 'boolean', default: false },
     model: { type: 'string' },
     interval: { type: 'string', default: '20' },
     'dry-run': { type: 'boolean', default: false },
@@ -29,6 +31,9 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board up                        install hooks for the agents found here, then serve
   session-board serve                     start the hub and the board UI
   session-board install <claude|codex>    add hooks to the agent's config
+  session-board install claude --statusline   also report usage-limit windows to the board (subscribers)
+  session-board remote <ssh-host>         bring sessions on another machine onto this board
+  session-board codex-cloud               show how Codex cloud tasks are read (enable with SESSION_BOARD_CODEX_CLOUD=1)
   session-board uninstall <claude|codex>  remove them again
   session-board doctor [--push-test]      check on this machine that every piece actually works
   session-board status                    is the hub up, are the hooks in place
@@ -90,6 +95,11 @@ async function hook(agent) {
 async function main() {
   if (opt.help || !cmd) return console.log(HELP);
   if (cmd === 'hook') return hook(arg);
+  if (cmd === 'statusline') {
+    const { statusline } = await import('../src/statusline.js');
+    const { url, token } = await endpoint();
+    return statusline({ url, token }).catch(() => {});
+  }
   if (cmd === 'mcp') {
     const { serveMcp } = await import('../src/mcp.js');
     return serveMcp({ endpoint, triage: opt.triage });
@@ -130,10 +140,28 @@ async function main() {
     console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
     if (process.env.SESSION_BOARD_NTFY || process.env.SESSION_BOARD_WEBHOOK) console.log('phone notifications: on (sent when no board page is in view)');
     // Claude Code's HTTP hooks carry the hub address; follow the hub if it moved.
+    // Keep installed hooks current: follow the hub if it moved, and add events
+    // that a newer version of session-board listens for.
     const claude = status('claude');
-    if (claude.installed && claude.url !== url) {
+    if (claude.installed && (claude.url !== url || claude.missing.length)) {
       install('claude', { url, host: opt.host, token });
-      console.log(`updated Claude Code hooks: ${claude.url} -> ${url}`);
+      console.log(claude.url !== url ? `updated Claude Code hooks: ${claude.url} -> ${url}` : `added new Claude Code hook events: ${claude.missing.join(', ')}`);
+    }
+    const codex = status('codex');
+    if (codex.installed && codex.missing.length) {
+      install('codex', { url, host: opt.host, token });
+      console.log(`added new Codex hook events: ${codex.missing.join(', ')} (Codex will ask you to trust them again: /hooks)`);
+    }
+    if (process.env.SESSION_BOARD_CODEX_CLOUD === '1') {
+      const { listCloudTasks, toEvents } = await import('../src/codexcloud.js');
+      const poll = async () => {
+        const tasks = await listCloudTasks();
+        if (!tasks) return false;
+        await fetch(`${url}/ingest/event`, { method: 'POST', headers: authHeaders(token), body: JSON.stringify(toEvents(tasks)) }).catch(() => {});
+        return true;
+      };
+      console.log((await poll()) ? 'Codex cloud tasks: on (listed through the codex CLI every 2 minutes)' : 'Codex cloud tasks: `codex cloud list` did not work (logged in?); will keep trying');
+      setInterval(poll, 120_000).unref();
     }
     const lost = await hub.reconcile().catch(() => 0);
     if (lost) console.log(`${lost} session(s) had no agent process left and were marked unknown`);
@@ -146,8 +174,18 @@ async function main() {
     if (arg !== 'claude' && arg !== 'codex') throw new Error('specify claude or codex');
     const { install } = await import('../src/install.js');
     const { url, token } = await endpoint();
+    if (opt.statusline) {
+      if (arg !== 'claude') throw new Error('the status line bridge is for Claude Code');
+      const { installStatusline } = await import('../src/install.js');
+      const { rememberOriginal, forgetOriginal, originalCommand } = await import('../src/statusline.js');
+      const out = installStatusline({ remove: cmd === 'uninstall', remember: rememberOriginal, forget: forgetOriginal, original: originalCommand });
+      console.log(!out.changed ? `${out.path}: status line already ${cmd === 'uninstall' ? 'not ours' : 'bridged'}`
+        : cmd === 'uninstall' ? `${out.path}: your status line is back as it was`
+          : `${out.path}: status line now reports usage limits to the board${out.wrapped ? ' (your own status line still shows)' : ''}`);
+      return;
+    }
     const { path, after, changed } = install(arg, {
-      url, host: opt.host, token, pin: !!opt.url, dryRun: opt['dry-run'], remove: cmd === 'uninstall',
+      url, host: opt.host, token, pin: !!opt.url, httpOnly: opt['http-only'], dryRun: opt['dry-run'], remove: cmd === 'uninstall',
     });
     if (opt['dry-run']) console.log(JSON.stringify(after, null, 2));
     console.log(!changed ? `${path} is already up to date` : `${opt['dry-run'] ? 'Would write' : 'Wrote'} ${path}`);
@@ -185,6 +223,34 @@ async function main() {
     const { url, token } = await endpoint();
     const { failed } = await doctor({ url, token, pushTest: opt['push-test'] });
     process.exit(failed ? 1 : 0);
+  }
+
+  // Another machine: its agents post to their own localhost, and an SSH reverse
+  // tunnel carries that to this hub. No relay service, nothing exposed.
+  if (cmd === 'remote') {
+    if (!arg) throw new Error('usage: session-board remote <ssh-host>');
+    const { plan } = await import('../src/install.js');
+    const { spawn } = await import('node:child_process');
+    const port = opt.port;
+    const snippet = JSON.stringify(plan('claude', {}, { url: `http://127.0.0.1:${port}`, host: arg, httpOnly: true }).hooks);
+    console.log(`On ${arg}, merge this into ~/.claude/settings.json under "hooks" (it only posts to its own localhost:${port}):\n\n${snippet}\n`);
+    console.log(`Opening the tunnel: ${arg}:${port} -> this hub. Leave this running; Ctrl+C to stop.`);
+    console.log('From here you can see those sessions and approve or answer their requests. Replying, diffs and PR status need the files, so they stay on that machine.\n');
+    for (;;) {
+      const child = spawn('ssh', ['-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30', '-R', `${port}:127.0.0.1:${port}`, arg], { stdio: 'inherit' });
+      const code = await new Promise((r) => child.on('close', r));
+      console.log(`tunnel closed (ssh exited ${code}); retrying in 10s`);
+      await new Promise((r) => setTimeout(r, 10_000));
+    }
+  }
+
+  if (cmd === 'codex-cloud') {
+    const { listCloudTasks, phaseOf } = await import('../src/codexcloud.js');
+    const tasks = await listCloudTasks();
+    if (!tasks) return console.log('`codex cloud list --json` did not return a task list. Is Codex installed and logged in?');
+    console.log(`${tasks.length} task(s) as session-board reads them:`);
+    for (const t of tasks) console.log(`  ${String(t.status).padEnd(12)} -> ${String(phaseOf(t.status) || 'not recognised').padEnd(14)} ${t.title || '(no title read)'}`);
+    return console.log('If titles or states look wrong, the JSON has fields this reader does not know yet.');
   }
 
   if (cmd === 'status') {

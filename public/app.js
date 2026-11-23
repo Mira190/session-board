@@ -362,7 +362,7 @@ const cardSig = (s) => JSON.stringify([
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
-  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts,
+  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.context_pct >= 85 && s.context_pct, s.task?.why,
 ]);
 
 function card(s) {
@@ -387,6 +387,7 @@ function card(s) {
     triageLine(s),
     s.overlap && el('div', { className: 'warn', textContent: t('Same file as {who}: {file}', { who: s.overlap.with[0], file: s.overlap.file }) }),
     s.state === 'review' && checkLine(s),
+    s.context_pct >= 85 && el('div', { className: 'warn', textContent: t('Context {n}% full: it will compact soon and may lose early details', { n: s.context_pct }) }),
     s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
     s.quiet && el('div', { className: 'warn', textContent: t('No activity for over 10 minutes') }),
   );
@@ -424,7 +425,9 @@ function limitCard(group) {
   const each = (list, fn) => Promise.allSettled(list.map(fn));
   return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
     el('div', { className: 'status' }, el('span', { className: 'what', textContent: t('{n} sessions stopped at the usage limit', { n: group.length }) })),
-    el('div', { className: 'meta', textContent: t('Nothing is wrong with the work. When the limit resets they can pick up where they stopped.') }),
+    el('div', { className: 'meta', textContent: t('Nothing is wrong with the work. When the limit resets they can pick up where they stopped.') +
+      (snap.quota?.five_hour?.resets_at ? t(' The 5-hour window resets {at}.', { at: resetAt(snap.quota.five_hour.resets_at) }) : '') +
+      t(' Interactive Claude Code sessions continue by themselves after the reset.') }),
     el('div', { className: 'actions' },
       can.length > 0 && el('button', { className: 'primary', textContent: t('Tell {n} to continue', { n: can.length }), title: t('Sends “continue” to the ones the board can reach. Use it once the limit has reset.'),
         onclick: async () => {
@@ -849,8 +852,9 @@ function replyBox(s) {
   return el('div', { className: 'reply' }, area,
     el('div', { className: 'actions' },
       el('button', { className: 'primary', textContent: t('Send'), onclick: () => send(s) }),
-      el('span', { className: 'note', textContent: (s.reply === 'tmux'
-        ? t('Goes straight into its tmux window.') : t('Its process has exited: this resumes the same session for another round in the background.')) + t(' Ctrl/⌘ + Enter to send') }),
+      el('span', { className: 'note', textContent: (s.reply === 'tmux' ? t('Goes straight into its tmux window.')
+        : s.reply === 'queue' ? t('Queued for the session through Codex’s own message queue.')
+          : t('Its process has exited: this resumes the same session for another round in the background.')) + t(' Ctrl/⌘ + Enter to send') }),
     ));
 }
 
@@ -895,12 +899,38 @@ async function ackTask(s, adopt) {
   }
 }
 
+// The versions next to each other: what each says it did, what checks it ran,
+// how much it touched and what it cost.
+function compareGrid(group) {
+  const done = group.filter((m) => m.state === 'review' || m.state === 'idle' || m.state === 'ended');
+  if (done.length < 2) return null;
+  return el('details', { className: 'compare', open: done.length <= 3 },
+    el('summary', { textContent: t('Compare the {n} finished versions', { n: done.length }) }),
+    el('div', { className: 'cols' }, done.slice(0, 4).map((m) => el('div', { className: 'col', dataset: { current: String(m.key === selected) } },
+      el('div', { className: 'meta' }, el('span', { className: `badge ${m.agent}`, textContent: agentName(m) }), el('span', { textContent: m.branch || '' })),
+      evidence(m),
+      el('div', { className: 'facts', textContent: [m.files_count ? t('{n} files changed', { n: m.files_count }) : t('no files edited'), m.usage?.cost_usd != null ? `$${m.usage.cost_usd.toFixed(2)}` : null, m.pr && prLine(m.pr)].filter(Boolean).join(' · ') }),
+      el('div', { className: 'prose', textContent: m.last_message || '' }),
+      el('button', { className: 'mini', textContent: t('Open'), onclick: () => select(m.key, true) })))));
+}
+
+// Put a session into another session's task by hand, when the guess missed.
+function joinPicker(s) {
+  const others = snap.sessions.filter((o) => o.key !== s.key && o.task?.id !== s.task?.id && repoOf(o) === repoOf(s) && o.state !== 'ended').slice(0, 30);
+  if (!others.length) return null;
+  return el('select', { className: 'join', ariaLabel: t('Join another session’s task'), onchange: (e) => {
+    const join = e.target.value;
+    if (join) call(`/api/sessions/${encodeURIComponent(s.key)}/task`, { join }).catch((err) => say(s.key, err.message));
+  } }, el('option', { value: '', textContent: t('Same task as…') }), others.map((o) => el('option', { value: o.key, textContent: `${agentName(o)} · ${o.title || o.session_id}`.slice(0, 70) })));
+}
+
 function taskStrip(s) {
   const group = siblings(s);
-  if (!s.task || group.length < 2) return null;
+  if (!s.task || group.length < 2) return joinPicker(s) && el('div', { className: 'taskjoin' }, joinPicker(s));
   const reviewable = group.filter((m) => ['review', 'failed', 'unknown'].includes(m.state));
   return el('div', { className: 'taskstrip' },
-    el('div', { className: 'note', textContent: t('{n} sessions of the same task (same instruction or same branch). Click a row to switch, compare them one by one, then accept by task.', { n: group.length }) }),
+    el('div', { className: 'note', textContent: t('{n} sessions of one task, grouped because {why}. Click a row to switch between them, then accept by task.', {
+      n: group.length, why: (s.task.why || []).map((w) => ({ prompt: t('they were given the same instruction'), branch: t('one picked up the same branch after another'), manual: t('you joined them') }[w])).filter(Boolean).join(t(' and ')) || t('they look like the same work') }) }),
     el('div', { className: 'members' }, group.map((m) => {
       const d = describe(m);
       return el('button', { className: 'member wide', type: 'button', dataset: { tone: d.tone }, ariaCurrent: String(m.key === s.key), onclick: () => select(m.key, true) },
@@ -908,9 +938,11 @@ function taskStrip(s) {
         el('span', { className: 'what', textContent: d.what }),
         el('span', { className: 'facts', textContent: [m.branch, m.files_count ? t('{n} files changed', { n: m.files_count }) : null, m.pr && prLine(m.pr), m.usage?.cost_usd != null ? `$${m.usage.cost_usd.toFixed(2)}` : null].filter(Boolean).join(' · ') }));
     })),
+    compareGrid(group),
     el('div', { className: 'actions' },
       s.state === 'review' && el('button', { className: 'primary', textContent: t('Adopt this one, archive the rest'), title: t('Accept this session and archive the task’s other stopped sessions; ones still working are left alone'), onclick: () => ackTask(s, s.key) }),
       reviewable.length > 0 && el('button', { textContent: t('Accept all ({n})', { n: reviewable.length }), onclick: () => ackTask(s) }),
+      joinPicker(s),
       el('button', { textContent: t('Split this session off'), title: t('It is actually a different task'), onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/task`, { join: null }).catch((e) => say(s.key, e.message)) }),
     ));
 }
@@ -1018,7 +1050,7 @@ function renderBench() {
   bench.replaceChildren(...[
     el('div', { className: 'meta' },
       el('span', { className: `badge ${s.agent}`, textContent: agentName(s) }),
-      el('span', { className: 'where', textContent: [where(s), t('turn {n}', { n: s.turns }), usageLine(s)].filter(Boolean).join(' · ') }),
+      el('span', { className: 'where', textContent: [where(s), t('turn {n}', { n: s.turns }), usageLine(s), s.context_pct != null ? t('context {n}% full', { n: s.context_pct }) : null].filter(Boolean).join(' · ') }),
       s.runtime === 'cloud' && el('span', { textContent: t('☁ Cloud') })),
     el('h2', {}, s.title || s.session_id, el('button', { className: 'mini', textContent: t('Rename'), onclick: () => {
       const title = prompt(t('Name this session'), s.title || '');
@@ -1120,6 +1152,17 @@ function select(key, byHuman) {
   $(`.card[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: 'nearest' });
 }
 
+// Usage-limit windows, when the status line bridge reports them.
+const resetAt = (ms) => new Date(ms - skew).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+function quotaLine() {
+  const q = snap.quota;
+  if (!q) return '';
+  const part = (name, w) => w && el('span', { className: w.used >= 90 ? 'q hot' : w.used >= 70 ? 'q warm' : 'q' },
+    t(' · {name} {used}% used', { name, used: w.used }), w.resets_at ? t(', resets {at}', { at: resetAt(w.resets_at) }) : '');
+  return el('span', { className: 'quota', title: t('Your plan’s usage windows, as Claude Code reports them to its status line.') },
+    part(t('5-hour window'), q.five_hour), part(t('week'), q.seven_day));
+}
+
 let frame = 0;
 function render() {
   if (frame) return;
@@ -1158,6 +1201,7 @@ function paint() {
     count.attention ? el('b', { textContent: t('{n} waiting for you', { n: count.attention }) }) : t('Nothing is waiting for you'),
     t(', {r} to review, {w} working', { r: count.review, w: count.working }),
     filter ? t(' (filtered: showing {v} / {t})', { v: visible().length, t: snap.sessions.length }) : '',
+    quotaLine(),
     snap.burn ? el('span', { className: 'burn', title: t('What the agents report having spent, added up. It is what was used, not what is left: the board does not know your limits.'),
       textContent: t(' · ${usd} in the last {h}h across {n} session(s)', { usd: snap.burn.usd.toFixed(2), h: snap.burn.hours, n: snap.burn.sessions }) }) : '',
   );
@@ -1225,7 +1269,7 @@ function connect() {
       for (const s of msg.changed) all.set(s.key, s);
       for (const key of msg.removed) all.delete(key);
     }
-    snap = { now: msg.now, sessions: [...all.values()], queue: msg.queue, rules: msg.rules, burn: msg.burn };
+    snap = { now: msg.now, sessions: [...all.values()], queue: msg.queue, rules: msg.rules, burn: msg.burn, quota: msg.quota };
     skew = snap.now - Date.now();
     alertNew(msg.sessions ? snap.sessions : msg.changed);
     render();

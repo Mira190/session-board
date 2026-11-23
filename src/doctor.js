@@ -88,9 +88,24 @@ export async function doctor({ url, token, env = process.env, log = console.log,
   if (env.SESSION_BOARD_GITHUB === 'off') warn('GitHub lookups are switched off', 'unset SESSION_BOARD_GITHUB to turn them on');
   else {
     const gh = await sh('gh', ['auth', 'status']);
+    const token = env.GITHUB_TOKEN || env.GH_TOKEN;
     if (gh.ok) pass('gh is logged in', 'private repositories work');
-    else if (env.GITHUB_TOKEN || env.GH_TOKEN) pass('a GitHub token is set', 'used through the REST API');
-    else warn('no gh login and no GITHUB_TOKEN', 'PR status will only work for public repositories, at a low rate limit: run `gh auth login`');
+    else if (token) {
+      // A token that exists is not a token that works: ask GitHub.
+      const res = await fetch(`${env.GITHUB_API_URL || 'https://api.github.com'}/rate_limit`, {
+        headers: { authorization: `Bearer ${token}`, 'user-agent': 'session-board' }, signal: AbortSignal.timeout(8000),
+      }).catch((e) => ({ ok: false, status: e.message }));
+      if (res.ok) pass('the GitHub token works', 'used through the REST API');
+      else fail(`the GitHub token was refused (${res.status})`, 'it is expired, revoked, or GitHub is unreachable from here: run `gh auth login` or set a valid GITHUB_TOKEN');
+    } else warn('no gh login and no GITHUB_TOKEN', 'PR status will only work for public repositories, at a low rate limit: run `gh auth login`');
+    // In a repository: try the real lookup for the current branch.
+    const branch = await sh('git', ['rev-parse', '--abbrev-ref', 'HEAD']);
+    if (branch.ok && branch.out && branch.out !== 'HEAD') {
+      const { createGitHub } = await import('./github.js');
+      const pr = await createGitHub({ env }).findPr({ cwd: process.cwd(), branch: branch.out });
+      if (pr === undefined) warn(`could not look up a PR for branch ${branch.out}`, 'not a GitHub repository, or GitHub did not answer');
+      else pass(pr ? `PR lookup works: #${pr.number} is ${pr.state}` : `PR lookup works: no PR for branch ${branch.out}`);
+    }
   }
 
   log('Phone notifications');

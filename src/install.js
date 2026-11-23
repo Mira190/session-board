@@ -36,13 +36,16 @@ export function strip(config) {
 // `url` is baked into Claude Code's HTTP hooks. The command bridge (all of
 // Codex, and Claude's SessionStart) looks the hub up at call time instead,
 // unless `pin` says the hub lives somewhere this machine cannot discover.
-export function plan(agent, config, { url, host = hostname(), token = null, pin = false } = {}) {
+export function plan(agent, config, { url, host = hostname(), token = null, pin = false, httpOnly = false } = {}) {
   const next = strip(structuredClone(config));
   next.hooks ||= {};
   const bridge = `node ${JSON.stringify(BIN)} hook ${agent} --host ${JSON.stringify(host)}` +
     (pin ? ` --url ${JSON.stringify(url)}` : '');
   const events = agent === 'claude' ? CLAUDE_EVENTS : CODEX_EVENTS;
   for (const event of events) {
+    // On a machine that only has the agent (no session-board checkout), use
+    // nothing but HTTP: skip the one event that needs the command bridge.
+    if (httpOnly && (agent !== 'claude' || event === 'SessionStart')) continue;
     const timeout = event === 'PermissionRequest' ? WAIT_S : QUICK_S;
     // Claude Code: SessionStart only accepts command/mcp_tool handlers, and the
     // bridge is also what tells us about tmux. Everything else is a direct
@@ -76,7 +79,37 @@ export function status(agent, path = configPath(agent)) {
   }
   const ours = Object.values(config.hooks || {}).flat().flatMap((g) => g.hooks || []).filter(isOurs);
   const http = ours.find((h) => h.url);
-  return { path, installed: ours.length > 0, url: http ? http.url.split('/ingest/')[0] : null };
+  // Events a newer version wants that this install does not have yet.
+  const wanted = agent === 'claude' ? CLAUDE_EVENTS : CODEX_EVENTS;
+  const have = new Set(Object.entries(config.hooks || {}).filter(([, groups]) => groups.some((g) => (g.hooks || []).some(isOurs))).map(([event]) => event));
+  const missing = ours.length ? wanted.filter((e) => !have.has(e)) : [];
+  return { path, installed: ours.length > 0, url: http ? http.url.split('/ingest/')[0] : null, missing };
+}
+
+// Opt-in: route Claude Code's status line through the bridge so the board can
+// show the usage-limit windows. The user's own status line keeps working.
+export function installStatusline({ path = configPath('claude'), remove = false, remember, forget, original } = {}) {
+  const config = load(path);
+  const ours = (c) => typeof c?.command === 'string' && c.command.includes(MARK) && c.command.includes(' statusline');
+  const before = JSON.stringify(config);
+  if (remove) {
+    if (ours(config.statusLine)) {
+      const prev = original();
+      if (prev) config.statusLine = { type: 'command', command: prev };
+      else delete config.statusLine;
+      forget();
+    }
+  } else if (!ours(config.statusLine)) {
+    if (config.statusLine?.command) remember(config.statusLine.command);
+    config.statusLine = { type: 'command', command: `node ${JSON.stringify(BIN)} statusline` };
+  }
+  const changed = JSON.stringify(config) !== before;
+  if (changed) {
+    mkdirSync(dirname(path), { recursive: true });
+    if (existsSync(path)) copyFileSync(path, `${path}.session-board.bak`);
+    writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+  }
+  return { path, changed, wrapped: !remove && !!original() };
 }
 
 export function install(agent, opts = {}) {

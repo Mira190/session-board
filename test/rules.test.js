@@ -96,3 +96,53 @@ test('phone push: only when away, once per thing, merged when many, without the 
   assert.match(sent.at(-1).body, /cat \.env/, 'detail is included when asked for');
   assert.equal(createNotifier({ env: {} }).enabled, false);
 });
+
+test('Codex cloud tasks: read tolerantly, turned into events that apply once', async () => {
+  const { readTasks, toEvents, phaseOf, listCloudTasks } = await import('../src/codexcloud.js');
+  assert.deepEqual(['in_progress', 'READY', 'failed', 'cancelled', 'mystery'].map(phaseOf), ['working', 'finished', 'failed', 'cancelled', null]);
+  const tasks = readTasks({ tasks: [{ id: 't1', title: 'Fix login', status: 'in_progress', environment_label: 'acme/api' }, { task_id: 't2', summary: 'Add tests', state: 'ready', url: 'https://x/t2' }, { title: 'no id' }] });
+  assert.deepEqual(tasks.map((t) => [t.id, t.title, t.status]), [['t1', 'Fix login', 'in_progress'], ['t2', 'Add tests', 'ready']]);
+  assert.equal(await listCloudTasks({ exec: async () => null }), null, 'not logged in is "could not ask"');
+  assert.equal(await listCloudTasks({ exec: async () => 'not json' }), null);
+
+  const hub = createHub({});
+  const { port } = await hub.listen(0, '127.0.0.1');
+  const send = (list) => fetch(`http://127.0.0.1:${port}/ingest/event`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(toEvents(list)) });
+  await send(tasks); await send(tasks);
+  const s = (id) => hub.store.get(`codex:${id}`);
+  assert.deepEqual([s('t1').state, s('t1').runtime, s('t1').turns, s('t1').repo], ['working', 'cloud', 1, 'api'], 'listed twice, counted once');
+  assert.deepEqual([s('t2').state, s('t2').last_message], ['review', 'Finished in Codex cloud: https://x/t2']);
+  await send(readTasks([{ id: 't1', title: 'Fix login', status: 'completed' }]));
+  assert.equal(s('t1').state, 'review');
+  await hub.close();
+});
+
+test('installer: a plan for another machine uses only HTTP; an older install is seen as incomplete; the status line is wrapped, not replaced', async () => {
+  const { plan, status, install, installStatusline } = await import('../src/install.js');
+  const { mkdtempSync, writeFileSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const remote = plan('claude', {}, { url: 'http://127.0.0.1:4590', host: 'devbox', httpOnly: true });
+  assert.ok(Object.values(remote.hooks).every((g) => g[0].hooks[0].type === 'http'));
+  assert.equal(remote.hooks.SessionStart, undefined);
+  assert.match(remote.hooks.Stop[0].hooks[0].url, /host=devbox/);
+
+  const path = join(mkdtempSync(join(tmpdir(), 'sb-inst-')), 'settings.json');
+  install('claude', { path, url: 'http://127.0.0.1:4590', host: 'laptop' });
+  const old = JSON.parse(readFileSync(path, 'utf8'));
+  delete old.hooks.PreCompact; delete old.hooks.PostToolUseFailure; // as written by an earlier version
+  old.statusLine = { type: 'command', command: '~/bin/my-statusline.sh' };
+  writeFileSync(path, JSON.stringify(old));
+  assert.deepEqual(status('claude', path).missing.sort(), ['PostToolUseFailure', 'PreCompact']);
+  install('claude', { path, url: 'http://127.0.0.1:4590', host: 'laptop' });
+  assert.deepEqual(status('claude', path).missing, []);
+
+  let kept = null;
+  const io = { path, remember: (c) => { kept = c; }, forget: () => { kept = null; }, original: () => kept };
+  assert.deepEqual([installStatusline(io).changed, kept], [true, '~/bin/my-statusline.sh'], 'the user\'s own status line is remembered');
+  assert.match(JSON.parse(readFileSync(path, 'utf8')).statusLine.command, /session-board\.js" statusline$/);
+  assert.equal(installStatusline(io).changed, false, 'installing twice changes nothing');
+  installStatusline({ ...io, remove: true });
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).statusLine, { type: 'command', command: '~/bin/my-statusline.sh' }, 'and put back on uninstall');
+  assert.deepEqual(status('claude', path).missing, [], 'hooks were not disturbed');
+});

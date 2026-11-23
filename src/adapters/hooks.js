@@ -2,6 +2,19 @@
 // Codex hooks deliberately mirror Claude Code's stdin schema, so one mapper
 // serves both with small per-vendor branches.
 
+// Did the tool call succeed? Claude Code tells us by which event it sends.
+// Codex has no failure event (checked against its 0.171 binary), so there we
+// only say so when the response carries an explicit exit status; otherwise
+// the answer is "unknown" and no evidence is recorded either way.
+function outcome(agent, p) {
+  if (agent === 'claude') return p.hook_event_name === 'PostToolUse' && !p.tool_response?.interrupted;
+  const r = p.tool_response;
+  const code = r?.exit_code ?? r?.exitCode ?? r?.metadata?.exit_code;
+  if (Number.isInteger(code)) return code === 0;
+  if (typeof r?.success === 'boolean') return r.success;
+  return undefined;
+}
+
 const text = (v) => (typeof v === 'string' ? v : v == null ? null : JSON.stringify(v));
 
 export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null, source = null, tmux = null } = {}) {
@@ -32,7 +45,7 @@ export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null
     case 'PostToolUseFailure':
       // A command that exits non-zero arrives as PostToolUseFailure (verified
       // on Claude Code 2.1.330): that is how we know a test run failed.
-      return ev('tool.finished', { tool: p.tool_name, input: p.tool_input, ok: p.hook_event_name === 'PostToolUse' && !p.tool_response?.interrupted });
+      return ev('tool.finished', { tool: p.tool_name, input: p.tool_input, ok: outcome(agent, p) });
     case 'PreCompact':
       return ev('context.compacted', { trigger: p.trigger });
     case 'PermissionRequest':

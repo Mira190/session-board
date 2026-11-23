@@ -22,6 +22,29 @@ export const setLangPref = (v) => store.set(LANGS.includes(v) ? v : 'auto');
 export const lang = () => (langPref() === 'auto' ? systemLang() : langPref());
 
 const ZH = {
+  // ---- quota, compare, join
+  ' · {name} {used}% used': ' · {name}已用 {used}%',
+  ', resets {at}': '，{at} 重置',
+  '5-hour window': '5 小时窗口',
+  'week': '本周',
+  'Your plan’s usage windows, as Claude Code reports them to its status line.': '你的套餐用量窗口，来自 Claude Code 给状态栏的数据。',
+  'Queued for the session through Codex’s own message queue.': '通过 Codex 自己的消息队列排给这个会话。',
+  '{n} sessions of one task, grouped because {why}. Click a row to switch between them, then accept by task.': '同一个任务的 {n} 个会话，归到一起是因为{why}。点一行切换，然后按任务验收。',
+  'they were given the same instruction': '它们收到的是同一句指令',
+  'one picked up the same branch after another': '它们先后在同一个分支上接着干',
+  'you joined them': '你手动合并的',
+  ' and ': '，并且',
+  'they look like the same work': '它们看起来是同一件事',
+  'Compare the {n} finished versions': '对比 {n} 个已完成的版本',
+  'no files edited': '没有编辑文件',
+  'Open': '打开',
+  'Join another session’s task': '并入另一个会话的任务',
+  'Same task as…': '和这个会话是同一个任务…',
+  'Context {n}% full: it will compact soon and may lose early details': '上下文已用 {n}%：很快会被压缩，可能丢掉早先的细节',
+  'context {n}% full': '上下文已用 {n}%',
+  ' The 5-hour window resets {at}.': ' 5 小时窗口在 {at} 重置。',
+  ' Interactive Claude Code sessions continue by themselves after the reset.': ' 交互式的 Claude Code 会话会在重置后自己继续。',
+
   // ---- review, re-entry, limits, overlap
   'tests': '测试',
   'type check': '类型检查',

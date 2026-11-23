@@ -126,6 +126,9 @@ export function createHub({
   const promptOpen = (s) => s.requests.some((r) => r.kind === 'permission' || r.kind === 'question');
   const replyRoute = (s) => {
     if (!isLocal(s)) return null;
+    // Codex has an official way to hand a message to an existing session
+    // (`codex queue`), so it needs neither tmux nor a guess about the terminal.
+    if (s.agent === 'codex' && !s.imported) return 'queue';
     if (s.tmux?.pane) return promptOpen(s) ? null : 'tmux';
     if (s.exited || s.imported) return 'headless';
     return null;
@@ -154,7 +157,8 @@ export function createHub({
     // A reply that the agent has not confirmed receiving.
     undelivered: !!s.outgoing && now() - s.outgoing.ts > UNDELIVERED_MS,
     // Which task this belongs to, when it shares one with other sessions.
-    task: tasks.get(s.key)?.size > 1 ? { id: tasks.get(s.key).id, size: tasks.get(s.key).size } : null,
+    task: tasks.get(s.key)?.size > 1 ? { id: tasks.get(s.key).id, size: tasks.get(s.key).size, why: tasks.get(s.key).why } : null,
+    context_pct: contextPct.get(s.key) ?? null,
     overlap: overlaps.has(s.key) ? {
       files: overlaps.get(s.key).count, file: overlaps.get(s.key).file.split('/').pop(),
       with: [...overlaps.get(s.key).others.values()].slice(0, 2), sessions: overlaps.get(s.key).others.size,
@@ -238,6 +242,31 @@ export function createHub({
     burnCache = { at: now(), value: last.size ? { usd: Math.round(usd * 100) / 100, sessions: last.size, hours: 5 } : null };
     return burnCache.value;
   }
+  // Usage-limit windows, as the agent itself reports them to its status line
+  // (Claude Code, subscribers only). One account, so one value for the fleet.
+  let quota = null; // { five_hour: { used, resets_at }, seven_day: {...}, at }
+  const contextPct = new Map(); // session key -> % of the context window in use
+  function noteStatus(agent, p) {
+    const key = p.session_id ? `${agent}:${p.session_id}` : null;
+    const pct = p.context_window?.used_percentage;
+    if (key && Number.isFinite(pct) && Math.round(pct) !== contextPct.get(key)) {
+      contextPct.set(key, Math.round(pct));
+      if (store.get(key)) broadcast({ key });
+    }
+    const win = (w) => (w && Number.isFinite(w.used_percentage) ? { used: Math.round(w.used_percentage), resets_at: Number(w.resets_at) * 1000 || null } : null);
+    const next = { five_hour: win(p.rate_limits?.five_hour), seven_day: win(p.rate_limits?.seven_day) };
+    if (!next.five_hour && !next.seven_day) return;
+    const same = JSON.stringify(next) === JSON.stringify({ five_hour: quota?.five_hour || null, seven_day: quota?.seven_day || null });
+    quota = { ...next, at: now() };
+    if (!same) { dirty.add('__quota__'); broadcast({}); }
+  }
+  // A window whose reset time has passed is no longer true.
+  const liveQuota = () => {
+    if (!quota) return null;
+    const ok = (w) => (w && (!w.resets_at || w.resets_at > now()) ? w : null);
+    const q = { five_hour: ok(quota.five_hour), seven_day: ok(quota.seven_day), at: quota.at };
+    return q.five_hour || q.seven_day ? q : null;
+  };
   let rules = store.rules(); // global: [{ tool, detail, mode }]
   // Someone is "present" while a board page has reported itself visible lately.
   let lookedAt = 0;
@@ -247,7 +276,7 @@ export function createHub({
   const snapshot = () => {
     refreshTasks();
     const sessions = store.list().filter((s) => !s.archived).map(view);
-    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length, burn: burn() };
+    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length, burn: burn(), quota: liveQuota() };
   };
 
   // Live updates are deltas: a client gets the full picture once, then only
@@ -260,13 +289,14 @@ export function createHub({
   const TICK_MS = 120;
   const broadcast = (s) => {
     if (s?.key) dirty.add(s.key);
-    else for (const x of store.list()) dirty.add(x.key); // unknown scope: recheck all
+    else if (!s || Object.keys(s).length) for (const x of store.list()) dirty.add(x.key); // unknown scope: recheck all
     if (pending) return;
     pending = setTimeout(() => {
       pending = null;
       for (const key of refreshTasks()) dirty.add(key);
       const changed = [];
       const removed = [];
+      const quotaChanged = dirty.delete('__quota__');
       for (const key of dirty) {
         const x = store.get(key);
         if (!x || x.archived) {
@@ -281,9 +311,9 @@ export function createHub({
         changed.push(v);
       }
       dirty.clear();
-      if (!clients.size || (!changed.length && !removed.length)) return;
+      if (!clients.size || (!changed.length && !removed.length && !quotaChanged)) return;
       const live = store.list().filter((x) => !x.archived).map(view);
-      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length, burn: burn() })}\n\n`;
+      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length, burn: burn(), quota: liveQuota() })}\n\n`;
       for (const res of clients) res.write(msg);
     }, TICK_MS);
   };
@@ -365,6 +395,40 @@ export function createHub({
     if (!changed && !overdue) return false;
     emit(s, 'pr.updated', { pr: next });
     return changed;
+  }
+
+  // Shared folders: when two live sessions work in one directory, a diff of
+  // the directory cannot say who changed what. So around each shell command
+  // of a session in a shared folder we note what the working tree looked like
+  // before and after, and credit the difference to that session. (Two
+  // commands running at the same moment can still both be credited.)
+  const shared = (s) => isLocal(s) && s.cwd && existsSync(s.cwd) &&
+    store.list().some((o) => o.key !== s.key && !o.archived && o.cwd === s.cwd && o.host === s.host && o.state !== 'ended' && now() - o.last_event_ts < QUIET_MS * 6);
+  async function treeState(cwd) {
+    const [tree, head, untracked] = await Promise.all([
+      git(cwd, ['stash', 'create', 'session-board attribution']),
+      git(cwd, ['rev-parse', 'HEAD']),
+      git(cwd, ['ls-files', '--others', '--exclude-standard']),
+    ]);
+    return { tree: tree || head, untracked: new Set((untracked || '').split('\n').filter(Boolean)) };
+  }
+  const before = new Map(); // tool_use_id -> tree state when the command began
+  async function noteShellStart(s, id) {
+    if (!id || !shared(s)) return;
+    const state = await Promise.race([treeState(s.cwd), new Promise((r) => setTimeout(() => r(null), 1500))]);
+    if (state?.tree) before.set(id, state);
+    if (before.size > 200) before.delete(before.keys().next().value);
+  }
+  async function noteShellEnd(s, id) {
+    const was = before.get(id);
+    if (!was) return;
+    before.delete(id);
+    const is = await treeState(s.cwd);
+    if (!is.tree) return;
+    const changed = ((await git(s.cwd, ['diff', '--name-only', was.tree, is.tree])) || '').split('\n').filter(Boolean);
+    const created = [...is.untracked].filter((f) => !was.untracked.has(f));
+    const files = [...new Set([...changed, ...created])].slice(0, 100).map((f) => join(s.cwd, f));
+    if (files.length) emit(store.get(s.key), 'files.attributed', { files, via: 'shell' });
   }
 
   function ingest(events) {
@@ -491,6 +555,12 @@ export function createHub({
         throw Object.assign(new Error('tmux refused the keys'), { status: 502 });
       }
       return done({ via: 'tmux' });
+    }
+    if (route === 'queue') {
+      const out = await new Promise((resolve) => execFile('codex', ['queue', '--thread', s.session_id, '--message', text, '--resume'],
+        { cwd: s.cwd && existsSync(s.cwd) ? s.cwd : undefined, timeout: 20_000 }, (err, stdout, stderr) => resolve({ err, text: `${stdout || ''}${stderr || ''}`.trim() })));
+      if (out.err) throw Object.assign(new Error(`codex queue failed: ${out.text.split('\n').pop() || out.err.message}`), { status: 502 });
+      return done({ via: 'queue' });
     }
     if (route === 'headless') {
       if (!s.cwd || !existsSync(s.cwd)) throw Object.assign(new Error('the session directory no longer exists'), { status: 409 });
@@ -762,7 +832,12 @@ export function createHub({
       if (payload.hook_event_name === 'PermissionRequest' && events.length) {
         return holdPermission(req, res, events[0], payload.tool_input);
       }
-      ingest(events);
+      const s = ingest(events);
+      // Shell commands in a shared folder: look before the command runs (the
+      // hook's answer waits for that, a few tens of milliseconds) and after.
+      const shell = s && payload.tool_use_id && ['Bash', 'shell', 'local_shell', 'exec_command'].includes(payload.tool_name);
+      if (shell && payload.hook_event_name === 'PreToolUse') await noteShellStart(s, payload.tool_use_id).catch(() => {});
+      else if (shell && /^PostToolUse/.test(payload.hook_event_name)) noteShellEnd(s, payload.tool_use_id).catch(() => {});
       return json(res, 200, {});
     }
     if (path === '/ingest/event' && req.method === 'POST') {
@@ -844,6 +919,12 @@ export function createHub({
       return json(res, 200, { acked, archived });
     }
 
+    if (path === '/ingest/status' && req.method === 'POST') {
+      // From the status line bridge: quota windows and context fill.
+      const p = await body().catch(() => ({}));
+      noteStatus(url.searchParams.get('agent') || 'claude', p || {});
+      return json(res, 200, {});
+    }
     if (path === '/api/presence' && req.method === 'POST') {
       const { visible } = await body();
       lookedAt = visible ? now() : 0;

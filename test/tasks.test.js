@@ -86,3 +86,15 @@ test('accept by task: everything at once, or adopt one version and file the rest
   assert.equal((await rows()).runner, undefined);
   await hub.close();
 });
+
+test('a shared branch joins sessions that followed one another, not ones that ran side by side; the task says why', () => {
+  const at = (key, from, to, over = {}) => ({ key, created_ts: from, last_work_ts: to, repo: 'api', branch: 'feat/x', title: `distinct work number ${key}`, ...over });
+  let m = groupTasks([at('a', 100, 200), at('b', 300, 400)]);
+  assert.deepEqual([m.get('b').id, m.get('b').why], ['task:a', ['branch']], 'picked back up later: one task');
+  m = groupTasks([at('a', 100, 300), at('b', 200, 400)]);
+  assert.equal(m.get('b').size, 1, 'both active at once on one branch: two workers, not one task');
+  m = groupTasks([at('a', 100, 300, { title: 'the very same instruction' }), at('b', 200, 400, { title: 'the very same instruction' })]);
+  assert.deepEqual([m.get('b').size, m.get('b').why], [2, ['prompt']], 'the same instruction still joins them');
+  m = groupTasks([at('a', 100, 300), at('b', 200, 400, { task_manual: 'a' })]);
+  assert.deepEqual(m.get('a').why, ['manual']);
+});

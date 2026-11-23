@@ -97,11 +97,11 @@ A few behaviors worth knowing:
 
 - **For live sessions not in tmux, the board cannot type into them.** Such sessions can only be watched and have permissions approved; replies have to go back to the terminal.
 - **Typing into tmux is only guarded against prompts the hooks can see** (permissions, questions). If the terminal is stopped at some other menu (for example the `/model` picker), the board does not know, and the text and Enter will be eaten by that menu; this case is discovered afterwards through the "not delivered" notice.
-- **When several sessions share one folder, changes cannot be told apart**: the default there is only the files its edit tools touched; shell-made changes need the "Since it started" view, which then also contains the other sessions' changes. One worktree per session avoids this.
+- **When several sessions share one folder, two commands running at the same moment cannot be told apart**: in a shared folder the board looks at the working tree before and after each shell command and credits the difference to the session that ran it. If two sessions' commands happen to overlap, changes in that interval are credited to both.
 - **PR status has not been verified against the real GitHub**: the development environment cannot reach GitHub, so it was tested only with a simulated API and simulated `gh` output.
 - **Rebase merges where the PR was deleted afterwards** are not detected; squash merges with no PR, pushed straight to the trunk, are not detected either.
 - **Cloud**: neither vendor has a public "list sessions / read status" interface, so it can only rely on hooks pushing outward.
-- **Quota windows** cannot be seen; they are only marked when a session fails because of rate limiting.
+- **Quota windows need the status line bridge** (below), and only subscribers have that data; Codex's limits are not visible.
 - Session file formats are each vendor's internal formats and can change at any time; content that cannot be understood is skipped without an error, but cost and history import may stop working because of it.
 
 ## Dozens to hundreds of sessions
@@ -142,7 +142,7 @@ Limits: when several sessions share one folder, "Since it started" also contains
 
 Several sessions stopping at the usage limit become one card, not a row of failures. Acknowledge them all at once, or, once the limit has reset, tell the ones the board can reach to continue. The header shows what the sessions report having spent over the last five hours: that is what was used, not what is left; the board does not know your limits.
 
-Note: replying to an exited session from the board, and triage, both run headless. Users report that this draws down limits faster; I have not verified it. When limits are tight, prefer sessions running in tmux.
+Note: replying to an exited session from the board, and triage, both run headless. Users report that this draws down subscription limits faster, which I cannot check. I did run one comparison: the same one-line prompt cost $0.0445 headless and $0.1604 interactive, so nothing suggests headless costs more in tokens, but that was a single run and the headless one happened to hit the cache.
 
 ## Tasks: accept by task, not by session
 
@@ -170,6 +170,41 @@ Whenever the queue has items without a note, it starts a very short headless age
 - **Ordinary sessions cannot write notes**: the triage interface is provided only in `mcp --triage` mode, and the MCP registered by ordinary sessions stays read-only, so a session cannot write "suggest allow" on its own request.
 - **It is guarded against smuggled instructions, but do not treat the suggestion as a conclusion**: text in the queue comes from other agents and repository content, and may be deliberately written as "instructions to the reviewer". In testing it recognized and refused one such request to steal credentials, but that was a single test, not a guarantee. The red warning on risky commands is not affected by triage suggestions.
 - **It consumes your model quota**: one call per batch, which is why it is a command you start manually and not the default behavior. In testing, a batch of 6–7 items took 12–14 seconds.
+
+## Usage windows and context fill
+
+Claude Code gives "how much is used and when it resets" in exactly one place: the data it hands to a status line command. So this is an optional step:
+
+```bash
+node bin/session-board.js install claude --statusline
+```
+
+With it, the header shows the 5-hour and weekly windows with their reset times (coloured past 70%, red past 90%), each session shows how full its context is, and a card warns past 85% that a compaction is near.
+
+- Your own status line is kept: the bridge passes the data on, then runs your original command with the same input and shows its output. `uninstall claude --statusline` puts it back.
+- Only claude.ai subscribers get limit data; with an API key there is only context fill.
+- Verified with a real session: in this development environment it reported "week 27% used" with its reset time.
+
+## Codex
+
+Most of this column is still checked against the documentation and the program itself, not against a logged-in real session. Installing Codex 0.171 here confirmed:
+
+- its binary contains the hook event and field names we rely on, and `codex resume` / `codex exec resume` exist;
+- **replying needs no tmux**: Codex has an official `codex queue`, which the board uses to hand a message to an existing session;
+- **it has no "command failed" event**: so test evidence for Codex sessions is shown only when its response carries an explicit exit status, and a failure is never shown as a pass;
+- **Codex cloud tasks (optional, off by default)**: with `SESSION_BOARD_CODEX_CLOUD=1` the hub lists cloud tasks every two minutes through the official `codex cloud list --json`. That is the sanctioned route; no private API. But the shape of that JSON is undocumented and could not be checked here without a login, so it is read tolerantly by common field names; run `node bin/session-board.js codex-cloud` first to see what it makes of your real data.
+
+## Sessions on another machine
+
+```bash
+node bin/session-board.js remote that-machines-ssh-name
+```
+
+It prints a hooks snippet (HTTP only, so that machine does not need session-board) and opens an SSH reverse tunnel: the agents there post to their own `localhost`, and the tunnel carries it to your hub. No relay service, no port exposed.
+
+- Works: seeing those sessions, approving and answering their requests.
+- Does not: replying, diffs, PR status, which need the files locally.
+- Not tested with two real machines, only the generated configuration.
 
 ## Push to your phone when you are away
 
