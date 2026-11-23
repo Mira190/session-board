@@ -71,7 +71,7 @@ Text the hub itself produces (phone pushes and the triage agent's notes) follows
 | Agent reads the board through MCP | ✅ Verified with real sessions | ⚠️ Untested | ⚠️ Must be able to reach your hub |
 | Reply from the board (sessions in tmux) | ✅ Verified with real sessions | ⚠️ Untested | ❌ |
 | Reply from the board (exited sessions, continued in the background) | ✅ Verified with real sessions | ⚠️ Untested | ❌ |
-| See changes, by default only files this session changed | ✅ | ⚠️ Whole workspace only | ❌ |
+| See changes (shell-made ones too), mark files reviewed, test evidence | ✅ test evidence confirmed with a real session | ⚠️ Untested | ❌ |
 | Cost and tokens | ✅ Uses the numbers Claude Code records itself | ⚠️ Tokens only, format untested | ❌ |
 | Lost detection, history import | ✅ | ⚠️ Untested | ❌ |
 | PR status, auto-accept after merge | ⚠️ Tested against a simulated GitHub, not the real one | ⚠️ Same as left | ⚠️ The reporter must provide the repository and branch |
@@ -121,6 +121,28 @@ A person can closely watch only a handful of sessions, so once the scale goes up
 Three things were done for performance: the live updates sent to the browser now carry only the sessions that changed; the page redraws only the cards whose content changed; and the PRs of one repository are queried together, with git subprocesses limited in concurrency.
 
 Measured on this development machine with simulated data: 200 sessions concurrently and 10,000 events, the hub handles about 4,000 per second, the data sent to a page dropped from 8 MB to 1.4 MB, and restart replay takes 30 ms; with 150 sessions updating continuously, the slowest page frame was 17 ms. **It has not been tested with hundreds of real agents**; in real use, the hook overhead per agent and GitHub rate limits are still unverified.
+
+## Review: making the looking faster
+
+The top pain in the research was that human review is the bottleneck. The review area of the workbench does these things:
+
+![Review panel](docs/review.png)
+
+- **Evidence first**: whether it ran the tests and whether they passed is shown outright (`✓ tests · 2m ago`). If none ran it says so; if it edited code after a green run it says "Edited again after the last test run". Cards carry one line of this too. It comes from the commands' actual exit status, not from what the agent says.
+- **Shell-made changes are visible**: when a session first appears, the board takes a snapshot of the working tree (one git object; your files, index and branches are untouched). The "Since it started" view shows everything that changed after that, including what scripts and `sed` did. The other two views are "Its own edits" and "Whole workspace".
+- **Mark files reviewed**: tick each file as you go, with progress at the top. If the file changes after you ticked it, the tick is removed and it says "changed since you reviewed it".
+- **Comment on a file**: "Comment" starts a reply with the file name filled in.
+- **A brief when you come back**: opening a session shows what was originally asked and what happened since you last looked (tool calls, failed commands, requests to you, context compactions).
+- **Same-file warning**: two live sessions editing the same file in one repository are flagged on the card and in the workbench. Between different branches a merge is also dry-run and the conflicting files are listed (nothing is written).
+- **Rename**: give a session a name you recognise; it is not overwritten afterwards.
+
+Limits: when several sessions share one folder, "Since it started" also contains the others' changes, so "Its own edits" is the default there. The snapshot does not include files that were untracked at the time.
+
+## When the usage limit hits
+
+Several sessions stopping at the usage limit become one card, not a row of failures. Acknowledge them all at once, or, once the limit has reset, tell the ones the board can reach to continue. The header shows what the sessions report having spent over the last five hours: that is what was used, not what is left; the board does not know your limits.
+
+Note: replying to an exited session from the board, and triage, both run headless. Users report that this draws down limits faster; I have not verified it. When limits are tight, prefer sessions running in tmux.
 
 ## Tasks: accept by task, not by session
 

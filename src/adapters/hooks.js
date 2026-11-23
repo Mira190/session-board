@@ -30,7 +30,11 @@ export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null
       return ev('tool.started', { tool: p.tool_name, input: p.tool_input });
     case 'PostToolUse':
     case 'PostToolUseFailure':
-      return ev('tool.finished', { tool: p.tool_name });
+      // A command that exits non-zero arrives as PostToolUseFailure (verified
+      // on Claude Code 2.1.330): that is how we know a test run failed.
+      return ev('tool.finished', { tool: p.tool_name, input: p.tool_input, ok: p.hook_event_name === 'PostToolUse' && !p.tool_response?.interrupted });
+    case 'PreCompact':
+      return ev('context.compacted', { trigger: p.trigger });
     case 'PermissionRequest':
       return ev('permission.requested', { tool: p.tool_name, input: p.tool_input });
     case 'PermissionDenied':
@@ -77,9 +81,9 @@ export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null
 export const CLAUDE_EVENTS = [
   'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest',
   'PermissionDenied', 'Notification', 'Stop', 'StopFailure', 'SubagentStart', 'SubagentStop',
-  'SessionEnd',
+  'SessionEnd', 'PostToolUseFailure', 'PreCompact',
 ];
 export const CODEX_EVENTS = [
   'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest',
-  'Stop', 'Interrupt', 'SubagentStart', 'SubagentStop', 'SessionEnd',
+  'Stop', 'Interrupt', 'SubagentStart', 'SubagentStop', 'SessionEnd', 'PreCompact',
 ];

@@ -348,12 +348,21 @@ function taskCard(entry) {
     })));
 }
 
+// On a finished session's card: was the work checked, in one glance.
+function checkLine(s) {
+  const test = (s.checks || []).filter((c) => c.kind === 'test').at(-1);
+  if (!test) return el('div', { className: 'peek', textContent: t('No test run seen') });
+  if (!test.ok) return el('div', { className: 'warn', textContent: t('Last test run failed') });
+  if (s.last_edit_ts > test.ts) return el('div', { className: 'warn', textContent: t('Edited after the last test run') });
+  return el('div', { className: 'pr ok', textContent: t('Tests passed after the last edit') });
+}
+
 const cardSig = (s) => JSON.stringify([
   s.state, s.since, s.title, s.host, s.repo, s.cwd, s.branch, s.runtime, s.agent, s.subagents, s.requests.length,
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
-  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage,
+  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts,
 ]);
 
 function card(s) {
@@ -376,6 +385,8 @@ function card(s) {
     s.waiting?.risky && el('div', { className: 'warn', textContent: t('Risky command, confirm on its own') }),
     d.detail && el('div', { className: 'peek', textContent: d.detail.split('\n')[0] }),
     triageLine(s),
+    s.overlap && el('div', { className: 'warn', textContent: t('Same file as {who}: {file}', { who: s.overlap.with[0], file: s.overlap.file }) }),
+    s.state === 'review' && checkLine(s),
     s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
     s.quiet && el('div', { className: 'warn', textContent: t('No activity for over 10 minutes') }),
   );
@@ -404,6 +415,26 @@ function batches(sessions) {
   }
   const alike = [...kinds.values()].filter((g) => g.length > 2).map((g) => Object.assign(g, { stem: g[0].waiting.stem }));
   return [...exact, ...alike].sort((a, b) => b.length - a.length);
+}
+
+// Sessions that stopped at the usage limit are one event, not N failures.
+const limited = (sessions) => sessions.filter((s) => s.state === 'failed' && s.rate_limited);
+function limitCard(group) {
+  const can = group.filter((s) => s.reply);
+  const each = (list, fn) => Promise.allSettled(list.map(fn));
+  return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
+    el('div', { className: 'status' }, el('span', { className: 'what', textContent: t('{n} sessions stopped at the usage limit', { n: group.length }) })),
+    el('div', { className: 'meta', textContent: t('Nothing is wrong with the work. When the limit resets they can pick up where they stopped.') }),
+    el('div', { className: 'actions' },
+      can.length > 0 && el('button', { className: 'primary', textContent: t('Tell {n} to continue', { n: can.length }), title: t('Sends “continue” to the ones the board can reach. Use it once the limit has reset.'),
+        onclick: async () => {
+          const out = await each(can, (s) => call(`/api/sessions/${encodeURIComponent(s.key)}/message`, { text: t('Continue where you left off.'), command_id: crypto.randomUUID() }));
+          toast(t('Sent to {n} session(s).', { n: out.filter((r) => r.status === 'fulfilled').length }));
+        } }),
+      el('button', { textContent: t('Acknowledge all ({n})', { n: group.length }), onclick: async () => {
+        await each(group, (s) => call(`/api/sessions/${encodeURIComponent(s.key)}/ack`, {}));
+        toast(t('Acknowledged {n}.', { n: group.length }), () => each(group, (s) => call(`/api/sessions/${encodeURIComponent(s.key)}/unack`, {})));
+      } })));
 }
 
 async function decideBatch(group, decision, remember = false) {
@@ -492,6 +523,10 @@ function renderLists(groups) {
       items.unshift(...batches(groups.attention).map((g) => ({
         key: `batch:${g[0].waiting.tool}:${g.stem ? `kind:${g.stem}` : g[0].waiting.detail}`, sig: g.map((s) => s.waiting.id).join(','), make: () => batchCard(g),
       })));
+    }
+    if (name === 'attention' && !fold && limited(groups.attention).length > 1) {
+      const g = limited(groups.attention);
+      items.unshift({ key: 'limit', sig: g.map((s) => `${s.key}${s.reply}`).join(','), make: () => limitCard(g) });
     }
     if (!items.length && !fold) {
       items.push({ key: 'empty', sig: `${name}:${filter}`, make: () => el('div', {
@@ -709,6 +744,85 @@ function renderOffice() {
 
 // -------------------------------------------------------------- workbench --
 
+// ---- review: evidence first, then the changes file by file ----
+const CHECK_NAME = { test: 'tests', types: 'type check', lint: 'lint', build: 'build' };
+function evidence(s) {
+  const tests = s.checks?.filter((c) => c.kind === 'test') || [];
+  const lastTest = tests.at(-1);
+  return el('div', { className: 'evidence' },
+    (s.checks || []).map((c) => el('span', { className: `check ${c.ok ? 'ok' : 'bad'}`, title: c.cmd },
+      `${c.ok ? '✓' : '✗'} ${t(CHECK_NAME[c.kind])} · ${t('{age} ago', { age: age(c.ts) })}`)),
+    !lastTest && el('span', { className: 'check none', textContent: t('No test run seen in this session') }),
+    lastTest && s.last_edit_ts > lastTest.ts && el('span', { className: 'check bad', textContent: t('Edited again after the last test run') }));
+}
+
+function briefBlock(s, b) {
+  if (!b) return null;
+  const parts = [
+    b.turns && t('{n} new instruction(s) from you', { n: b.turns }),
+    b.tools && t('{n} tool calls', { n: b.tools }),
+    b.failed_commands && t('{n} failed command(s)', { n: b.failed_commands }),
+    b.requests && t('{n} request(s) to you ({a} allowed, {d} denied, {r} by rule)', { n: b.requests, a: b.allowed, d: b.denied, r: b.by_rule }),
+    b.compactions && t('context compacted {n} time(s): it may have forgotten early details', { n: b.compactions }),
+  ].filter(Boolean);
+  const asked = b.first_prompt && b.first_prompt !== s.last_prompt ? b.first_prompt : null;
+  if (!parts.length && !asked) return null;
+  return el('div', { className: 'brief' },
+    asked && el('div', {}, el('b', { textContent: t('Originally asked: ') }), el('span', { className: 'prose', textContent: asked })),
+    parts.length > 0 && el('div', {}, el('b', { textContent: b.since ? t('Since you last looked: ') : t('So far: ') }), parts.join(' · ')));
+}
+
+function conflictBlock(s, conflicts) {
+  return el('div', {},
+    s.overlap && el('div', { className: 'warn' }, t('Also being edited by {n} other live session(s) ({who}): {file}{more}', {
+      n: s.overlap.sessions, who: s.overlap.with.join(', '), file: s.overlap.file, more: s.overlap.files > 1 ? t(' and {n} more file(s)', { n: s.overlap.files - 1 }) : '' })),
+    (conflicts || []).map((c) => el('div', { className: 'warn' },
+      t('Would conflict when merged with branch {branch} ({who}): {files}', { branch: c.branch, who: c.with.join(', '), files: c.files.join(', ') || '?' }))));
+}
+
+function reviewPanel(s, diff, scope) {
+  if (!diff?.available) return null;
+  const mark = (f, on) => call(`/api/sessions/${encodeURIComponent(s.key)}/viewed`, { path: f.path, hash: on ? f.hash : null })
+    .then(() => { reviewTick += 1; render(); }).catch((e) => say(s.key, e.message));
+  const files = diff.files || [];
+  const done = files.filter((f) => f.viewed).length;
+  // Split the unified diff into one block per file.
+  const blocks = new Map();
+  for (const part of (diff.diff || '').split(/^(?=diff --git )/m)) {
+    const m = /^diff --git a\/.* b\/(.*)$/m.exec(part);
+    if (m) blocks.set(m[1], part);
+  }
+  const SCOPES = [
+    ['since', t('Since it started'), t('Everything that changed in the working tree since this session began, shell commands included. Other sessions in the same folder show up too.')],
+    ['session', t('Its own edits'), t('Only files this session’s edit tools touched. Misses what it changed through shell commands.')],
+    ['all', t('Whole workspace'), t('Everything uncommitted, whoever changed it.')],
+  ];
+  return el('div', { className: 'review' },
+    el('h3', { textContent: t('Review') }),
+    evidence(s),
+    el('div', { className: 'actions', style: 'margin-top:8px' },
+      el('div', { className: 'seg' }, SCOPES.map(([id, label, tip]) => el('button', {
+        textContent: label, title: tip, ariaPressed: String(diff.scope === id),
+        onclick: () => { scopes.set(s.key, id); render(); },
+      }))),
+      scope === 'since' && diff.scope !== 'since' && el('span', { className: 'note', textContent: t('No snapshot from when it started, showing the whole workspace.') }),
+      files.length > 0 && el('span', { className: 'note', textContent: t('{done} of {n} files reviewed', { done, n: files.length }) })),
+    !files.length && el('p', { className: 'note', textContent: t('No changes.') }),
+    files.map((f) => el('details', { className: 'file', open: !f.viewed && files.length <= 12 },
+      el('summary', {},
+        el('input', { type: 'checkbox', checked: f.viewed, title: t('Mark as reviewed'), onclick: (e) => { e.stopPropagation(); mark(f, e.target.checked); } }),
+        el('code', { textContent: f.path }),
+        f.changed_since_viewed && el('span', { className: 'check bad', textContent: t('changed since you reviewed it') }),
+        s.reply && el('button', { className: 'mini', textContent: t('Comment'), title: t('Start a reply about this file'), onclick: (e) => {
+          e.preventDefault();
+          drafts.set(s.key, `${drafts.get(s.key) ? drafts.get(s.key) + '\n' : ''}${f.path}: `);
+          render();
+          setTimeout(() => $('#reply')?.focus(), 30);
+        } })),
+      blocks.has(f.path) ? diffView(blocks.get(f.path)) : el('p', { className: 'note', textContent: t('(binary or too large to show)') }))),
+    diff.truncated && el('p', { className: 'note', textContent: t('The diff was too long and is cut off.') }));
+}
+
 function diffView(diff) {
   const cls = (l) =>
     l.startsWith('diff --git') ? 'file' : l.startsWith('@@') ? 'hunk'
@@ -897,7 +1011,7 @@ function renderBench() {
   const active = document.activeElement;
   const typing = active?.id && active.matches('input[type="text"], textarea')
     ? { id: active.id, start: active.selectionStart, end: active.selectionEnd } : null;
-  const scope = scopes.get(s.key) || (s.files_count ? 'session' : 'all');
+  const scope = scopeOf(s);
 
   const diff = more.diff;
   const changed = diff?.available && (diff.status || diff.diff);
@@ -906,7 +1020,10 @@ function renderBench() {
       el('span', { className: `badge ${s.agent}`, textContent: agentName(s) }),
       el('span', { className: 'where', textContent: [where(s), t('turn {n}', { n: s.turns }), usageLine(s)].filter(Boolean).join(' · ') }),
       s.runtime === 'cloud' && el('span', { textContent: t('☁ Cloud') })),
-    el('h2', { textContent: s.title || s.session_id }),
+    el('h2', {}, s.title || s.session_id, el('button', { className: 'mini', textContent: t('Rename'), onclick: () => {
+      const title = prompt(t('Name this session'), s.title || '');
+      if (title?.trim()) call(`/api/sessions/${encodeURIComponent(s.key)}/rename`, { title }).catch((e) => say(s.key, e.message));
+    } })),
     s.pr && el('p', { className: `pr ${prTone(s.pr)}` },
       el('a', { href: s.pr.url, target: '_blank', rel: 'noreferrer', textContent: prLine(s.pr) }),
       s.pr.title ? `　${s.pr.title}` : '', s.pr.base ? ` → ${s.pr.base}` : ''),
@@ -919,15 +1036,9 @@ function renderBench() {
     s.last_message && s.state !== 'review' && el('h3', { textContent: t('What it said last') }),
     s.last_message && s.state !== 'review' && el('div', { className: 'prose', textContent: s.last_message }),
 
-    diff?.available && el('h3', {}, diff.scope === 'session'
-      ? t('Files this session changed: {n} (relative to the last commit; changes made through shell commands are not included)', { n: diff.attributed })
-      : t('All changes in the workspace (relative to the last commit, not only this session’s)')),
-    diff?.available && s.files_count > 0 && el('div', { className: 'actions', style: 'margin-top:0' },
-      el('button', { textContent: scope === 'session' ? t('See the whole workspace') : t('Only what this session changed'), onclick: () => { scopes.set(s.key, scope === 'session' ? 'all' : 'session'); render(); } })),
-    diff?.available && !changed && el('p', { className: 'note', textContent: t('No uncommitted changes.') }),
-    changed && el('div', { className: 'box code', textContent: [diff.stat, diff.status].filter(Boolean).join('\n\n') }),
-    changed && diff.diff && el('details', { open: s.state === 'review' },
-      el('summary', { textContent: diff.truncated ? t('Full diff (too long, truncated)') : t('Full diff') }), diffView(diff.diff)),
+    briefBlock(s, detail.brief),
+    conflictBlock(s, detail.conflicts),
+    reviewPanel(s, diff, scope),
 
     el('h3', { textContent: t('Reply') }),
     s.outgoing && el('div', { className: s.undelivered ? 'warn' : 'note' },
@@ -961,21 +1072,29 @@ function renderBench() {
 
 // Diff and event history are fetched when a session is opened and again
 // whenever it changes state.
+// The default cut of the diff: everything since the session began, unless it
+// shares its directory with another live session, where that would mix them.
+const sharesDir = (s) => snap.sessions.some((o) => o.key !== s.key && o.cwd === s.cwd && o.host === s.host && o.state !== 'ended');
+const scopeOf = (s) => scopes.get(s.key) || (sharesDir(s) && s.files_count ? 'session' : 'since');
+const openedAt = new Map(); // key -> the seen mark when the session was opened, for "since you last looked"
+
 async function loadExtra(s) {
-  const scope = scopes.get(s.key) || (s.files_count ? 'session' : 'all');
-  const sig = `${s.state}:${s.last_event_ts}:${scope}`;
+  const scope = scopeOf(s);
+  const sig = `${s.state}:${s.last_event_ts}:${scope}:${reviewTick}`;
   const have = extra.get(s.key);
   if (have?.sig === sig) return;
   extra.set(s.key, { ...have, sig });
+  if (!openedAt.has(s.key)) openedAt.set(s.key, s.seen_ts || 0);
   const key = encodeURIComponent(s.key);
   const [diff, events, full] = await Promise.all([
     call(`/api/sessions/${key}/diff?scope=${scope}`).catch(() => null),
     call(`/api/sessions/${key}/events`).catch(() => null),
-    call(`/api/sessions/${key}/detail`).catch(() => null),
+    call(`/api/sessions/${key}/detail?since=${openedAt.get(s.key)}`).catch(() => null),
   ]);
   extra.set(s.key, { sig, diff, events, full });
   if (selected === s.key) render();
 }
+let reviewTick = 0; // bumped when a file is marked reviewed, to refetch the diff
 
 // Looking at a session marks it seen (stored by the hub, so every device
 // agrees), but only after a moment and only while the page is in view.
@@ -1028,7 +1147,7 @@ function paint() {
   const s = byKey(selected);
   // The workbench is rebuilt only when what it shows has changed.
   const more = extra.get(selected) || {};
-  const benchSig = JSON.stringify([s, s && siblings(s).map((m) => [m.key, m.state, m.since, m.files_count, m.pr]), more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
+  const benchSig = JSON.stringify([s, reviewTick, more.diff?.files, more.full?.brief, more.full?.conflicts, s && siblings(s).map((m) => [m.key, m.state, m.since, m.files_count, m.pr]), more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
   if (benchSig !== paint.bench) { paint.bench = benchSig; renderBench(); }
   if (s) loadExtra(s);
   noteReading();
@@ -1039,6 +1158,8 @@ function paint() {
     count.attention ? el('b', { textContent: t('{n} waiting for you', { n: count.attention }) }) : t('Nothing is waiting for you'),
     t(', {r} to review, {w} working', { r: count.review, w: count.working }),
     filter ? t(' (filtered: showing {v} / {t})', { v: visible().length, t: snap.sessions.length }) : '',
+    snap.burn ? el('span', { className: 'burn', title: t('What the agents report having spent, added up. It is what was used, not what is left: the board does not know your limits.'),
+      textContent: t(' · ${usd} in the last {h}h across {n} session(s)', { usd: snap.burn.usd.toFixed(2), h: snap.burn.hours, n: snap.burn.sessions }) }) : '',
   );
   $('#rules').textContent = t('Auto rules {n}', { n: snap.rules || 0 });
   document.title = `${count.attention ? `(${count.attention}) ` : ''}Session Board`;
@@ -1104,7 +1225,7 @@ function connect() {
       for (const s of msg.changed) all.set(s.key, s);
       for (const key of msg.removed) all.delete(key);
     }
-    snap = { now: msg.now, sessions: [...all.values()], queue: msg.queue, rules: msg.rules };
+    snap = { now: msg.now, sessions: [...all.values()], queue: msg.queue, rules: msg.rules, burn: msg.burn };
     skew = snap.now - Date.now();
     alertNew(msg.sessions ? snap.sessions : msg.changed);
     render();

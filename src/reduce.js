@@ -47,6 +47,13 @@ function blank(ev) {
     repo_id: null, // what identifies the repository across worktrees (remote, or the shared git dir)
     task_manual: null, // another session's key (joined by hand) or 'solo' (pulled out by hand)
     triage: null, // { for, summary, suggestion, ts } a triage agent's note on what is currently open
+    first_prompt: null, // what was originally asked, for coming back to a session cold
+    title_manual: false, // the human named it; do not rename it for them
+    compactions: 0, // times the agent's context was compacted
+    baseline: null, // commit-ish of the working tree when the session was first seen
+    checks: [], // recent test / lint / type / build runs: { kind, cmd, ok, ts }
+    last_edit_ts: 0, // last time an edit tool ran, to tell "tests passed" from "tests passed, then more edits"
+    viewed: {}, // file -> content hash the human marked as reviewed
     pr: null, // { number, url, title, state: open|merged|closed, draft, checks, review, base, head_sha }
     github: null, // "owner/repo", when a sender tells us (cloud sessions)
     tmux: null, // { socket, pane } when the agent runs inside tmux
@@ -153,6 +160,15 @@ const RISKY = [
 ];
 export const isRisky = (detail) => typeof detail === 'string' && RISKY.some((re) => re.test(detail));
 
+// Commands that are evidence about the work: did it run the tests, did they pass.
+const CHECKS = [
+  ['test', /\b(pytest|jest|vitest|mocha|rspec|phpunit|playwright|cypress|go test|cargo test|dotnet test|ctest|(npm|pnpm|yarn|bun)( run)? test\w*|make (test|check)|tox|unittest)\b/],
+  ['types', /\b(tsc|mypy|pyright|typecheck|type-check|cargo check)\b/],
+  ['lint', /\b(eslint|ruff|flake8|pylint|rubocop|clippy|biome|golangci-lint|(npm|pnpm|yarn|bun)( run)? lint\w*|prettier --check)\b/],
+  ['build', /\b((npm|pnpm|yarn|bun)( run)? build\w*|cargo build|go build|make( all)?$|gradle build|mvn (package|verify)|vite build|next build)\b/],
+];
+export const checkKind = (command) => (typeof command === 'string' ? (CHECKS.find(([, re]) => re.test(command)) || [null])[0] : null);
+
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const MAX_FILES = 300;
 
@@ -173,7 +189,7 @@ export function summarizeToolInput(tool, input) {
 }
 
 export function reduce(prev, ev) {
-  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), auto_allow: [...prev.auto_allow], files: [...prev.files] } : blank(ev);
+  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), auto_allow: [...prev.auto_allow], files: [...prev.files], checks: [...prev.checks], viewed: { ...prev.viewed } } : blank(ev);
   const d = ev.data || {};
   const ts = ev.ts;
   s.last_event_ts = ts;
@@ -217,6 +233,7 @@ export function reduce(prev, ev) {
       s.turns += 1;
       s.last_prompt = clip(d.prompt, 600);
       if (!s.title && d.prompt) s.title = clip(String(d.prompt).split('\n')[0], 120);
+      if (!s.first_prompt && d.prompt) s.first_prompt = clip(d.prompt, 600);
       s.background = 0;
       s.settled = null;
       s.requests = []; // the human is at the keyboard: nothing is pending
@@ -235,6 +252,7 @@ export function reduce(prev, ev) {
       if (EDIT_TOOLS.has(d.tool)) {
         const file = d.input?.file_path || d.input?.notebook_path;
         if (typeof file === 'string' && !s.files.includes(file) && s.files.length < MAX_FILES) s.files.push(file);
+        s.last_edit_ts = ts;
       }
       working();
       break;
@@ -243,7 +261,17 @@ export function reduce(prev, ev) {
       // Only the tool a request was about resolves it; parallel tool calls
       // (e.g. from subagents) leave other requests open.
       resolve(s, { tool: d.tool });
+      // Keep the last few runs of anything that checks the work.
+      if (d.ok !== undefined) {
+        const cmd = typeof d.input?.command === 'string' ? d.input.command : Array.isArray(d.input?.command) ? d.input.command.join(' ') : null;
+        const kind = checkKind(cmd);
+        if (kind) s.checks = [...s.checks.filter((c) => c.kind !== kind || c.cmd !== clip(cmd, 160)), { kind, cmd: clip(cmd, 160), ok: !!d.ok, ts }].slice(-6);
+      }
       working();
+      break;
+
+    case 'context.compacted':
+      s.compactions += 1;
       break;
 
     case 'permission.requested':
@@ -402,9 +430,23 @@ export function reduce(prev, ev) {
       if (d.repo !== undefined) s.repo = d.repo;
       if (d.branch !== undefined) s.branch = d.branch;
       if (d.head && !s.start_head) s.start_head = d.head;
+      if (d.baseline && !s.baseline) s.baseline = d.baseline;
       if (d.github) s.github = d.github;
       if (d.repo_id) s.repo_id = d.repo_id;
-      if (d.title) s.title = clip(d.title, 120);
+      if (d.title && !s.title_manual) s.title = clip(d.title, 120);
+      break;
+
+    case 'human.renamed':
+      if (typeof d.title === 'string' && d.title.trim()) {
+        s.title = clip(d.title.trim(), 120);
+        s.title_manual = true;
+      }
+      break;
+
+    case 'human.viewed':
+      // hash null = "not reviewed after all"
+      if (d.hash) s.viewed[d.path] = d.hash;
+      else delete s.viewed[d.path];
       break;
 
     case 'pr.updated': {
@@ -432,7 +474,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.exited = false;
     s.imported = false;

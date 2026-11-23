@@ -281,3 +281,21 @@ dialog h3 { margin: 0 0 6px; font-size: 16px; }
 #settings { padding: 2px 8px; }
 .setting { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
 .setting select { font: inherit; padding: 4px 6px; }
+
+/* ---- review workbench, re-entry brief, evidence ---- */
+.evidence { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.check { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; white-space: nowrap; }
+.check.ok { color: var(--ok); border-color: var(--ok); }
+.check.bad { color: var(--urgent); border-color: var(--urgent); }
+.check.none { color: var(--muted); }
+.brief { margin-top: 10px; padding: 8px 12px; border-left: 3px solid var(--line); font-size: 13px; color: var(--ink); display: grid; gap: 4px; max-width: 90ch; }
+.brief b { font-weight: 600; color: var(--muted); }
+.review .seg button { font-size: 12px; padding: 2px 10px; }
+details.file { border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; background: var(--bg); }
+details.file > summary { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 10px; color: var(--ink); font-size: 13px; list-style: none; }
+details.file > summary::-webkit-details-marker { display: none; }
+details.file > summary code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; flex: 1 1 200px; }
+details.file pre.diff { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 8px 8px; }
+details.file > .note { padding: 0 10px 8px; margin: 0; }
+button.mini { font-size: 11px; padding: 0 8px; margin-left: 8px; font-weight: 400; vertical-align: middle; }
+.burn { color: var(--muted); }

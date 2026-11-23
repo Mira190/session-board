@@ -33,6 +33,16 @@ import { serverLang } from './lang.js';
 
 const BURST = 5; // more than this many at once becomes one summary
 
+// "22:00-08:00" -> is `date` inside it? Handles ranges that cross midnight.
+export function inQuietHours(spec, date = new Date()) {
+  const m = /^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/.exec(String(spec || '').trim());
+  if (!m) return false;
+  const now = date.getHours() * 60 + date.getMinutes();
+  const from = Number(m[1]) * 60 + Number(m[2]);
+  const to = Number(m[3]) * 60 + Number(m[4]);
+  return from <= to ? now >= from && now < to : now >= from || now < to;
+}
+
 export const attentionKind = (s) => {
   if (s.archived || s.snoozed_until) return null;
   if (s.state === 'needs_input') return s.waiting?.kind || 'question';
@@ -40,7 +50,7 @@ export const attentionKind = (s) => {
   return null;
 };
 
-export function createNotifier({ env = process.env, fetcher = fetch, boardUrl = '', isPresent = () => false, delayMs = 4000 } = {}) {
+export function createNotifier({ env = process.env, fetcher = fetch, boardUrl = '', isPresent = () => false, delayMs = 4000, clock = () => new Date() } = {}) {
   const ntfy = env.SESSION_BOARD_NTFY || null;
   const webhook = env.SESSION_BOARD_WEBHOOK || null;
   if (!ntfy && !webhook) return { enabled: false, consider() {} };
@@ -70,6 +80,7 @@ export function createNotifier({ env = process.env, fetcher = fetch, boardUrl = 
     const items = batch;
     batch = [];
     if (!items.length || isPresent()) return; // they came back and can see it
+    if (inQuietHours(env.SESSION_BOARD_QUIET, clock())) return; // nothing is pushed during quiet hours; it is all on the board
     if (items.length > BURST) {
       const high = items.some((i) => i.priority === 'high');
       return post(WAITING[lang](items.length), items.slice(0, 8).map((i) => `${i.label}${sep}${i.title}`).join('\n'), high ? 'high' : 'default', boardUrl || undefined);

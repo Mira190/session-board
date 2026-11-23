@@ -35,6 +35,7 @@ export const SETTLE_MS = 2 * 60 * 1000;
 // before it is handed back to the agent's own prompt.
 export const HOLD_MS = 9 * 60 * 1000;
 const LOCAL_NAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+const SHELLS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh', 'nu', 'pwsh', 'login']);
 
 // Answering a question tool = allowing it with the answers filled in.
 const answerBody = (input, answers) => ({
@@ -154,6 +155,10 @@ export function createHub({
     undelivered: !!s.outgoing && now() - s.outgoing.ts > UNDELIVERED_MS,
     // Which task this belongs to, when it shares one with other sessions.
     task: tasks.get(s.key)?.size > 1 ? { id: tasks.get(s.key).id, size: tasks.get(s.key).size } : null,
+    overlap: overlaps.has(s.key) ? {
+      files: overlaps.get(s.key).count, file: overlaps.get(s.key).file.split('/').pop(),
+      with: [...overlaps.get(s.key).others.values()].slice(0, 2), sessions: overlaps.get(s.key).others.size,
+    } : null,
     // A triage note counts only for the item it was written about.
     triage: s.triage && s.triage.for === itemId(s) ? s.triage : null,
   });
@@ -164,11 +169,41 @@ export function createHub({
   // the one session that is open. test/more.test.js holds this to a budget.
   const short = (t) => (typeof t === 'string' && t.length > ROW_TEXT ? `${t.slice(0, ROW_TEXT - 1)}…` : t);
   const view = (s) => {
-    const { files, transcript, auto_allow, acked, start_head, pr_alert, repo_id, ...row } = full(s);
+    const { files, transcript, auto_allow, acked, start_head, pr_alert, repo_id, viewed, baseline, first_prompt, ...row } = full(s);
     return { ...row, last_prompt: short(row.last_prompt), last_message: short(row.last_message), files_count: files.length };
   };
   // Task membership depends on every session, so it is recomputed as a whole
   // and the sessions whose task changed are re-sent.
+  // Two live sessions editing the same file in the same repository are heading
+  // for a conflict; say so while it is still cheap to sort out.
+  let overlaps = new Map(); // key -> { count, file, with: [titles] }
+  function refreshOverlaps(live) {
+    const byFile = new Map();
+    for (const s of live) {
+      if (s.state === 'ended' || !s.files.length) continue;
+      const repo = s.repo_id || s.repo || s.cwd;
+      for (const f of s.files) (byFile.get(`${repo}\n${f}`) || byFile.set(`${repo}\n${f}`, []).get(`${repo}\n${f}`)).push(s);
+    }
+    const next = new Map();
+    for (const [k, group] of byFile) {
+      if (group.length < 2) continue;
+      const file = k.split('\n')[1];
+      for (const s of group) {
+        const o = next.get(s.key) || next.set(s.key, { count: 0, file, others: new Map() }).get(s.key);
+        o.count += 1;
+        for (const other of group) if (other.key !== s.key) o.others.set(other.key, other.title || other.session_id);
+      }
+    }
+    const changed = [];
+    for (const key of new Set([...next.keys(), ...overlaps.keys()])) {
+      const a = next.get(key);
+      const b = overlaps.get(key);
+      if ((a?.count || 0) !== (b?.count || 0) || (a?.others.size || 0) !== (b?.others.size || 0)) changed.push(key);
+    }
+    overlaps = next;
+    return changed;
+  }
+
   let tasks = new Map();
   function refreshTasks() {
     const next = groupTasks(store.list().filter((s) => !s.archived));
@@ -178,7 +213,30 @@ export function createHub({
       if ((was?.size > 1 ? was.id : null) !== (t.size > 1 ? t.id : null) || (was?.size || 1) !== t.size) changed.push(key);
     }
     tasks = next;
-    return changed;
+    return [...changed, ...refreshOverlaps(store.list().filter((s) => !s.archived))];
+  }
+  // Spend over the last five hours, from the agents' own running totals. This
+  // is what was used, not what is left: the hub does not know anyone's limits.
+  const BURN_MS = 5 * 60 * 60 * 1000;
+  let burnCache = { at: 0, value: null };
+  function burn() {
+    if (now() - burnCache.at < 30_000) return burnCache.value;
+    const first = new Map();
+    const last = new Map();
+    for (const row of store.db.prepare("SELECT key, body FROM events WHERE type = 'usage.updated' AND ts > ? ORDER BY id").iterate(now() - BURN_MS)) {
+      const cost = JSON.parse(row.body).data?.cost_usd;
+      if (cost == null) continue;
+      if (!first.has(row.key)) first.set(row.key, cost);
+      last.set(row.key, cost);
+    }
+    let usd = 0;
+    for (const [key, cost] of last) {
+      // A session that began inside the window spent its whole total in it.
+      const began = store.get(key)?.created_ts > now() - BURN_MS;
+      usd += began ? cost : Math.max(0, cost - first.get(key));
+    }
+    burnCache = { at: now(), value: last.size ? { usd: Math.round(usd * 100) / 100, sessions: last.size, hours: 5 } : null };
+    return burnCache.value;
   }
   let rules = store.rules(); // global: [{ tool, detail, mode }]
   // Someone is "present" while a board page has reported itself visible lately.
@@ -189,7 +247,7 @@ export function createHub({
   const snapshot = () => {
     refreshTasks();
     const sessions = store.list().filter((s) => !s.archived).map(view);
-    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length };
+    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length, burn: burn() };
   };
 
   // Live updates are deltas: a client gets the full picture once, then only
@@ -225,7 +283,7 @@ export function createHub({
       dirty.clear();
       if (!clients.size || (!changed.length && !removed.length)) return;
       const live = store.list().filter((x) => !x.archived).map(view);
-      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length })}\n\n`;
+      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length, burn: burn() })}\n\n`;
       for (const res of clients) res.write(msg);
     }, TICK_MS);
   };
@@ -259,12 +317,16 @@ export function createHub({
       s.repo_id ? null : git(s.cwd, ['remote', 'get-url', 'origin']),
       s.repo_id ? null : git(s.cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
     ]);
+    // A snapshot of the working tree as it was when we first saw the session,
+    // uncommitted changes included. `git stash create` writes a commit object
+    // and nothing else: no ref, no change to the index or the files.
+    const baseline = s.baseline || !head ? null : (await git(s.cwd, ['stash', 'create', 'session-board baseline'])) || head;
     const repo = top ? basename(top) : basename(s.cwd);
     // Worktrees of one repository have different folders but share a remote
     // (or at least a git directory): that is what makes them the same repo.
     const repoId = s.repo_id ? null : (remote ? remote.replace(/\/\/[^@/]*@/, '//') : common);
     if (repo !== s.repo || branch !== s.branch || (head && !s.start_head) || repoId) {
-      emit(s, 'meta.updated', { repo, branch, ...(head ? { head } : {}), ...(repoId ? { repo_id: repoId } : {}) });
+      emit(s, 'meta.updated', { repo, branch, ...(head ? { head } : {}), ...(repoId ? { repo_id: repoId } : {}), ...(baseline ? { baseline } : {}) });
     }
   }
 
@@ -409,8 +471,20 @@ export function createHub({
     const route = replyRoute(s);
     if (route === 'tmux') {
       const t = ['-S', s.tmux.socket];
-      const alive = await run('tmux', [...t, 'display-message', '-p', '-t', s.tmux.pane, '#{pane_id}']);
-      if (alive == null) throw Object.assign(new Error('the tmux pane this session ran in is gone'), { status: 409 });
+      // Asked separately: tmux rewrites control characters in its output, so
+      // the two values cannot be told apart reliably on one line.
+      const show = (what) => run('tmux', [...t, 'display-message', '-p', '-t', s.tmux.pane, what]);
+      const [shown, where] = await Promise.all([show('#{pane_current_command}'), show('#{pane_current_path}')]);
+      if (shown == null) throw Object.assign(new Error('the tmux pane this session ran in is gone'), { status: 409 });
+      // Keys go to whatever is in the pane now. If the agent has exited, that
+      // is a shell and our text would be run as a command; if the pane was
+      // recorded wrongly (a hook fired from a shared daemon), it is someone
+      // else's terminal. Either way: do not type.
+      const command = shown.trim();
+      const path = (where || '').trim();
+      if (SHELLS.has(command)) throw Object.assign(new Error(`the agent is no longer running in that tmux pane (it shows ${command}); typing there would run as a shell command`), { status: 409 });
+      const related = (a, b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+      if (s.cwd && path && !related(path, s.cwd)) throw Object.assign(new Error('that tmux pane is in a different directory from this session; refusing to type into it'), { status: 409 });
       // -l sends the text literally; Enter is a separate key so it is not typed.
       if ((await run('tmux', [...t, 'send-keys', '-t', s.tmux.pane, '-l', '--', text])) == null ||
           (await run('tmux', [...t, 'send-keys', '-t', s.tmux.pane, 'Enter'])) == null) {
@@ -439,13 +513,21 @@ export function createHub({
   // scope 'session' narrows everything to the files this session's edit
   // tools touched. Changes it made through shell commands are not attributed,
   // so the whole-tree view stays one click away.
+  // Three ways to cut the diff:
+  //   since    everything that changed in the working tree since the session
+  //            was first seen, whoever or whatever changed it (shell commands
+  //            included). Exact when the session has the directory to itself.
+  //   session  only the files this session's edit tools touched
+  //   all      the whole working tree against the last commit
   async function workingTree(s, scope = 'all') {
     if (!isLocal(s) || !s.cwd || !existsSync(s.cwd)) return { available: false };
+    const sinceOk = scope === 'since' && !!s.baseline && (await run('git', ['-C', s.cwd, 'cat-file', '-e', `${s.baseline}^{commit}`])) != null;
+    const base = sinceOk ? s.baseline : 'HEAD';
     const own = scope === 'session' && s.files.length ? ['--', ...s.files] : [];
     const [status, stat, tracked] = await Promise.all([
       git(s.cwd, ['status', '--porcelain', '-uall', ...own]),
-      git(s.cwd, ['diff', 'HEAD', '--stat', ...own]),
-      run('git', ['-C', s.cwd, 'diff', 'HEAD', ...own]),
+      git(s.cwd, ['diff', base, '--stat', ...own]),
+      run('git', ['-C', s.cwd, 'diff', base, ...own]),
     ]);
     if (status == null && tracked == null) return { available: false };
     // New files are not in `git diff HEAD`; show them as additions too.
@@ -454,15 +536,66 @@ export function createHub({
       fresh.map((f) => run('git', ['-C', s.cwd, 'diff', '--no-index', '--', '/dev/null', f], { okCodes: [1] })),
     );
     const diff = [tracked, ...added].filter(Boolean).join('\n');
+    // Per file: its current content hash, and whether the human has reviewed
+    // exactly this content (a later change makes it unreviewed again).
+    const paths = [...new Set([...diff.matchAll(/^diff --git a\/.* b\/(.*)$/gm)].map((m) => m[1]))].slice(0, 200);
+    const present = paths.filter((p) => existsSync(join(s.cwd, p)));
+    const hashes = present.length ? ((await git(s.cwd, ['hash-object', '--', ...present])) || '').split('\n') : [];
+    const hashOf = new Map(present.map((p, i) => [p, hashes[i] || null]));
+    const files = paths.map((p) => {
+      const hash = hashOf.get(p) || 'deleted';
+      return { path: p, hash, viewed: s.viewed[p] === hash, changed_since_viewed: !!s.viewed[p] && s.viewed[p] !== hash };
+    });
     return {
       available: true,
-      scope: own.length ? 'session' : 'all',
+      scope: sinceOk ? 'since' : own.length ? 'session' : 'all',
+      baseline: !!s.baseline,
+      files,
       attributed: s.files.length,
       status: status || '',
       stat: stat || '',
       diff: diff.slice(0, MAX_DIFF),
       truncated: diff.length > MAX_DIFF,
     };
+  }
+
+  // Coming back to a session cold: what was asked, and what has happened
+  // since the human last looked, counted from the event log.
+  function brief(s, since) {
+    const events = store.events(s.key, 3000).filter((e) => e.ts > since && !e.late);
+    const count = (type, pred = () => true) => events.filter((e) => e.type === type && pred(e)).length;
+    const decisions = events.filter((e) => e.type === 'request.resolved' && e.data?.decision).map((e) => ({ decision: e.data.decision, by: e.data.by }));
+    return {
+      first_prompt: s.first_prompt,
+      since,
+      turns: count('prompt.submitted'),
+      tools: count('tool.started'),
+      failed_commands: count('tool.finished', (e) => e.data?.ok === false),
+      requests: count('permission.requested') + count('question.asked'),
+      allowed: decisions.filter((d) => d.decision === 'allow' || d.decision === 'answer').length,
+      denied: decisions.filter((d) => d.decision === 'deny').length,
+      by_rule: decisions.filter((d) => d.by && d.by !== 'human').length,
+      compactions: count('context.compacted'),
+      total_compactions: s.compactions,
+    };
+  }
+
+  // Would this session's branch merge cleanly with the branches of the other
+  // live sessions in the same repository? A dry run: nothing is written.
+  async function conflicts(s) {
+    if (!isLocal(s) || !s.cwd || !s.branch || s.branch === 'HEAD' || !existsSync(s.cwd)) return [];
+    const repo = s.repo_id || s.repo;
+    const others = store.list().filter((o) => o.key !== s.key && !o.archived && o.state !== 'ended' &&
+      (o.repo_id || o.repo) === repo && o.branch && o.branch !== s.branch && o.branch !== 'HEAD');
+    const out = [];
+    for (const branch of [...new Set(others.map((o) => o.branch))].slice(0, 6)) {
+      const res = await new Promise((resolve) => execFile('git', ['-C', s.cwd, 'merge-tree', '--write-tree', '--name-only', s.branch, branch],
+        { timeout: 8000, maxBuffer: 4 << 20 }, (err, stdout) => resolve({ code: err ? err.code : 0, stdout: stdout || '' })));
+      if (res.code !== 1) continue; // 0 = clean; anything else = could not tell
+      const files = res.stdout.split('\n').slice(1).filter((l) => l && !l.includes(' ')).slice(0, 8);
+      out.push({ branch, with: others.filter((o) => o.branch === branch).map((o) => o.title || o.session_id).slice(0, 2), files });
+    }
+    return out;
   }
 
   // --- upkeep -----------------------------------------------------------------
@@ -778,7 +911,7 @@ export function createHub({
         : json(res, 410, { error: 'this request is no longer waiting on the board' });
     }
 
-    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail|task)$/);
+    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail|task|rename|viewed)$/);
     if (act) {
       const key = decodeURIComponent(act[1]);
       const s = store.get(key);
@@ -786,7 +919,10 @@ export function createHub({
       const verb = act[2];
       if (req.method === 'GET') {
         if (verb === 'events') return json(res, 200, store.events(key));
-        if (verb === 'detail') return json(res, 200, full(s));
+        if (verb === 'detail') {
+          const since = Number(url.searchParams.get('since')) || 0;
+          return json(res, 200, { ...full(s), brief: brief(s, since), conflicts: await conflicts(s) });
+        }
         if (verb === 'diff') return json(res, 200, await workingTree(s, url.searchParams.get('scope') || 'all'));
       }
       if (req.method === 'POST') {
@@ -800,6 +936,19 @@ export function createHub({
           if (typeof tool !== 'string') return json(res, 400, { error: 'tool required' });
           emit(s, allow === false ? 'rule.removed' : 'rule.added', { tool });
           return json(res, 200, view(store.get(key)));
+        }
+        if (verb === 'rename') {
+          const { title } = await body();
+          if (typeof title !== 'string' || !title.trim()) return json(res, 400, { error: 'title required' });
+          emit(s, 'human.renamed', { title });
+          return json(res, 200, view(store.get(key)));
+        }
+        if (verb === 'viewed') {
+          // { path, hash } marks that content as reviewed; hash null takes it back.
+          const { path: file, hash } = await body();
+          if (typeof file !== 'string') return json(res, 400, { error: 'path required' });
+          emit(s, 'human.viewed', { path: file, hash: hash || null });
+          return json(res, 200, { ok: true });
         }
         if (verb === 'task') {
           // { join: <session key> } puts it with that session's task; { join: null } pulls it out.
