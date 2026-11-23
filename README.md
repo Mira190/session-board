@@ -183,6 +183,10 @@ T3 Code 好用，靠的不是功能多，而是几条纪律（详见[拆解笔�
 - 调研笔记里对文档、论文和公开讨论的引用都是带出处的短句。
 - Claude、Claude Code 是 Anthropic 的商标，Codex 是 OpenAI 的商标，T3 Code 属于 T3 Tools。本项目与这些公司没有关联，也未获其认可；提到这些名字只是为了说明兼容和参考对象。
 
+## 许可证
+
+[MIT](LICENSE) © 2026 Mira
+
 ## 开发
 
 ```bash

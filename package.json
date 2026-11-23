@@ -4,6 +4,7 @@
   "description": "One inbox for all your coding-agent sessions (Claude Code, Codex; local and cloud)",
   "type": "module",
   "license": "MIT",
+  "author": "Mira",
   "bin": { "session-board": "bin/session-board.js" },
   "engines": { "node": ">=22.5" },
   "scripts": {
