@@ -36,6 +36,7 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board install <claude|codex>    add hooks to the agent's config
   session-board install claude --statusline   also report usage-limit windows to the board (subscribers)
   session-board remote <ssh-host>         bring sessions on another machine onto this board
+  session-board watch <git url|folder>    also look for cloud sessions in a repository this machine has not used
   session-board cloud-setup --url https://…   make this repository's Claude cloud sessions report to your hub
   session-board cloud-reporter            how to list all your Claude cloud sessions on the board
   session-board codex-cloud               show how Codex cloud tasks are read (enable with SESSION_BOARD_CODEX_CLOUD=1)
@@ -144,7 +145,13 @@ async function main() {
     // Cloud sessions through git: on unless switched off. Looks at the remotes
     // of the repositories Claude Code has been used in on this machine.
     const { claudeProjectDirs } = await import('../src/cloudgit.js');
-    const cloudGit = process.env.SESSION_BOARD_CLOUD_GIT === 'off' ? null : { cacheRoot: join(home(), 'git'), dirs: () => claudeProjectDirs() };
+    const { watched, recentRepos } = await import('../src/watch.js');
+    const lately = process.env.SESSION_BOARD_CLOUD_DISCOVER === 'off' ? async () => [] : recentRepos();
+    const cloudGit = process.env.SESSION_BOARD_CLOUD_GIT === 'off' ? null : {
+      cacheRoot: join(home(), 'git'),
+      dirs: () => [...claudeProjectDirs(), ...watched(home()).filter((w) => !/^(https?:|git@|ssh:)/.test(w))],
+      urls: async () => [...watched(home()).filter((w) => /^(https?:|git@|ssh:)/.test(w)), ...(await lately())],
+    };
     const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl, ignoreCwds: [triageDir(home())], cloudGit });
     await hub.listen(Number(opt.port), opt.bind);
     writeEndpoint({ url, token });
@@ -327,6 +334,20 @@ children), including ones in repositories without hooks. It is a snapshot taken 
 and each run costs that session a turn, so use it on demand or on a slow schedule. The hooks from
 \`session-board cloud-setup\` are the live, free route. To expose nothing at all, use --local.`);
     return;
+  }
+
+  // Repositories to look at for cloud sessions that this machine would not find by itself.
+  if (cmd === 'watch' || cmd === 'unwatch') {
+    const { watched, setWatched } = await import('../src/watch.js');
+    const { home } = await import('../src/endpoint.js');
+    const { resolve } = await import('node:path');
+    const { existsSync } = await import('node:fs');
+    const list = watched(home());
+    if (!arg) return console.log(list.length ? `watching:\n  ${list.join('\n  ')}` : 'not watching anything extra. Add one with: session-board watch <git url or folder>');
+    const item = /^(https?:|git@|ssh:)/.test(arg) ? arg : resolve(arg);
+    if (cmd === 'watch' && item === resolve(arg) && !existsSync(item)) throw new Error(`${item} is not a folder here (or give a git URL)`);
+    setWatched(home(), cmd === 'watch' ? [...list, item] : list.filter((x) => x !== item));
+    return console.log(`${cmd === 'watch' ? 'now watching' : 'no longer watching'} ${item}. The hub picks this up within a minute.`);
   }
 
   if (cmd === 'codex-cloud') {

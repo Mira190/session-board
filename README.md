@@ -189,22 +189,40 @@ With it, the header shows the 5-hour and weekly windows with their reset times (
 
 There are two sanctioned ways to get cloud sessions onto the board. Neither touches a private API, and both need a hub the cloud can reach.
 
-### Out of the box: cloud sessions found through git
+### Out of the box: managing cloud sessions through git
 
-Nothing to set up. A cloud session works on a `claude/…` branch and signs each commit with a link to itself (`Claude-Session: https://claude.ai/code/session_…`). Both can be read from your machine with the git access you already have.
+Nothing to set up. A cloud session works on a `claude/…` branch and signs each commit with a link to itself (`Claude-Session: https://claude.ai/code/session_…`). Both can be read from your machine with the git access you already have, so the hub puts the cloud sessions it finds on the board as soon as it starts.
 
-So once the hub is running, it looks at the remotes of the repositories Claude Code has been used in on this machine, every three minutes, and puts the cloud sessions it finds on the board:
+![Cloud sessions found through git](docs/cloud-git.png)
 
-- **Visible**: which cloud sessions exist, the branch each is on, what its last commit did and when, a link back to it on claude.ai, and its pull request (open, checks failing, changes requested, merged). PR problems join the queue as usual, and a merged PR counts as accepted.
-- **Not visible**: whether it is waiting for you. A session whose last commit is under 30 minutes old shows as "Committed recently"; after that the board says plainly "finished, waiting for you, or on a long task" rather than guess.
-- **Your repositories are not touched**: the hub keeps a small cache of its own per remote (commit records only, no file contents). Your clones gain no branches and no objects.
-- **Turn it off** with `SESSION_BOARD_CLOUD_GIT=off`.
+**What it does:**
 
-Limits: only sessions that have pushed a commit can be found; a session with commit attribution switched off is not recognised; and the repository has to be one Claude Code was used in on this machine (or one with a local session in it).
+- **Discovery**: which cloud sessions exist, the branch each is on, a link back to it on claude.ai.
+- **Progress**: its recent commits, and how many are new since you last looked.
+- **Review on the board**: everything on the branch since it left the default branch, file by file, with reviewed marks; a file that changes after you ticked it is flagged. File contents are fetched from the remote only when you open them.
+- **Distance from the default branch**: commits ahead and behind, whether merging would conflict, and in which files.
+- **Collisions**: two cloud sessions, or a cloud session and a local one, editing the same file are flagged; merges between cloud branches are dry-run too.
+- **Pull requests**: state, checks and review decision. A session that opened a PR and went quiet counts as awaiting review; a merged PR counts as accepted; failing checks or requested changes join the queue.
+- **Branch gone**: deleted after a merge counts as accepted; deleted without one shows as ended.
 
-Verified: on this project's own repository, a hub started with no configuration found two cloud sessions from the real remote in 0.6 seconds, with the same session ids as the official list, and nothing changed in the local repository.
+**What it cannot do: tell whether a session is waiting for you.** A session whose last commit is under 30 minutes old shows as "Committed recently"; one that has been quiet longer and has no PR is described plainly as "finished, waiting for you, or on a long task". That needs one of the routes below, where the cloud reports in.
 
-To know whether a session is waiting for you, the cloud has to report in, by one of the routes below.
+**How repositories are found:**
+
+- Repositories Claude Code has been used in on this machine, and ones with a local session: automatically.
+- Repositories you pushed to in the last 14 days: automatically when `gh` is logged in (not verified against a real GitHub login).
+- Anything else: `node bin/session-board.js watch <git url or folder>`.
+
+**Cost and footprint:**
+
+- One small request per remote per minute to ask whether a branch moved; data is fetched only when something did.
+- The hub keeps its own cache per remote, commits only, with file contents fetched on demand. **Your clones gain no branches and no objects.**
+- It uses your existing git credentials and never prompts; a remote it cannot read is skipped.
+- Turn it off with `SESSION_BOARD_CLOUD_GIT=off`. For a branch prefix other than `claude/`, set `SESSION_BOARD_CLOUD_BRANCHES`.
+
+**Limits:** only sessions that have pushed a commit can be found; a session with commit attribution switched off is not recognised; only the 300 most recent commits of a branch are looked at, so a branch further than that from the default branch has no ahead/behind count.
+
+**Measured on this project's real remote, with no configuration:** two cloud sessions found within 3 seconds, with the same ids as the official list; the per-minute check is one request of about 0.26 s; a diff spanning 8 commits fetched on demand took about 0.4 s; the cache went from 188 KB to 2.3 MB; the local repository's branches and object counts did not change.
 
 ### Security first: do not expose the board itself
 

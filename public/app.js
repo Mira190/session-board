@@ -120,6 +120,7 @@ function describeState(s) {
         verb: '{age}',
       };
     case 'ended':
+      if (s.activity === 'gone') return { tone: 'rest', what: t('Its branch was deleted without being merged'), detail: s.last_message, verb: '' };
       return { tone: 'rest', what: s.settled === 'merged' ? t('Merged, counted as accepted') : s.imported ? t('Past session (imported)') : t('Ended'), detail: s.last_message, verb: '' };
     default:
       if (s.activity === 'quiet' && !s.hooked && !s.listed && s.settled !== 'merged') {
@@ -368,7 +369,7 @@ const cardSig = (s) => JSON.stringify([
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
-  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.activity, s.hooked, s.listed, s.context_pct >= 85 && s.context_pct, s.task?.why,
+  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage, s.overlap, s.checks, s.last_edit_ts, s.activity, s.hooked, s.listed, s.base_conflicts?.length, s.ahead, s.behind, s.context_pct >= 85 && s.context_pct, s.task?.why,
 ]);
 
 function card(s) {
@@ -392,7 +393,8 @@ function card(s) {
     d.detail && el('div', { className: 'peek', textContent: d.detail.split('\n')[0] }),
     triageLine(s),
     s.overlap && el('div', { className: 'warn', textContent: t('Same file as {who}: {file}', { who: s.overlap.with[0], file: s.overlap.file }) }),
-    s.state === 'review' && checkLine(s),
+    s.base_conflicts?.length > 0 && el('div', { className: 'warn', textContent: t('Conflicts with {base}', { base: s.base_branch || t('the default branch') }) }),
+    s.state === 'review' && s.runtime !== 'cloud' && checkLine(s),
     s.context_pct >= 85 && el('div', { className: 'warn', textContent: t('Context {n}% full: it will compact soon and may lose early details', { n: s.context_pct }) }),
     s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
     s.quiet && el('div', { className: 'warn', textContent: t('No activity for over 10 minutes') }),
@@ -781,6 +783,22 @@ function briefBlock(s, b) {
     parts.length > 0 && el('div', {}, el('b', { textContent: b.since ? t('Since you last looked: ') : t('So far: ') }), parts.join(' · ')));
 }
 
+// A cloud session known through git: where its branch stands, and what it did.
+function branchBlock(s, detail) {
+  if (s.runtime !== 'cloud' || !s.tip) return null;
+  const commits = detail.commits || [];
+  const fresh = commits.filter((c) => c.ts > (openedAt.get(s.key) || 0)).length;
+  return el('div', { className: 'brief' },
+    el('div', {}, el('b', { textContent: t('Branch: ') }), el('code', { textContent: s.branch || '' }),
+      s.ahead != null ? t(' · {a} commit(s) ahead of {base}, {b} behind', { a: s.ahead, b: s.behind, base: s.base_branch || t('the default branch') }) : ''),
+    s.branch && s.branch === s.base_branch && el('div', { className: 'note', textContent: t('Its branch is the repository’s default branch, so there is nothing to compare it against.') }),
+    s.base_conflicts?.length > 0 && el('div', { className: 'warn', textContent: t('Would conflict when merged into {base}: {files}', { base: s.base_branch, files: s.base_conflicts.join(', ') }) }),
+    s.base_conflicts?.length === 0 && s.behind > 0 && el('div', { className: 'note', textContent: t('Merges cleanly into {base} as things stand.', { base: s.base_branch }) }),
+    commits.length > 0 && el('details', { open: commits.length <= 6 },
+      el('summary', { textContent: openedAt.get(s.key) && fresh ? t('Commits ({n}, {f} since you last looked)', { n: commits.length, f: fresh }) : t('Commits ({n})', { n: commits.length }) }),
+      el('ul', { className: 'timeline' }, commits.map((c) => el('li', {}, el('time', { textContent: t('{age} ago', { age: age(c.ts) }) }), el('span', { textContent: c.subject }))))));
+}
+
 function conflictBlock(s, conflicts) {
   return el('div', {},
     s.overlap && el('div', { className: 'warn' }, t('Also being edited by {n} other live session(s) ({who}): {file}{more}', {
@@ -808,9 +826,11 @@ function reviewPanel(s, diff, scope) {
   ];
   return el('div', { className: 'review' },
     el('h3', { textContent: t('Review') }),
-    evidence(s),
+    // Test runs are only visible for sessions whose own hooks report them.
+    (s.runtime !== 'cloud' || s.hooked) && evidence(s),
+    diff.scope === 'branch' && el('p', { className: 'note', textContent: t('Everything on its branch since it left {base}, read from the remote.', { base: diff.base || t('the default branch') }) }),
     el('div', { className: 'actions', style: 'margin-top:8px' },
-      el('div', { className: 'seg' }, SCOPES.map(([id, label, tip]) => el('button', {
+      diff.scope !== 'branch' && el('div', { className: 'seg' }, SCOPES.map(([id, label, tip]) => el('button', {
         textContent: label, title: tip, ariaPressed: String(diff.scope === id),
         onclick: () => { scopes.set(s.key, id); render(); },
       }))),
@@ -1057,7 +1077,7 @@ function renderBench() {
   bench.replaceChildren(...[
     el('div', { className: 'meta' },
       el('span', { className: `badge ${s.agent}`, textContent: agentName(s) }),
-      el('span', { className: 'where', textContent: [where(s), t('turn {n}', { n: s.turns }), usageLine(s), s.context_pct != null ? t('context {n}% full', { n: s.context_pct }) : null].filter(Boolean).join(' · ') }),
+      el('span', { className: 'where', textContent: [where(s), s.turns ? t('turn {n}', { n: s.turns }) : null, usageLine(s), s.context_pct != null ? t('context {n}% full', { n: s.context_pct }) : null].filter(Boolean).join(' · ') }),
       s.runtime === 'cloud' && el('span', { textContent: t('☁ Cloud') })),
     el('h2', {}, s.title || s.session_id, el('button', { className: 'mini', textContent: t('Rename'), onclick: () => {
       const title = prompt(t('Name this session'), s.title || '');
@@ -1075,9 +1095,10 @@ function renderBench() {
 
     s.last_prompt && el('h3', { textContent: t('What you said last') }),
     s.last_prompt && el('div', { className: 'prose', textContent: s.last_prompt }),
-    s.last_message && s.state !== 'review' && el('h3', { textContent: t('What it said last') }),
-    s.last_message && s.state !== 'review' && el('div', { className: 'prose', textContent: s.last_message }),
+    s.last_message && s.state !== 'review' && s.last_message !== d.detail && el('h3', { textContent: t('What it said last') }),
+    s.last_message && s.state !== 'review' && s.last_message !== d.detail && el('div', { className: 'prose', textContent: s.last_message }),
 
+    branchBlock(s, detail),
     briefBlock(s, detail.brief),
     conflictBlock(s, detail.conflicts),
     reviewPanel(s, diff, scope),
@@ -1200,7 +1221,7 @@ function paint() {
   const s = byKey(selected);
   // The workbench is rebuilt only when what it shows has changed.
   const more = extra.get(selected) || {};
-  const benchSig = JSON.stringify([s, reviewTick, more.diff?.files, more.full?.brief, more.full?.conflicts, s && siblings(s).map((m) => [m.key, m.state, m.since, m.files_count, m.pr]), more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
+  const benchSig = JSON.stringify([s, reviewTick, more.diff?.files, more.full?.brief, more.full?.conflicts, more.full?.commits?.length, s && siblings(s).map((m) => [m.key, m.state, m.since, m.files_count, m.pr]), more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
   if (benchSig !== paint.bench) { paint.bench = benchSig; renderBench(); }
   if (s) loadExtra(s);
   noteReading();

@@ -22,6 +22,20 @@ export const setLangPref = (v) => store.set(LANGS.includes(v) ? v : 'auto');
 export const lang = () => (langPref() === 'auto' ? systemLang() : langPref());
 
 const ZH = {
+  'Its branch is the repository’s default branch, so there is nothing to compare it against.': '它的分支就是仓库的默认分支，没有可以比较的基线。',
+
+  // ---- cloud branches
+  'Everything on its branch since it left {base}, read from the remote.': '它的分支自离开 {base} 以来的全部改动，从远端读取。',
+  'the default branch': '主干',
+  'Branch: ': '分支：',
+  ' · {a} commit(s) ahead of {base}, {b} behind': ' · 比 {base} 多 {a} 个提交，落后 {b} 个',
+  'Would conflict when merged into {base}: {files}': '合并进 {base} 时会冲突：{files}',
+  'Merges cleanly into {base} as things stand.': '按现在的情况可以干净地合并进 {base}。',
+  'Commits ({n}, {f} since you last looked)': '提交（{n} 个，其中 {f} 个是你上次看过之后的）',
+  'Commits ({n})': '提交（{n} 个）',
+  'Conflicts with {base}': '与 {base} 有冲突',
+  'Its branch was deleted without being merged': '它的分支没合并就被删了',
+
   // ---- cloud sessions found through git
   '　Found through git: its commits and pull request are visible, but not whether it is waiting for you.': '　通过 git 发现：能看到它的提交和 PR，但看不出它是否在等你。',
   'Committed recently': '最近有提交',

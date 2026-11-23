@@ -16,7 +16,7 @@ import { createGitHub } from './github.js';
 import { ruleMatches, ruleProblem, stemOf } from './rules.js';
 import { createNotifier } from './notify.js';
 import { groupTasks } from './tasks.js';
-import { readRemote, claudeProjectDirs, remoteOf } from './cloudgit.js';
+import { lsRemote, readRemote, branchFiles, branchConflicts, branchDiff, remoteOf } from './cloudgit.js';
 import { parseRemote } from './github.js';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
@@ -184,7 +184,7 @@ export function createHub({
   // the one session that is open. test/more.test.js holds this to a budget.
   const short = (t) => (typeof t === 'string' && t.length > ROW_TEXT ? `${t.slice(0, ROW_TEXT - 1)}…` : t);
   const view = (s) => {
-    const { files, transcript, auto_allow, acked, start_head, pr_alert, repo_id, viewed, baseline, first_prompt, ...row } = full(s);
+    const { files, transcript, auto_allow, acked, start_head, pr_alert, repo_id, viewed, baseline, first_prompt, commits, ...row } = full(s);
     return { ...row, last_prompt: short(row.last_prompt), last_message: short(row.last_message), files_count: files.length };
   };
   // Task membership depends on every session, so it is recomputed as a whole
@@ -197,7 +197,11 @@ export function createHub({
     for (const s of live) {
       if (s.state === 'ended' || !s.files.length) continue;
       const repo = s.repo_id || s.repo || s.cwd;
-      for (const f of s.files) (byFile.get(`${repo}\n${f}`) || byFile.set(`${repo}\n${f}`, []).get(`${repo}\n${f}`)).push(s);
+      for (const full of s.files) {
+        // Local sessions record absolute paths, cloud ones paths in the repository.
+        const f = s.cwd && full.startsWith(`${s.cwd}/`) ? full.slice(s.cwd.length + 1) : full;
+        (byFile.get(`${repo}\n${f}`) || byFile.set(`${repo}\n${f}`, []).get(`${repo}\n${f}`)).push(s);
+      }
     }
     const next = new Map();
     for (const [k, group] of byFile) {
@@ -386,7 +390,7 @@ export function createHub({
   // on github.com, so this is read at turn ends and then polled.
   const prAsked = new Map();
   async function refreshPr(s, { force = false } = {}) {
-    if (!s.branch || (!isLocal(s) && !s.github)) return false;
+    if (!s.branch || (!isLocal(s) && !s.github && !s.cloud_id)) return false;
     if (isLocal(s) && (!s.cwd || !existsSync(s.cwd))) return false;
     if (!force && now() - (prAsked.get(s.key) || 0) < PR_POLL_MS) return false;
     prAsked.set(s.key, now());
@@ -607,6 +611,7 @@ export function createHub({
   //   session  only the files this session's edit tools touched
   //   all      the whole working tree against the last commit
   async function workingTree(s, scope = 'all') {
+    if (!isLocal(s) && s.cloud_id) return branchReview(s);
     if (!isLocal(s) || !s.cwd || !existsSync(s.cwd)) return { available: false };
     const sinceOk = scope === 'since' && !!s.baseline && (await run('git', ['-C', s.cwd, 'cat-file', '-e', `${s.baseline}^{commit}`])) != null;
     const base = sinceOk ? s.baseline : 'HEAD';
@@ -685,42 +690,109 @@ export function createHub({
     return out;
   }
 
-  // Cloud sessions through git: for each repository this machine knows, read
-  // the remote's claude/ branches. A session is "recently active" for a while
-  // after its last commit; after that git cannot tell working from waiting.
+  // Cloud sessions through git. Once a minute each known remote is asked, in
+  // one small request, where its session branches point. Only when something
+  // moved is anything fetched and worked out again (changed files, distance
+  // from the default branch, whether it would conflict).
   const RECENT_MS = 30 * 60 * 1000;
+  const remotes = new Map(); // url -> { sig, baseSha, dir, base, branches: Map(cloud id -> branch facts) }
+  const cloudRef = new Map(); // session key -> { url, dir, ref } for showing its diff
+  async function knownRemotes() {
+    const dirs = new Set([...store.list().filter((s) => isLocal(s) && s.cwd).map((s) => s.cwd), ...(cloudGit.dirs ? cloudGit.dirs() : [])]);
+    const urls = new Set(cloudGit.urls ? await cloudGit.urls() : []);
+    for (const dir of [...dirs].slice(0, 80)) {
+      const url = await remoteOf(dir);
+      if (url) urls.add(url);
+    }
+    return [...urls].slice(0, 40);
+  }
   async function scanCloudBranches() {
     if (!cloudGit) return { remotes: 0, sessions: 0 };
-    const dirs = new Set([...store.list().filter((s) => isLocal(s) && s.cwd).map((s) => s.cwd), ...(cloudGit.dirs ? cloudGit.dirs() : [])]);
-    const remotes = new Set();
-    for (const dir of [...dirs].slice(0, 60)) {
-      const url = await remoteOf(dir);
-      if (url) remotes.add(url);
-    }
+    const urls = await knownRemotes();
     let found = 0;
-    for (const url of [...remotes].slice(0, 30)) {
-      const branches = await readRemote(url, cloudGit.cacheRoot);
-      if (!branches) continue;
+    for (const url of urls) {
+      const seen = await lsRemote(url);
+      if (!seen) continue;
+      const sig = `${seen.base}@${seen.baseSha}|${[...seen.heads].sort().join(',')}`;
+      let st = remotes.get(url);
+      if (!st || st.sig !== sig) {
+        const read = await readRemote(url, cloudGit.cacheRoot, seen);
+        if (!read) continue;
+        const branches = new Map();
+        for (const b of read.branches) {
+          const was = st?.branches.get(b.cloud_id);
+          if (was && was.sha === b.sha && st.baseSha === seen.baseSha) Object.assign(b, { files: was.files, conflicts: was.conflicts });
+          else {
+            // Trees are fetched on demand for these; do them only when the branch moved.
+            b.files = await branchFiles(read.dir, b.ref).catch(() => null);
+            b.conflicts = seen.base ? await branchConflicts(read.dir, b.ref).catch(() => null) : null;
+          }
+          branches.set(b.cloud_id, b);
+        }
+        // A branch that is gone from the remote: merged and deleted, or abandoned.
+        for (const [id] of st?.branches || []) {
+          if (branches.has(id)) continue;
+          const s = store.list().find((x) => x.cloud_id === id);
+          if (s) emit(s, 'cloud.branch.gone', {});
+        }
+        st = { sig, baseSha: seen.baseSha, dir: read.dir, base: read.base, branches };
+        remotes.set(url, st);
+      }
       const slug = parseRemote(url);
       const repo = url.replace(/\.git\/?$/, '').split(/[/:]/).pop();
+      const repoId = url.replace(/\/\/[^@/]*@/, '//');
       const byCloud = new Map(store.list().filter((x) => x.cloud_id).map((x) => [x.cloud_id, x]));
-      for (const b of branches) {
+      for (const b of st.branches.values()) {
         const have = byCloud.get(b.cloud_id);
         const ref = have ? { agent: have.agent, session_id: have.session_id } : { agent: 'claude', session_id: `session_${b.cloud_id}` };
         const recent = now() - b.ts < RECENT_MS;
+        const moved = !have || have.tip !== b.sha;
         const s = store.append({
           ...ref, ts: now(), host: 'claude-cloud', runtime: 'cloud', cloud_id: b.cloud_id,
-          eid: `git:${b.sha}:${recent}`, type: 'cloud.branch',
-          data: { branch: b.branch, repo, github: slug ? `${slug.owner}/${slug.repo}` : null, subject: b.subject, ts: b.ts, commits: b.commits, recent, url: `https://claude.ai/code/session_${b.cloud_id}` },
+          eid: `git:${b.sha}:${st.baseSha}:${recent}`, type: 'cloud.branch',
+          data: {
+            branch: b.branch, repo, repo_id: repoId, github: slug ? `${slug.owner}/${slug.repo}` : null, tip: b.sha, subject: b.subject, ts: b.ts, recent,
+            url: `https://claude.ai/code/session_${b.cloud_id}`, base: st.base, ahead: b.ahead, behind: b.behind,
+            files: b.files, conflicts: b.conflicts, commits: b.commits,
+          },
         });
-        if (s) refreshPr(s).catch(() => {});
+        if (s) {
+          cloudRef.set(s.key, { url, dir: st.dir, ref: b.ref });
+          refreshPr(s, { force: moved }).catch(() => {});
+        }
         found += 1;
       }
     }
-    return { remotes: remotes.size, sessions: found };
+    return { remotes: urls.length, sessions: found };
   }
-  const cloudScanner = cloudGit ? setInterval(() => scanCloudBranches().catch(() => {}), 3 * 60_000) : null;
+  const cloudScanner = cloudGit ? setInterval(() => scanCloudBranches().catch(() => {}), 60_000) : null;
   cloudScanner?.unref();
+
+  // A cloud session's work, read from the hub's own copy of its branch.
+  async function branchReview(s) {
+    const at = cloudRef.get(s.key);
+    if (!at) return { available: false };
+    const d = await branchDiff(at.dir, at.ref);
+    if (!d) return { available: false };
+    return {
+      available: true, scope: 'branch', base: s.base_branch, baseline: true, attributed: d.files.length, status: '', stat: d.stat, diff: d.diff, truncated: d.truncated,
+      files: d.files.map((f) => ({ ...f, viewed: s.viewed[f.path] === f.hash, changed_since_viewed: !!s.viewed[f.path] && s.viewed[f.path] !== f.hash })),
+    };
+  }
+  // Would it conflict with the other session branches on the same remote?
+  async function branchClashes(s) {
+    const at = cloudRef.get(s.key);
+    if (!at) return [];
+    const out = [];
+    for (const [key, other] of cloudRef) {
+      if (key === s.key || other.url !== at.url || out.length >= 5) continue;
+      const o = store.get(key);
+      if (!o || o.archived || o.state === 'ended') continue;
+      const files = await branchConflicts(at.dir, at.ref, other.ref);
+      if (files?.length) out.push({ branch: o.branch, with: [o.title || o.session_id], files });
+    }
+    return out;
+  }
 
   // --- upkeep -----------------------------------------------------------------
   // Reconciliation: a session we show as active, on this machine, silent for a
@@ -1098,7 +1170,7 @@ export function createHub({
         if (verb === 'events') return json(res, 200, store.events(key));
         if (verb === 'detail') {
           const since = Number(url.searchParams.get('since')) || 0;
-          return json(res, 200, { ...full(s), brief: brief(s, since), conflicts: await conflicts(s) });
+          return json(res, 200, { ...full(s), brief: brief(s, since), conflicts: isLocal(s) ? await conflicts(s) : await branchClashes(s) });
         }
         if (verb === 'diff') return json(res, 200, await workingTree(s, url.searchParams.get('scope') || 'all'));
       }

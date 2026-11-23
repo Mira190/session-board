@@ -47,6 +47,12 @@ function blank(ev) {
     cloud_id: null, // the vendor's id for a cloud session
     url: null, // where to open it in the vendor's own UI
     activity: null, // what a cloud session says it is doing right now
+    tip: null, // commit its branch points at (cloud sessions known through git)
+    commits: [], // its recent commits: { sha, ts, subject }
+    ahead: null, behind: null, // commits it has that the default branch lacks, and the reverse
+    base_branch: null, // the repository's default branch
+    base_conflicts: null, // files that would conflict merging into the default branch ([] = clean, null = unknown)
+    git_recent: false, // committed within the "recently active" window
     listed: false, // seen in the vendor's session list (which knows its state better than git does)
     last_commit_ts: 0, // newest commit on its branch, for sessions known through git
     hooked: false, // its own hooks report to us (so a coarse cloud listing must not drive its state)
@@ -118,6 +124,27 @@ function resolve(s, { id, kind, tool } = {}) {
   );
   if (i >= 0) s.requests.splice(i, 1);
   return i >= 0;
+}
+
+// A cloud session known only through git: what its commits and pull request
+// allow us to say. Git shows what it did and when, never that it is waiting.
+function gitState(s, ts) {
+  if (s.pr?.state === 'merged') {
+    if (s.phase !== 'idle') enter(s, 'idle', ts);
+    s.settled = 'merged';
+    s.activity = null;
+  } else if (s.git_recent) {
+    enter(s, 'working', ts);
+    s.activity = null;
+  } else if (s.pr?.state === 'open' && !s.pr.draft && s.reviewed_tip !== s.tip) {
+    // It opened a pull request and went quiet: there is something to review
+    // (unless the human already accepted exactly this commit).
+    if (s.phase !== 'review') enter(s, 'review', ts);
+    s.activity = null;
+  } else {
+    if (s.phase !== 'idle' && s.phase !== 'ended') enter(s, 'idle', ts);
+    s.activity = 'quiet';
+  }
 }
 
 // What is wrong with a pull request that the human should hear about, if anything.
@@ -211,7 +238,7 @@ export function reduce(prev, ev) {
   }
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'cloud.snapshot', 'cloud.branch', 'files.attributed', 'context.compacted'].includes(ev.type)) s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone', 'files.attributed', 'context.compacted'].includes(ev.type)) s.archived = false;
 
   const working = () => enter(s, 'working', ts);
 
@@ -384,6 +411,7 @@ export function reduce(prev, ev) {
       if (s.requests.some((r) => r.kind === 'pr')) s.requests = s.requests.filter((r) => r.kind !== 'pr');
       else if (['review', 'failed', 'unknown'].includes(s.phase)) {
         s.acked = { phase: s.phase, since: s.phase_since, error: s.error };
+        s.reviewed_tip = s.tip || null;
         enter(s, s.exited ? 'ended' : 'idle', ts);
       }
       break;
@@ -431,18 +459,34 @@ export function reduce(prev, ev) {
       s.runtime = 'cloud';
       if (d.url) s.url = d.url;
       if (d.repo && !s.repo) s.repo = d.repo;
+      if (d.repo_id && !s.repo_id) s.repo_id = d.repo_id;
       if (d.github) s.github = d.github;
       if (d.branch) s.branch = d.branch;
+      s.tip = d.tip || s.tip;
       s.last_commit_ts = d.ts || s.last_commit_ts;
-      if (!s.title_manual && !s.listed && !s.hooked && d.subject) s.title = clip(d.subject, 120);
+      s.commits = Array.isArray(d.commits) ? d.commits.slice(0, 15) : s.commits;
+      s.ahead = d.ahead ?? null;
+      s.behind = d.behind ?? null;
+      s.base_branch = d.base || s.base_branch;
+      s.base_conflicts = d.conflicts ?? null;
+      s.git_recent = !!d.recent;
+      // The branch is the record of what it changed: better than anything else we have for a cloud session.
+      if (Array.isArray(d.files) && !s.cwd) s.files = d.files.slice(0, MAX_FILES);
+      if (!s.title_manual && !s.listed && !s.hooked && d.subject && !s.pr?.title) s.title = clip(d.subject, 120);
       if (s.hooked || s.listed) break; // better sources decide its state
       s.last_message = clip(d.subject, 1200);
-      // Git says what it did and when, not whether it is waiting for anyone.
-      if (d.recent) enter(s, 'working', ts);
-      else if (s.phase !== 'idle' && s.phase !== 'ended') enter(s, 'idle', ts);
-      s.activity = d.recent ? null : 'quiet';
+      gitState(s, ts);
       break;
     }
+
+    case 'cloud.branch.gone':
+      // Its branch is no longer on the remote: merged and deleted, or dropped.
+      s.git_recent = false;
+      if (s.hooked || s.listed) break;
+      s.requests = s.requests.filter((r) => r.kind !== 'pr');
+      if (s.pr?.state === 'merged') { enter(s, 'idle', ts); s.settled = 'merged'; } else enter(s, 'ended', ts);
+      s.activity = 'gone';
+      break;
 
     case 'cloud.snapshot': {
       // One row of the vendor's own session list. Coarser than hooks: it says
@@ -519,6 +563,10 @@ export function reduce(prev, ev) {
 
     case 'pr.updated': {
       s.pr = d.pr || null;
+      if (s.runtime === 'cloud' && s.tip && !s.hooked && !s.listed) {
+        if (s.pr?.title && !s.title_manual) s.title = clip(s.pr.title, 120);
+        gitState(s, ts);
+      }
       // A failing check or a "changes requested" review joins the queue as a
       // request of its own: once per problem, and not while the agent is
       // mid-turn (it may be fixing exactly this). It leaves when the problem
@@ -542,7 +590,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.last_work_ts = ts;
     if (ev.type !== 'heartbeat' && ev.type !== 'notification') s.hooked = true;
