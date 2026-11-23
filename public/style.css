@@ -129,7 +129,7 @@ main[data-view="office"] #office { display: block; }
   linear-gradient(90deg, var(--line) 1px, transparent 1px) 0 0 / 44px 100%, var(--panel);
   border: 1px solid var(--line); overflow: hidden; }
 .legend { margin: 8px 2px 0; font-size: 12px; color: var(--muted); }
-.zone { position: absolute; z-index: 0; left: 0; right: 0; border-top: 2px dashed var(--line); background: color-mix(in srgb, var(--card) 70%, transparent); }
+.zone { position: absolute; z-index: 0; left: 0; right: 0; border-bottom: 2px dashed var(--line); background: color-mix(in srgb, var(--card) 70%, transparent); }
 .zone-label { position: absolute; font-size: 11px; color: var(--muted); letter-spacing: .04em; }
 
 .desk { position: absolute; z-index: 3; width: 132px; text-align: center; background: none; border: 0; padding: 0; cursor: pointer; color: inherit; font: inherit; }
@@ -208,3 +208,41 @@ main[data-view="office"] #office { display: block; }
 .pr.bad, .pr.bad a { color: var(--urgent); }
 .pr a { color: var(--work); font-weight: 600; }
 #bench .pr { font-size: 13px; margin: 0 0 4px; }
+
+/* ---- scale: folding groups, batch decisions, filter, standing rules ---- */
+#filter { font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 7px; padding: 4px 10px; width: 210px; max-width: 100%; }
+#filter:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.fold { all: unset; cursor: pointer; display: flex; gap: 8px; align-items: baseline; font: inherit; color: inherit; }
+.fold:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.caret::before { content: "▾"; display: inline-block; width: 1em; color: var(--muted); }
+.group[data-folded="true"] .caret::before { content: "▸"; }
+.group[data-folded="true"] .hint { display: none; }
+.rollup { margin: 2px 0 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.rollup:empty { display: none; }
+.card.batch { cursor: default; border-color: var(--urgent); background: color-mix(in srgb, var(--urgent) 6%, var(--card)); }
+.peek.code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); width: min(640px, calc(100vw - 32px)); max-height: 80vh; padding: 0; }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog article { padding: 18px 20px; }
+dialog h3 { margin: 0 0 6px; font-size: 16px; }
+.rules { list-style: none; margin: 10px 0; padding: 0; }
+.rules li { display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.rules code { font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+
+/* ---- office at scale: rooms per project, compact desks, capped queue ---- */
+.room { position: absolute; z-index: 0; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--card) 55%, transparent); }
+.room-label { display: flex; flex-wrap: nowrap; gap: 8px; align-items: baseline; padding: 4px 8px; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+.room-label b { color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+.room-label .wait { color: var(--urgent); font-weight: 700; }
+.room-label .review { color: var(--ok); font-weight: 700; }
+.desk svg { width: 120px; height: 64px; }
+.agent svg { width: 44px; height: 52px; }
+.floor.compact .desk { width: 58px; }
+.floor.compact .desk svg { width: 54px; height: 29px; margin-top: 16px; }
+.floor.compact .desk .flag { top: -2px; right: 0; padding: 0 4px; }
+.agent[data-small="true"] { width: 22px; }
+.agent[data-small="true"] svg { width: 22px; height: 26px; }
+.agent[data-small="true"] .ring { height: 5px; bottom: -2px; }
+.desk .flag.wait { color: #fff; background: var(--urgent); border-color: var(--urgent); }
+.desk .flag.done { color: var(--ok); border-color: var(--ok); }
+.queue-more { position: absolute; z-index: 2; min-width: 44px; height: 44px; border-radius: 50%; border: 2px dashed var(--urgent); color: var(--urgent); font-weight: 700; background: var(--card); }

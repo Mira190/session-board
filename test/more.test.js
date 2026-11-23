@@ -143,3 +143,75 @@ test('the MCP server reads the board and cannot change it', async () => {
   assert.equal((await rpc('nope')).error.code, -32601);
   await hub.close();
 });
+
+test('live updates are deltas: the full picture once, then only what changed', async () => {
+  const { hub, base, post } = await start({});
+  for (const id of ['a', 'b', 'c']) await post('/ingest/claude', { session_id: id, hook_event_name: 'UserPromptSubmit', prompt: id });
+  await new Promise((r) => setTimeout(r, 200)); // let the tick for those three pass
+  const res = await fetch(base + '/api/stream');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  const next = async () => {
+    for (;;) {
+      const i = buf.indexOf('\n\n');
+      if (i >= 0) { const msg = JSON.parse(buf.slice(6, i)); buf = buf.slice(i + 2); return msg; }
+      const { value } = await reader.read();
+      buf += decoder.decode(value);
+    }
+  };
+  const first = await next();
+  assert.equal(first.sessions.length, 3, 'a new client gets everything');
+  await post('/ingest/claude', { session_id: 'b', hook_event_name: 'Stop', last_assistant_message: 'done' });
+  const delta = await next();
+  assert.equal(delta.sessions, undefined);
+  assert.deepEqual(delta.changed.map((s) => [s.key, s.state]), [['claude:b', 'review']], 'only the session that changed');
+  assert.deepEqual(delta.queue, ['claude:b']);
+  await post(`/api/sessions/${encodeURIComponent('claude:a')}/archive`, {});
+  const gone = await next();
+  assert.deepEqual([gone.changed.length, gone.removed], [0, ['claude:a']]);
+  await reader.cancel();
+  await hub.close();
+});
+
+test('one decision for the same request in many sessions; standing rules; drastic commands are kept out of both', async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'sb-')), 'board.db');
+  let { hub, base, post, get } = await start({ dbPath, localHost: 'laptop' });
+  const ask = (id, command) => post('/ingest/claude?host=laptop', { session_id: id, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command } });
+  const held = async (n) => until(async () => {
+    const ids = (await get('/api/sessions')).sessions.flatMap((s) => s.requests.filter((r) => r.decidable).map((r) => r.id));
+    return ids.length === n && ids;
+  });
+  const pending = ['s1', 's2', 's3'].map((id) => ask(id, 'npm install'));
+  const danger = ask('s4', 'rm -rf build');
+  const ids = await held(4);
+  const s4 = (await get('/api/sessions')).sessions.find((s) => s.session_id === 's4');
+  assert.equal(s4.waiting.risky, true);
+
+  const out = await (await post('/api/requests/batch', { ids: ids.filter((id) => id !== s4.waiting.id), decision: 'allow', remember: true })).json();
+  assert.deepEqual(out, { decided: 3, rule: { tool: 'Bash', detail: 'npm install' } });
+  for (const p of pending) assert.equal((await (await p).json()).hookSpecificOutput.decision.behavior, 'allow');
+
+  // The rule answers the next identical request anywhere, with no human involved.
+  assert.equal((await (await ask('s9', 'npm install')).json()).hookSpecificOutput.decision.behavior, 'allow');
+  const events = await get(`/api/sessions/${encodeURIComponent('claude:s9')}/events`);
+  assert.equal(events.at(-1).data.by, 'standing rule');
+
+  // Drastic commands cannot become rules, by either route.
+  assert.equal((await post('/api/rules', { tool: 'Bash', detail: 'git push --force' })).status, 400);
+  const tried = await (await post('/api/requests/batch', { ids: [s4.waiting.id], decision: 'allow', remember: true })).json();
+  assert.deepEqual(tried, { decided: 1, rule: null }, 'allowed this once, not forever');
+  await danger;
+  assert.equal((await get('/api/rules')).length, 1);
+  await hub.close();
+
+  // Rules outlive the hub; deleting one makes the request wait for a human again.
+  ({ hub, base, post, get } = await start({ dbPath, localHost: 'laptop' }));
+  assert.equal((await (await ask('s10', 'npm install')).json()).hookSpecificOutput.decision.behavior, 'allow');
+  await fetch(base + '/api/rules', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'Bash', detail: 'npm install' }) });
+  const waits = ask('s11', 'npm install');
+  const [id] = await held(1);
+  await post(`/api/requests/${id}`, { decision: 'deny' });
+  assert.equal((await (await waits).json()).hookSpecificOutput.decision.behavior, 'deny');
+  await hub.close();
+});

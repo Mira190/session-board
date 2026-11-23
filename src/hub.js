@@ -9,7 +9,7 @@ import { basename, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.js';
 import { fromHook } from './adapters/hooks.js';
-import { attentionQueue, prAlertKey } from './reduce.js';
+import { attentionQueue, prAlertKey, isRisky } from './reduce.js';
 import { liveAgents, orphanReason } from './reconcile.js';
 import { scanHistory, usageFor } from './transcripts.js';
 import { createGitHub } from './github.js';
@@ -73,12 +73,22 @@ function readBody(req) {
 
 // Resolves with stdout, or null on failure. `okCodes` lists non-zero exit
 // codes that still mean success (git diff --no-index exits 1 on a difference).
-const run = (cmd, args, { okCodes = [], ...opts } = {}) =>
-  new Promise((resolve) => {
-    execFile(cmd, args, { timeout: 5000, maxBuffer: 16 << 20, ...opts }, (err, out) =>
-      resolve(err && !okCodes.includes(err.code) ? null : out),
-    );
+// With a hundred sessions the hub would otherwise start a git process per
+// event; a small pool keeps it from starving the agents it is watching.
+const MAX_PROCS = 4;
+let procs = 0;
+const waiting = [];
+const slot = () => (procs < MAX_PROCS ? (procs += 1, Promise.resolve()) : new Promise((r) => waiting.push(r)));
+const free = () => { const next = waiting.shift(); if (next) next(); else procs -= 1; };
+const run = async (cmd, args, { okCodes = [], ...opts } = {}) => {
+  await slot();
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: 5000, maxBuffer: 16 << 20, ...opts }, (err, out) => {
+      free();
+      resolve(err && !okCodes.includes(err.code) ? null : out);
+    });
   });
+};
 const git = async (cwd, args) => (await run('git', ['-C', cwd, ...args]))?.trim() || null;
 
 export function createHub({
@@ -115,19 +125,47 @@ export function createHub({
     local: isLocal(s),
     reply: replyRoute(s),
   });
+  let rules = store.rules(); // global: [{ tool, detail }]
   const snapshot = () => {
     const sessions = store.list().filter((s) => !s.archived).map(view);
-    return { now: now(), sessions, queue: attentionQueue(sessions).map((s) => s.key) };
+    return { now: now(), sessions, queue: attentionQueue(sessions).map((s) => s.key), rules: rules.length };
   };
 
+  // Live updates are deltas: a client gets the full picture once, then only
+  // the sessions that changed since the last tick. With hundreds of sessions
+  // the full snapshot is hundreds of KB, and something changes many times a
+  // second.
   let pending = null;
-  const broadcast = () => {
+  const dirty = new Set();
+  const sent = new Map(); // key -> last JSON sent, to drop no-op updates
+  const TICK_MS = 120;
+  const broadcast = (s) => {
+    if (s?.key) dirty.add(s.key);
+    else for (const x of store.list()) dirty.add(x.key); // unknown scope: recheck all
     if (pending) return;
     pending = setTimeout(() => {
       pending = null;
-      const msg = `data: ${JSON.stringify(snapshot())}\n\n`;
+      const changed = [];
+      const removed = [];
+      for (const key of dirty) {
+        const x = store.get(key);
+        if (!x || x.archived) {
+          sent.delete(key);
+          removed.push(key);
+          continue;
+        }
+        const v = view(x);
+        const json = JSON.stringify(v);
+        if (sent.get(key) === json) continue;
+        sent.set(key, json);
+        changed.push(v);
+      }
+      dirty.clear();
+      if (!clients.size || (!changed.length && !removed.length)) return;
+      const live = store.list().filter((x) => !x.archived).map(view);
+      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live).map((x) => x.key), rules: rules.length })}\n\n`;
       for (const res of clients) res.write(msg);
-    }, 50);
+    }, TICK_MS);
   };
   store.onChange(broadcast);
   // A request answered somewhere else (in the terminal, or swept away by the
@@ -138,7 +176,7 @@ export function createHub({
     }
   });
   // Re-send periodically so "quiet" flags and timers stay honest without events.
-  const tick = setInterval(() => clients.size && broadcast(), 30_000);
+  const tick = setInterval(() => clients.size && broadcast(), 30_000); // rechecks "quiet" flags
   tick.unref();
 
   const emit = (s, type, data = {}) =>
@@ -226,7 +264,7 @@ export function createHub({
     held.delete(id);
     clearTimeout(h.timer);
     if (!h.res.writableEnded) json(h.res, 200, body);
-    broadcast();
+    broadcast({ key: h.key });
     return true;
   }
   function decide(id, decision, { message, remember, answers } = {}) {
@@ -256,8 +294,11 @@ export function createHub({
     event.data.request_id = id;
     const s = ingest([event]);
     if (!s) return json(res, 200, {});
-    if (event.data.tool && s.auto_allow.includes(event.data.tool)) {
-      emit(s, 'request.resolved', { id, decision: 'allow', by: 'rule' });
+    const asked = s.requests.find((r) => r.id === id);
+    const standing = asked && !asked.risky &&
+      rules.some((r) => r.tool === asked.tool && r.detail === asked.detail);
+    if ((event.data.tool && s.auto_allow.includes(event.data.tool)) || standing) {
+      emit(s, 'request.resolved', { id, decision: 'allow', by: standing ? 'standing rule' : 'rule' });
       return json(res, 200, decisionBody('allow'));
     }
     // Claude Code keeps showing its own prompt while the hook is pending and
@@ -270,8 +311,8 @@ export function createHub({
     timer.unref();
     held.set(id, { res, key: s.key, tool: event.data.tool || null, input: input || {}, timer, parallel });
     // The agent gave up on the hook (answered in its own UI, interrupted, died).
-    res.on('close', () => held.delete(id) && (clearTimeout(timer), broadcast()));
-    broadcast();
+    res.on('close', () => held.delete(id) && (clearTimeout(timer), broadcast({ key: s.key })));
+    broadcast({ key: s.key });
   }
   // Nobody is watching the board any more: hand open requests back.
   let orphanTimer = null;
@@ -542,6 +583,38 @@ export function createHub({
     }
     if (path === '/api/reconcile' && req.method === 'POST') {
       return json(res, 200, { lost: await reconcile(), settled: await settle() });
+    }
+
+    // Decide once, apply everywhere: the same request open in many sessions is
+    // answered in one call, optionally becoming a standing rule.
+    if (path === '/api/requests/batch' && req.method === 'POST') {
+      const { ids, decision: d, remember } = await body();
+      if (!Array.isArray(ids) || !['allow', 'deny'].includes(d)) return json(res, 400, { error: 'ids and decision (allow|deny) required' });
+      let rule = null;
+      if (remember && d === 'allow') {
+        const h = held.get(ids.find((id) => held.has(id)));
+        const r = h && store.get(h.key).requests.find((x) => held.get(x.id) === h);
+        if (r?.tool && r.detail && !r.risky) {
+          store.addRule(r.tool, r.detail, now());
+          rules = store.rules();
+          rule = { tool: r.tool, detail: r.detail };
+        }
+      }
+      const done = ids.filter((id) => decide(id, d)).length;
+      return json(res, 200, { decided: done, rule });
+    }
+    if (path === '/api/rules') {
+      if (req.method === 'GET') return json(res, 200, rules);
+      const { tool, detail } = await body();
+      if (typeof tool !== 'string' || typeof detail !== 'string') return json(res, 400, { error: 'tool and detail required' });
+      if (req.method === 'POST') {
+        if (isRisky(detail)) return json(res, 400, { error: 'this looks drastic; it must be approved each time' });
+        store.addRule(tool, detail, now());
+      } else if (req.method === 'DELETE') store.removeRule(tool, detail);
+      else return json(res, 405, { error: 'method not allowed' });
+      rules = store.rules();
+      broadcast();
+      return json(res, 200, rules);
     }
 
     const decision = path.match(/^\/api\/requests\/([^/]+)$/);

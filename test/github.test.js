@@ -23,8 +23,8 @@ test('with gh logged in, its answer is used and normalized', async () => {
     calls.push([cmd, ...args.slice(0, 2)].join(' '));
     if (args[0] === 'auth') return 'ok';
     return JSON.stringify([
-      { number: 7, state: 'MERGED', url: 'u7', title: 'old', isDraft: false, headRefOid: 'aaa', baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z', statusCheckRollup: [] },
-      { number: 9, state: 'OPEN', url: 'u9', title: 'new', isDraft: true, headRefOid: 'bbb', baseRefName: 'main', updatedAt: '2025-01-01T00:00:00Z',
+      { number: 7, state: 'MERGED', url: 'u7', title: 'old', isDraft: false, headRefName: 'feature', headRefOid: 'aaa', baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z', statusCheckRollup: [] },
+      { number: 9, state: 'OPEN', url: 'u9', title: 'new', isDraft: true, headRefName: 'feature', headRefOid: 'bbb', baseRefName: 'main', updatedAt: '2025-01-01T00:00:00Z',
         reviewDecision: 'CHANGES_REQUESTED',
         statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }, { status: 'IN_PROGRESS', conclusion: '' }, { state: 'SUCCESS' }] },
     ]);
@@ -35,12 +35,14 @@ test('with gh logged in, its answer is used and normalized', async () => {
   assert.deepEqual([pr.state, pr.draft, pr.checks, pr.review, pr.head_sha], ['open', true, 'pending', 'changes_requested', 'bbb']);
   await gh.findPr({ cwd: '/w', branch: 'feature' });
   assert.equal(calls.filter((c) => c.startsWith('gh auth')).length, 1, 'login is checked once, not per lookup');
+  assert.equal(calls.filter((c) => c.startsWith('gh pr')).length, 1, 'one listing serves every session in the repository');
 });
 
 test('without gh, the REST API answers: merged, checks, no PR, and failure', async () => {
   const seen = [];
   const exec = async (cmd, args) => (cmd === 'git' ? 'git@github.com:acme/shop-api.git\n' : null); // gh: not logged in
   const routes = {
+    '/repos/acme/shop-api/pulls?state=all&per_page=100&sort=updated&direction=desc': [],
     '/repos/acme/shop-api/pulls?head=acme%3Asquashed&state=all&per_page=5&sort=updated&direction=desc':
       [{ number: 3, html_url: 'h3', title: 'squashed', state: 'closed', merged_at: '2026-02-02T00:00:00Z', draft: false, head: { sha: 'tip' }, base: { ref: 'main' }, updated_at: '2026-02-02T00:00:00Z' }],
     '/repos/acme/shop-api/pulls?head=acme%3Aopen&state=all&per_page=5&sort=updated&direction=desc':

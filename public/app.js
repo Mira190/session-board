@@ -21,7 +21,8 @@ const call = async (path, body) => {
   return out;
 };
 
-let snap = { now: Date.now(), sessions: [], queue: [] };
+let snap = { now: Date.now(), sessions: [], queue: [], rules: 0 };
+const all = new Map(); // key -> session, kept current from the hub's deltas
 let skew = 0; // hub clock minus browser clock
 let selected = null; // session key shown in the workbench
 let pinned = false; // true once the human picked a session themselves
@@ -37,7 +38,7 @@ const prefs = {
   set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
 };
 
-const byKey = (key) => snap.sessions.find((s) => s.key === key);
+const byKey = (key) => all.get(key);
 
 function age(ts) {
   const s = Math.max(0, Math.round((Date.now() + skew - ts) / 1000));
@@ -184,59 +185,174 @@ function copy(text, button) {
 }
 
 // ------------------------------------------------------------------ lists --
+// Built for hundreds of sessions: cards are keyed and only the ones whose
+// content changed are rebuilt; the groups that need nothing from you fold
+// into a per-project summary; identical requests are offered as one decision.
 
 const GROUPS = [
-  ['attention', '等你回应', '权限、提问、失败、失联。越靠上越该先处理。'],
+  ['attention', '等你回应', '权限、提问、失败、失联、PR 出问题。越靠上越该先处理。'],
   ['review', '待验收', 'agent 说做完了，你还没看。'],
   ['working', '工作中', '不需要你，除非它安静太久。'],
   ['rest', '空闲 / 已结束', '等你派下一件事，或已退出。'],
 ];
+const MANY = 30; // past this many sessions, quiet groups start folded
+
+let filter = '';
+const repoOf = (s) => s.repo || (s.cwd || '').split('/').pop() || '(未知项目)';
+const matches = (s) => !filter ||
+  [s.title, s.repo, s.cwd, s.host, s.agent, s.branch].filter(Boolean).join(' ').toLowerCase().includes(filter);
+const visible = () => (filter ? snap.sessions.filter(matches) : snap.sessions);
+const folded = (name) => {
+  const saved = prefs.get(`fold:${name}`);
+  if (saved) return saved === '1';
+  return (name === 'working' || name === 'rest') && snap.sessions.length > MANY;
+};
+
+// Move/insert only what differs, so focus and scroll survive live updates.
+function reconcile(container, items) {
+  const old = new Map();
+  for (const n of container.children) old.set(n.dataset.key, n);
+  const nodes = items.map((it) => {
+    const have = old.get(it.key);
+    if (have && have.dataset.sig === it.sig) return have;
+    const fresh = it.make();
+    fresh.dataset.key = it.key;
+    fresh.dataset.sig = it.sig;
+    if (have && have === document.activeElement) queueMicrotask(() => fresh.focus());
+    return fresh;
+  });
+  nodes.forEach((n, i) => { if (container.children[i] !== n) container.insertBefore(n, container.children[i] || null); });
+  while (container.children.length > nodes.length) container.lastChild.remove();
+}
+
+const ageSpan = (s, d) => el('span', {
+  className: 'age', dataset: { since: s.since, verb: d.verb }, textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前`,
+});
+function tickAges() {
+  for (const n of document.querySelectorAll('.age[data-since]')) {
+    const since = Number(n.dataset.since);
+    n.textContent = n.dataset.verb ? `${n.dataset.verb} ${age(since)}` : `${age(since)}前`;
+  }
+}
+
+const cardSig = (s) => JSON.stringify([
+  s.state, s.since, s.title, s.host, s.repo, s.cwd, s.branch, s.runtime, s.agent, s.subagents, s.requests.length,
+  s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
+  s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
+  s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
+]);
 
 function card(s) {
   const d = describe(s);
   return el('button', {
       className: 'card', type: 'button', onclick: () => select(s.key, true),
-      dataset: { key: s.key, tone: d.tone }, ariaCurrent: s.key === selected ? 'true' : 'false',
+      dataset: { tone: d.tone }, ariaCurrent: s.key === selected ? 'true' : 'false',
     },
     el('div', { className: 'meta' },
       el('span', { className: `badge ${s.agent}`, textContent: agentName(s) }),
       el('span', { className: 'where', textContent: where(s) }),
-      s.runtime === 'cloud' && el('span', { textContent: '☁ 云端' }),
+      s.runtime === 'cloud' && el('span', { textContent: '云端' }),
       s.subagents > 0 && el('span', { textContent: `${s.subagents} 个子 agent` }),
     ),
     el('div', { className: 'title', textContent: s.title || '(还没有任务描述)' }),
     el('div', { className: 'status' },
       el('span', { className: 'what', textContent: d.what + (s.requests.length > 1 ? `（共 ${s.requests.length} 个请求）` : '') }),
-      el('span', { className: 'age', textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前` }),
+      ageSpan(s, d),
     ),
+    s.waiting?.risky && el('div', { className: 'warn', textContent: '高风险命令，请单独确认' }),
     d.detail && el('div', { className: 'peek', textContent: d.detail.split('\n')[0] }),
     s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
-    s.quiet && el('div', { className: 'warn', textContent: `${age(s.last_event_ts)} 没有任何动静` }),
+    s.quiet && el('div', { className: 'warn', textContent: '超过 10 分钟没有任何动静' }),
   );
+}
+
+// The same permission request open in several sessions: one decision for all.
+// Drastic-looking commands are never batched.
+function batches(sessions) {
+  const groups = new Map();
+  for (const s of sessions) {
+    const w = s.waiting;
+    if (s.state !== 'needs_input' || w?.kind !== 'permission' || !w.decidable || w.risky || !w.tool || !w.detail) continue;
+    const k = `${w.tool}\n${w.detail}`;
+    (groups.get(k) || groups.set(k, []).get(k)).push(s);
+  }
+  return [...groups.values()].filter((g) => g.length > 1).sort((a, b) => b.length - a.length);
+}
+
+async function decideBatch(group, decision, remember = false) {
+  try {
+    const out = await call('/api/requests/batch', { ids: group.map((s) => s.waiting.id), decision, remember });
+    pinned = false;
+    say(selected, out.rule ? `已处理 ${out.decided} 个，以后这条命令自动允许。` : `已处理 ${out.decided} 个。`);
+  } catch (err) {
+    say(selected, err.message);
+  }
+}
+
+function batchCard(group) {
+  const w = group[0].waiting;
+  const repos = [...new Set(group.map(repoOf))];
+  return el('div', { className: 'card batch', dataset: { tone: 'urgent' } },
+    el('div', { className: 'status' }, el('span', { className: 'what', textContent: `${group.length} 个会话在请求同一件事：${w.tool}` })),
+    el('div', { className: 'peek code', textContent: w.detail.split('\n')[0] }),
+    el('div', { className: 'meta', textContent: repos.slice(0, 4).join('、') + (repos.length > 4 ? ` 等 ${repos.length} 个项目` : '') }),
+    el('div', { className: 'actions' },
+      el('button', { className: 'primary', textContent: `全部允许（${group.length}）`, onclick: () => decideBatch(group, 'allow') }),
+      el('button', { textContent: '全部允许，以后也自动允许', title: '只对完全相同的这条命令生效，可在“自动规则”里撤销', onclick: () => decideBatch(group, 'allow', true) }),
+      el('button', { className: 'danger', textContent: '全部拒绝', onclick: () => decideBatch(group, 'deny') }),
+    ));
 }
 
 function grouped() {
   const rank = new Map(snap.queue.map((k, i) => [k, i]));
   const groups = { attention: [], review: [], working: [], rest: [] };
-  for (const s of snap.sessions) groups[column(s)].push(s);
-  groups.attention.sort((a, b) => rank.get(a.key) - rank.get(b.key));
+  for (const s of visible()) groups[column(s)].push(s);
+  groups.attention.sort((a, b) => (rank.get(a.key) ?? 1e9) - (rank.get(b.key) ?? 1e9));
   groups.review.sort((a, b) => a.since - b.since);
   groups.working.sort((a, b) => Number(b.quiet) - Number(a.quiet) || a.since - b.since);
   groups.rest.sort((a, b) => b.last_event_ts - a.last_event_ts);
   return groups;
 }
 
+const rollup = (list) => {
+  const by = new Map();
+  for (const s of list) by.set(repoOf(s), (by.get(repoOf(s)) || 0) + 1);
+  const top = [...by].sort((a, b) => b[1] - a[1]);
+  return top.slice(0, 8).map(([r, n]) => `${r} ${n}`).join(' · ') + (top.length > 8 ? ` · 另有 ${top.length - 8} 个项目` : '');
+};
+
 function renderLists(groups) {
-  const focused = document.activeElement?.dataset?.key;
-  $('#lists').replaceChildren(...GROUPS.map(([name, label, hint]) =>
-    el('div', { className: 'group', dataset: { col: name } },
-      el('h2', {}, label, el('span', { className: 'count', textContent: groups[name].length || '' })),
-      el('p', { className: 'hint', textContent: hint }),
-      el('div', { className: 'cards' },
-        groups[name].length ? groups[name].map(card)
-          : el('div', { className: 'empty', textContent: name === 'attention' ? '没有人在等你。' : '—' })),
-    )));
-  if (focused) $(`.card[data-key="${CSS.escape(focused)}"]`)?.focus();
+  const lists = $('#lists');
+  if (!lists.children.length) {
+    lists.replaceChildren(...GROUPS.map(([name, label, hint]) =>
+      el('div', { className: 'group', dataset: { col: name } },
+        el('h2', {}, el('button', {
+          className: 'fold', type: 'button', onclick: () => { prefs.set(`fold:${name}`, folded(name) ? '0' : '1'); render(); },
+        }, el('span', { className: 'caret' }), label, el('span', { className: 'count' }))),
+        el('p', { className: 'hint', textContent: hint }),
+        el('p', { className: 'rollup' }),
+        el('div', { className: 'cards' }))));
+  }
+  for (const [name] of GROUPS) {
+    const sec = $(`.group[data-col="${name}"]`, lists);
+    const list = groups[name];
+    const fold = folded(name) && list.length > 0;
+    sec.dataset.folded = String(fold);
+    $('.count', sec).textContent = list.length || '';
+    $('.fold', sec).setAttribute('aria-expanded', String(!fold));
+    $('.rollup', sec).textContent = fold ? rollup(list) : '';
+    const items = fold ? [] : list.map((s) => ({ key: s.key, sig: cardSig(s), make: () => card(s) }));
+    if (name === 'attention' && !fold) {
+      items.unshift(...batches(list).map((g) => ({
+        key: `batch:${g[0].waiting.tool}:${g[0].waiting.detail}`, sig: g.map((s) => s.waiting.id).join(','), make: () => batchCard(g),
+      })));
+    }
+    if (!items.length && !fold) {
+      items.push({ key: 'empty', sig: `${name}:${filter}`, make: () => el('div', {
+        className: 'empty', textContent: filter ? '没有匹配的会话。' : name === 'attention' ? '没有人在等你。' : '—' }) });
+    }
+    reconcile($('.cards', sec), items);
+  }
 }
 
 // ----------------------------------------------------------------- office --
@@ -244,9 +360,11 @@ function renderLists(groups) {
 //   at its own desk        -> working / idle (nothing for you to do)
 //   queued at your desk    -> needs you; the queue order is the attention order
 //   paper in your in-tray  -> finished, waiting for review
-// Agent nodes are kept between renders so a state change shows as a walk.
+// Desks are grouped into one room per project. Past a couple of dozen
+// sessions the desks shrink to a compact grid: you read the rooms' totals and
+// the queue, not a hundred nameplates.
 
-const SPRITE = `<svg width="44" height="52" viewBox="0 0 22 26" aria-hidden="true">
+const SPRITE = `<svg viewBox="0 0 22 26" aria-hidden="true">
   <rect x="10" y="0" width="2" height="3" fill="#8a8f96"/><rect x="9" y="0" width="4" height="1" fill="#8a8f96"/>
   <rect x="5" y="3" width="12" height="9" fill="#d5d8dc"/><rect x="6" y="5" width="10" height="4" fill="#2b2f36"/>
   <rect class="eye" x="8" y="6" width="2" height="2"/><rect class="eye" x="12" y="6" width="2" height="2"/>
@@ -254,7 +372,7 @@ const SPRITE = `<svg width="44" height="52" viewBox="0 0 22 26" aria-hidden="tru
   <rect class="body arm-l" x="2" y="14" width="2" height="6"/><rect class="body arm-r" x="18" y="14" width="2" height="6"/>
   <rect class="leg-l" x="6" y="21" width="4" height="5" fill="#4a4e55"/><rect class="leg-r" x="12" y="21" width="4" height="5" fill="#4a4e55"/>
 </svg>`;
-const DESK = `<svg width="120" height="64" viewBox="0 0 60 32" aria-hidden="true">
+const DESK = `<svg viewBox="0 0 60 32" aria-hidden="true">
   <g class="smoke" fill="#8a8f96"><rect x="27" y="0" width="3" height="3"/><rect x="31" y="3" width="2" height="2"/></g>
   <rect x="20" y="6" width="20" height="13" fill="#5b6068"/><rect class="screen" x="22" y="8" width="16" height="9"/>
   <rect x="28" y="19" width="4" height="3" fill="#5b6068"/>
@@ -265,9 +383,13 @@ const MY_DESK = `<svg width="150" height="70" viewBox="0 0 75 35" aria-hidden="t
   <rect x="48" y="6" width="22" height="8" fill="none" stroke="#5b6068" stroke-width="2"/>
 </svg>`;
 
-const CELL = { w: 150, h: 128 };
+const ROOMY = { w: 150, h: 128, seat: { x: 4, y: 2 } };
+const COMPACT = { w: 62, h: 52, seat: { x: 0, y: 4 } };
+const COMPACT_OVER = 16; // more sessions than this: compact desks
+const ROOM = { head: 26, pad: 8, gap: 12 };
 const LOBBY = 150; // height of the strip in front of your desk
-const QUEUE = { w: 84, h: 104 }; // one standing place in the queue
+const QUEUE = { w: 84, h: 114 }; // one standing place in the queue
+const QUEUE_ROWS = 2; // the queue never takes more rows than this
 const agentNodes = new Map();
 
 const bubbleFor = (s) => {
@@ -280,60 +402,117 @@ const bubbleFor = (s) => {
 function renderOffice() {
   const office = $('#office');
   const floor = $('.floor', office);
-  const present = snap.sessions.filter((s) => s.state !== 'ended').sort((a, b) => a.created_ts - b.created_ts);
+  const present = visible().filter((s) => s.state !== 'ended');
   const width = Math.max(320, office.clientWidth - 38);
-  const cols = Math.max(2, Math.floor((width - 16) / CELL.w));
-  const rows = Math.max(1, Math.ceil(present.length / cols));
-  const deskTop = 26;
-  const lobbyTop = deskTop + rows * CELL.h + 8;
-  // The queue stands beside your desk, wrapping into more rows when the room
-  // is narrow; on a phone it forms up above the desk instead.
-  const queue = snap.queue.map(byKey).filter((s) => s && column(s) === 'attention');
-  const queued = new Map(queue.map((s, i) => [s.key, i]));
+  const compact = present.length > COMPACT_OVER;
+  const cell = compact ? COMPACT : ROOMY;
+  floor.classList.toggle('compact', compact);
+
+  // Rooms: one per project, biggest first, packed left to right.
+  const byRepo = new Map();
+  for (const s of present) (byRepo.get(repoOf(s)) || byRepo.set(repoOf(s), []).get(repoOf(s))).push(s);
+  const rooms = [...byRepo].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  const maxCols = Math.max(2, Math.floor((width - 16 - 2 * ROOM.pad) / cell.w));
+  const seat = new Map();
+  const desks = [];
+  const roomBoxes = [];
+  let x = 12;
+  let y = 12;
+  let rowH = 0;
+  for (const [repo, list] of rooms) {
+    list.sort((a, b) => a.created_ts - b.created_ts);
+    const cols = Math.min(maxCols, Math.max(compact ? 3 : 1, Math.ceil(Math.sqrt(list.length * (compact ? 2.2 : 1.6)))));
+    const rows = Math.ceil(list.length / cols);
+    const w = cols * cell.w + 2 * ROOM.pad;
+    const h = ROOM.head + rows * cell.h + ROOM.pad;
+    if (x > 12 && x + w > width) { x = 12; y += rowH + ROOM.gap; rowH = 0; }
+    const n = (col) => list.filter((s) => column(s) === col).length;
+    roomBoxes.push({ repo, x, y, w, h, wait: n('attention'), review: n('review'), work: n('working'), total: list.length });
+    list.forEach((s, i) => {
+      const dx = x + ROOM.pad + (i % cols) * cell.w;
+      const dy = y + ROOM.head + Math.floor(i / cols) * cell.h;
+      seat.set(s.key, { x: dx + cell.seat.x, y: dy + cell.seat.y });
+      desks.push({ s, x: dx, y: dy });
+    });
+    x += w + ROOM.gap;
+    rowH = Math.max(rowH, h);
+  }
+  const lobbyTop = y + rowH + 14;
+
+  // The queue stands beside your desk, wraps when the room is narrow (on a
+  // phone it forms up above the desk), and is capped: beyond the cap, agents
+  // wait at their desks with a flag and the queue ends in "+N".
+  const queue = snap.queue.map(byKey).filter((s) => s && column(s) === 'attention' && matches(s));
   const narrow = width < 560;
-  const queueX = narrow ? 34 : 236;
+  const queueX = narrow ? 34 : 300;
   const perRow = Math.max(1, Math.floor((width - queueX - 8) / QUEUE.w));
-  const queueRows = Math.max(1, Math.ceil(queue.length / perRow));
+  const cap = perRow * QUEUE_ROWS - (queue.length > perRow * QUEUE_ROWS ? 1 : 0);
+  const queued = new Map(queue.slice(0, cap).map((s, i) => [s.key, i]));
+  const overflow = queue.length - queued.size;
+  const queueRows = Math.max(1, Math.ceil((queued.size + (overflow ? 1 : 0)) / perRow));
   const lobby = LOBBY + (queueRows - 1) * QUEUE.h + (narrow && queue.length ? QUEUE.h + 30 : 0);
-  const height = Math.max(lobbyTop + lobby, Math.min(office.clientHeight - 60, lobbyTop + lobby + 90));
+  // Your desk and the queue go at the top: with a hundred desks below, the one
+  // part of the room that needs you must not be a scroll away.
+  for (const r of roomBoxes) r.y += lobby;
+  for (const d of desks) d.y += lobby;
+  for (const p of seat.values()) p.y += lobby;
+  const height = Math.max(lobbyTop + lobby, office.clientHeight - 60);
   floor.style.height = `${height}px`;
-  const myY = height - 92;
+  const myY = lobby - 92;
   const queueSlot = (q) => ({
     x: queueX + (q % perRow) * QUEUE.w,
     y: myY - 2 - (narrow ? QUEUE.h : 0) - (queueRows - 1 - Math.floor(q / perRow)) * QUEUE.h,
   });
-  const seat = new Map();
-  $('.desks', floor).replaceChildren(
-    el('div', { className: 'zone', style: `top:${height - lobby}px;height:${lobby}px` }),
-    el('div', { className: 'zone-label', style: `left:14px;top:6px`, textContent: '工位' }),
-    el('div', { className: 'zone-label', style: `left:14px;top:${height - lobby + 6}px`, textContent: '你的桌前：排队等你的' }),
-    ...present.map((s, i) => {
-      const x = 12 + (i % cols) * CELL.w;
-      const y = deskTop + Math.floor(i / cols) * CELL.h;
-      seat.set(s.key, { x: x + 4, y: y + 2 }); // standing behind the desk, beside the monitor
-      const d = describe(s);
-      const node = el('button', {
-          className: 'desk', type: 'button', style: `left:${x}px;top:${y}px`, title: `${s.title || s.session_id}：${d.what}`,
-          dataset: { state: s.state, away: String(queued.has(s.key)) }, onclick: () => select(s.key, true),
-        },
-        s.state === 'review' ? el('span', { className: 'flag', textContent: '做完了' })
-          : s.quiet ? el('span', { className: 'flag quiet', textContent: `${age(s.last_event_ts)}没动静` })
-            : s.subagents > 0 ? el('span', { className: 'flag', textContent: `+${s.subagents} 帮手` }) : null,
-      );
-      node.insertAdjacentHTML('beforeend', DESK);
-      node.append(el('span', { className: 'plate' }, s.title || '(还没有任务)',
-        el('small', { textContent: [s.runtime === 'cloud' ? '云端' : null, agentName(s), s.repo || (s.cwd || '').split('/').pop()].filter(Boolean).join(' · ') })));
-      return node;
+  const waitingAtDesk = new Set(queue.slice(cap).map((s) => s.key));
+
+  // Static scenery: rooms, the lobby, labels.
+  const more = overflow ? queueSlot(queued.size) : null;
+  $('.scene', floor).replaceChildren(...[
+    el('div', { className: 'zone', style: `top:0;height:${lobby}px` }),
+    el('div', { className: 'zone-label', style: 'left:14px;top:6px', textContent: '你的桌前：排队等你的' }),
+    ...roomBoxes.map((r) => el('div', { className: 'room', style: `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px` },
+      el('div', { className: 'room-label' },
+        el('b', { textContent: r.repo }),
+        r.wait > 0 && el('span', { className: 'n wait', textContent: `${r.wait} 等你` }),
+        r.review > 0 && el('span', { className: 'n review', textContent: `${r.review} 待验收` }),
+        el('span', { className: 'n', textContent: `${r.work}/${r.total} 在干活` })))),
+    more && el('button', {
+      className: 'queue-more', type: 'button', style: `left:${more.x}px;top:${more.y + 6}px`,
+      textContent: `+${overflow}`, title: `还有 ${overflow} 个在等你，在各自工位上举着牌子`, onclick: () => setView('inbox'),
     }),
-    ...(present.length ? [] : [el('div', { className: 'empty-office', textContent: '办公室里还没有人。启动任意一个 Claude Code 或 Codex 会话，它会自己走进来。' })]),
-  );
+    !present.length && el('div', { className: 'empty-office', textContent: filter ? '没有匹配的会话。' : '办公室里还没有人。启动任意一个 Claude Code 或 Codex 会话，它会自己走进来。' }),
+  ].filter(Boolean));
+
+  // Desks, keyed so that only changed ones are rebuilt.
+  reconcile($('.desks', floor), desks.map(({ s, x: dx, y: dy }) => {
+    const d = describe(s);
+    const flag = waitingAtDesk.has(s.key) ? ['wait', '!'] : s.state === 'review' ? ['done', compact ? '✓' : '做完了']
+      : s.quiet ? ['quiet', compact ? '…' : '很久没动静'] : !compact && s.subagents > 0 ? ['', `+${s.subagents} 帮手`] : null;
+    return {
+      key: s.key,
+      sig: JSON.stringify([dx, dy, compact, s.state, queued.has(s.key), flag, s.title, s.agent, s.repo, s.runtime, d.what]),
+      make: () => {
+        const node = el('button', {
+            className: 'desk', type: 'button', style: `left:${dx}px;top:${dy}px`, title: `${s.title || s.session_id}：${d.what}`,
+            dataset: { state: s.state, away: String(queued.has(s.key)) }, onclick: () => select(s.key, true),
+          },
+          flag && el('span', { className: `flag ${flag[0]}`, textContent: flag[1] }));
+        node.insertAdjacentHTML('beforeend', DESK);
+        if (!compact) {
+          node.append(el('span', { className: 'plate' }, s.title || '(还没有任务)',
+            el('small', { textContent: [s.runtime === 'cloud' ? '云端' : null, agentName(s)].filter(Boolean).join(' · ') })));
+        }
+        return node;
+      },
+    };
+  }));
 
   // Your desk, with the in-tray of finished work.
   const reviews = present.filter((s) => s.state === 'review').sort((a, b) => a.since - b.since);
   const you = $('.you', floor);
   you.style.cssText = `left:18px;top:${myY}px`;
   you.innerHTML = MY_DESK;
-  you.append(
+  you.append(...[
     el('div', { className: 'plate', textContent: '你' }),
     el('div', { className: 'tray', style: 'left:96px;bottom:54px' },
       reviews.slice(0, 5).map((s) => el('button', {
@@ -342,7 +521,7 @@ function renderOffice() {
       })),
       reviews.length > 5 && el('span', { className: 'paper more', textContent: `+${reviews.length - 5}` })),
     reviews.length > 0 && el('div', { className: 'tray-label', style: 'left:96px;bottom:86px', textContent: `待验收 ${reviews.length}` }),
-  );
+  ].filter(Boolean));
 
   // Agents: kept across renders so moving between desk and queue animates.
   const layer = $('.agents', floor);
@@ -370,12 +549,14 @@ function renderOffice() {
       node.classList.add('walking');
       node.style.transform = target;
     }
-    Object.assign(node.dataset, { agent: s.agent, tone: d.tone, state: s.state, queued: String(q !== undefined) });
+    const sig = [s.agent, d.tone, s.state, q !== undefined, compact && q === undefined, s.key === selected, s.title, d.what, bubbleFor(s), s.since].join('|');
+    if (node.dataset.sig === sig) continue;
+    Object.assign(node.dataset, { sig, agent: s.agent, tone: d.tone, state: s.state, queued: String(q !== undefined), small: String(compact && q === undefined) });
     node.setAttribute('aria-current', String(s.key === selected));
     node.setAttribute('aria-label', `${agentName(s)}：${s.title || s.session_id}，${d.what}`);
     node.title = `${s.title || s.session_id}：${d.what}`;
-    const label = bubbleFor(s);
-    $('.bubble', node).replaceChildren(...(label ? [label, el('small', { textContent: `等了 ${age(s.since)}` })] : []));
+    const label = q === undefined ? null : bubbleFor(s);
+    $('.bubble', node).replaceChildren(...(label ? [label, el('small', { className: 'age', dataset: { since: s.since, verb: '等了' }, textContent: `等了 ${age(s.since)}` })] : []));
     $('.tag', node).textContent = s.title || s.session_id;
   }
 }
@@ -575,7 +756,7 @@ async function loadExtra(s) {
     call(`/api/sessions/${key}/events`).catch(() => null),
   ]);
   extra.set(s.key, { sig, diff, events });
-  if (selected === s.key) renderBench();
+  if (selected === s.key) render();
 }
 
 function select(key, byHuman) {
@@ -588,7 +769,13 @@ function select(key, byHuman) {
   $(`.card[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: 'nearest' });
 }
 
+let frame = 0;
 function render() {
+  if (frame) return;
+  frame = requestAnimationFrame(() => { frame = 0; paint(); });
+}
+
+function paint() {
   // Follow the queue until the human picks something; never yank a session
   // they chose out from under them.
   const current = byKey(selected);
@@ -597,24 +784,29 @@ function render() {
     if (!current) pinned = false;
   }
   const groups = grouped();
-  renderLists(groups);
-  if ($('#app').dataset.view === 'office') renderOffice();
-  renderBench();
+  const office = $('#app').dataset.view === 'office';
+  if (office) renderOffice(); else renderLists(groups);
   const s = byKey(selected);
+  // The workbench is rebuilt only when what it shows has changed.
+  const more = extra.get(selected) || {};
+  const benchSig = JSON.stringify([s, more.sig, !!more.diff, !!more.events, notice, scopes.get(selected), snap.sessions.length > 0]);
+  if (benchSig !== paint.bench) { paint.bench = benchSig; renderBench(); }
   if (s) loadExtra(s);
 
-  const n = groups.attention.length;
+  const count = { attention: 0, review: 0, working: 0 };
+  for (const x of snap.sessions) if (column(x) in count) count[column(x)] += 1;
   $('#summary').replaceChildren(
-    ...(n ? [el('b', { textContent: `${n} 个会话在等你` }), '，'] : ['没有会话在等你，']),
-    `${groups.review.length} 个待验收，${groups.working.length} 个在工作`,
+    ...(count.attention ? [el('b', { textContent: `${count.attention} 个会话在等你` }), '，'] : ['没有会话在等你，']),
+    `${count.review} 个待验收，${count.working} 个在工作`, filter ? `（筛选后显示 ${visible().length} / ${snap.sessions.length}）` : '',
   );
-  document.title = `${n ? `(${n}) ` : ''}Session Board`;
+  $('#rules').textContent = `自动规则 ${snap.rules || 0}`;
+  document.title = `${count.attention ? `(${count.attention}) ` : ''}Session Board`;
 }
 
 // ---------------------------------------------------------- notifications --
 
-function alertNew() {
-  for (const s of snap.sessions) {
+function alertNew(sessions) {
+  for (const s of sessions) {
     const sig = `${s.state}:${s.waiting?.kind || ''}:${s.since}`;
     const before = seen.get(s.key);
     seen.set(s.key, sig);
@@ -654,7 +846,7 @@ function setView(view) {
   $('#view-board').setAttribute('aria-pressed', String(view === 'board'));
   $('#view-office').setAttribute('aria-pressed', String(view === 'office'));
   prefs.set('view', view);
-  if (view === 'office') renderOffice();
+  render();
 }
 
 function connect() {
@@ -663,9 +855,17 @@ function connect() {
   es.onopen = () => { conn.textContent = '实时'; conn.className = 'conn ok'; };
   es.onerror = () => { conn.textContent = '断开，重连中…'; conn.className = 'conn bad'; };
   es.onmessage = (m) => {
-    snap = JSON.parse(m.data);
+    const msg = JSON.parse(m.data);
+    if (msg.sessions) { // full picture, on (re)connect
+      all.clear();
+      for (const s of msg.sessions) all.set(s.key, s);
+    } else { // delta
+      for (const s of msg.changed) all.set(s.key, s);
+      for (const key of msg.removed) all.delete(key);
+    }
+    snap = { now: msg.now, sessions: [...all.values()], queue: msg.queue, rules: msg.rules };
     skew = snap.now - Date.now();
-    alertNew();
+    alertNew(msg.sessions ? snap.sessions : msg.changed);
     render();
   };
 }
@@ -673,7 +873,7 @@ function connect() {
 $('#view-inbox').onclick = () => setView('inbox');
 $('#view-board').onclick = () => setView('board');
 $('#view-office').onclick = () => setView('office');
-addEventListener('resize', () => $('#app').dataset.view === 'office' && renderOffice());
+addEventListener('resize', render);
 $('#backfill').onclick = async (e) => {
   const button = e.currentTarget;
   button.disabled = true;
@@ -687,9 +887,11 @@ $('#backfill').onclick = async (e) => {
 };
 
 document.addEventListener('keydown', (e) => {
-  if (e.target.matches('input[type="text"], textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'Escape' && e.target.id === 'filter') { e.target.value = ''; filter = ''; e.target.blur(); return render(); }
+  if (e.target.matches('input[type="text"], input[type="search"], textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
   const s = byKey(selected);
   const k = e.key.toLowerCase();
+  if (k === '/') { e.preventDefault(); return $('#filter').focus(); }
   if (k === 'n') {
     if (!snap.queue.length) return;
     const i = snap.queue.indexOf(selected);
@@ -701,6 +903,24 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'e' && (['review', 'failed', 'unknown'].includes(s.state) || s.waiting?.kind === 'pr')) ack(s);
   else if (k === 'r' && $('#reply')) { e.preventDefault(); $('#reply').focus(); }
 });
+
+$('#filter').oninput = (e) => { filter = e.target.value.trim().toLowerCase(); render(); };
+
+// Standing rules: commands that are approved automatically in every session.
+$('#rules').onclick = async () => {
+  const dialog = $('#rules-dialog');
+  const show = (rules) => $('article', dialog).replaceChildren(
+    el('h3', { textContent: '自动规则' }),
+    el('p', { className: 'note', textContent: '任何会话请求完全相同的命令时自动允许。在“全部允许，以后也自动允许”时创建；看起来高风险的命令不能设为规则。' }),
+    rules.length ? el('ul', { className: 'rules' }, rules.map((r) => el('li', {},
+      el('code', { textContent: `${r.tool}: ${r.detail}` }),
+      el('button', { textContent: '撤销', onclick: async () => show(await fetch(api('/api/rules'), {
+        method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(r) }).then((x) => x.json())) }))))
+      : el('p', { className: 'empty', textContent: '还没有规则。' }),
+    el('div', { className: 'actions' }, el('button', { textContent: '关闭', onclick: () => dialog.close() })));
+  show(await call('/api/rules'));
+  dialog.showModal();
+};
 
 for (const id of ['notify', 'sound']) {
   const box = $(`#${id}`);
@@ -714,5 +934,5 @@ for (const id of ['notify', 'sound']) {
   };
 }
 setView(['board', 'office'].includes(prefs.get('view')) ? prefs.get('view') : 'inbox');
-setInterval(() => { if (!document.activeElement?.matches('input[type="text"], textarea')) render(); }, 5000); // keep timers ticking
+setInterval(tickAges, 5000); // waiting timers tick without re-rendering anything // keep timers ticking
 connect();
