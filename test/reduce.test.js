@@ -35,7 +35,8 @@ test('permission wait survives parallel tool calls and keeps its start time', ()
   ]);
   const since = s.since;
   assert.equal(s.state, 'needs_input');
-  assert.deepEqual(s.waiting, { kind: 'permission', tool: 'Bash', detail: 'rm -rf build' });
+  assert.deepEqual(s.waiting, { id: null, kind: 'permission', tool: 'Bash', detail: 'rm -rf build' });
+  assert.equal(s.requests.length, 1, 'PreToolUse + PermissionRequest + Notification are one request');
   s = run('claude', 'b', [
     ['Notification', { notification_type: 'permission_prompt', message: 'Claude needs your permission' }],
     ['PreToolUse', { tool_name: 'Read', tool_input: { file_path: 'x' } }],
@@ -47,6 +48,41 @@ test('permission wait survives parallel tool calls and keeps its start time', ()
   s = run('claude', 'b', [['PostToolUse', { tool_name: 'Bash' }]], s);
   assert.equal(s.state, 'working');
   assert.equal(s.waiting, null);
+});
+
+test('several open requests queue up and resolve one by one, oldest shown first', () => {
+  const ev = (type, data) => ({ ts: (clock += 1000), agent: 'claude', session_id: 'q', type, data });
+  let s = [
+    ev('prompt.submitted', { prompt: 'go' }),
+    ev('permission.requested', { tool: 'Bash', input: { command: 'make' }, request_id: 'r1' }),
+    ev('permission.requested', { tool: 'Write', input: { file_path: 'a.md' }, request_id: 'r2' }),
+  ].reduce(reduce, undefined);
+  const since = s.since;
+  assert.equal(s.requests.length, 2);
+  assert.equal(s.waiting.id, 'r1');
+  s = reduce(s, ev('request.resolved', { id: 'r1', decision: 'allow', by: 'human' }));
+  assert.equal(s.state, 'needs_input');
+  assert.equal(s.waiting.id, 'r2');
+  assert.ok(s.since > since, 'the wait clock belongs to the request now shown');
+  s = reduce(s, ev('request.resolved', { id: 'r2', decision: 'deny', by: 'human' }));
+  assert.equal(s.state, 'working', 'resolving the last request falls back to the lifecycle phase');
+  s = reduce(s, ev('rule.added', { tool: 'Bash' }));
+  assert.deepEqual(s.auto_allow, ['Bash']);
+});
+
+test('lost sessions become unknown; imports are history; any real event revives', () => {
+  const ev = (type, data = {}) => ({ ts: (clock += 1000), agent: 'codex', session_id: 'l', type, data });
+  let s = [ev('prompt.submitted', { prompt: 'go' }), ev('session.lost', { reason: 'no codex process' })].reduce(reduce, undefined);
+  assert.equal(s.state, 'unknown');
+  assert.equal(s.error, 'no codex process');
+  s = reduce(s, ev('tool.started', { tool: 'shell' }));
+  assert.equal(s.state, 'working');
+  let h = reduce(undefined, { ...ev('session.imported', { title: 'old work', turns: 3, branch: 'main' }), session_id: 'h' });
+  assert.equal(h.state, 'ended');
+  assert.equal(h.imported, true);
+  assert.equal(h.turns, 3);
+  h = reduce(h, { ...ev('prompt.submitted', { prompt: 'again' }), session_id: 'h' });
+  assert.equal(h.imported, false);
 });
 
 test('AskUserQuestion is a question, a failed turn is a failure', () => {
@@ -93,8 +129,9 @@ test('attention queue: permission, question, failure, review; oldest first', () 
     mk('question', 'needs_input', 3, 'question'),
     mk('perm-new', 'needs_input', 9, 'permission'),
     mk('perm-old', 'needs_input', 4, 'permission'),
+    mk('gone', 'unknown', 5),
     mk('busy', 'working', 0),
     { ...mk('hidden', 'review', 0), archived: true },
   ]).map((s) => s.key);
-  assert.deepEqual(q, ['perm-old', 'perm-new', 'question', 'fail', 'review-old']);
+  assert.deepEqual(q, ['perm-old', 'perm-new', 'question', 'fail', 'gone', 'review-old']);
 });

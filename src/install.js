@@ -8,6 +8,9 @@ import { CLAUDE_EVENTS, CODEX_EVENTS } from './adapters/hooks.js';
 
 const BIN = fileURLToPath(new URL('../bin/session-board.js', import.meta.url));
 const MARK = 'session-board';
+// A permission request waits for the human; everything else must be instant.
+const WAIT_S = 600;
+const QUICK_S = 5;
 
 export const configPath = (agent) =>
   agent === 'claude'
@@ -15,7 +18,7 @@ export const configPath = (agent) =>
     : join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'hooks.json');
 
 const isOurs = (h) =>
-  (typeof h.url === 'string' && h.url.includes('/ingest/')) && h.url.includes(`board=${MARK}`) ||
+  (typeof h.url === 'string' && h.url.includes('/ingest/') && h.url.includes(`board=${MARK}`)) ||
   (typeof h.command === 'string' && h.command.includes(MARK) && h.command.includes(' hook '));
 
 export function strip(config) {
@@ -30,27 +33,28 @@ export function strip(config) {
   return config;
 }
 
-export function plan(agent, config, { url, host = hostname(), token = null } = {}) {
+// `url` is baked into Claude Code's HTTP hooks. The command bridge (all of
+// Codex, and Claude's SessionStart) looks the hub up at call time instead,
+// unless `pin` says the hub lives somewhere this machine cannot discover.
+export function plan(agent, config, { url, host = hostname(), token = null, pin = false } = {}) {
   const next = strip(structuredClone(config));
   next.hooks ||= {};
-  const q = `host=${encodeURIComponent(host)}&board=${MARK}`;
-  const command = {
-    type: 'command',
-    command: `node ${JSON.stringify(BIN)} hook ${agent} --url ${JSON.stringify(url)} --host ${JSON.stringify(host)}`,
-    timeout: 5,
-  };
-  const http = {
-    type: 'http',
-    url: `${url}/ingest/claude?${q}`,
-    timeout: 5,
-    ...(token ? { headers: { Authorization: 'Bearer $SESSION_BOARD_TOKEN' }, allowedEnvVars: ['SESSION_BOARD_TOKEN'] } : {}),
-  };
+  const bridge = `node ${JSON.stringify(BIN)} hook ${agent} --host ${JSON.stringify(host)}` +
+    (pin ? ` --url ${JSON.stringify(url)}` : '');
   const events = agent === 'claude' ? CLAUDE_EVENTS : CODEX_EVENTS;
   for (const event of events) {
-    // Claude Code: SessionStart only accepts command/mcp_tool handlers, so it
-    // goes through the bridge; everything else is a direct HTTP POST.
-    // Codex has no http handler type at all.
-    const handler = agent === 'claude' && event !== 'SessionStart' ? http : command;
+    const timeout = event === 'PermissionRequest' ? WAIT_S : QUICK_S;
+    // Claude Code: SessionStart only accepts command/mcp_tool handlers, and the
+    // bridge is also what tells us about tmux. Everything else is a direct
+    // HTTP POST. Codex has no http handler type at all.
+    const handler = agent === 'claude' && event !== 'SessionStart'
+      ? {
+          type: 'http',
+          url: `${url}/ingest/claude?host=${encodeURIComponent(host)}&board=${MARK}`,
+          timeout,
+          ...(token ? { headers: { Authorization: 'Bearer $SESSION_BOARD_TOKEN' }, allowedEnvVars: ['SESSION_BOARD_TOKEN'] } : {}),
+        }
+      : { type: 'command', command: bridge, timeout };
     (next.hooks[event] ||= []).push({ hooks: [handler] });
   }
   return next;
@@ -62,14 +66,30 @@ function load(path) {
   return raw ? JSON.parse(raw) : {};
 }
 
+// What is installed right now: { installed, url } (url only for Claude's HTTP hooks).
+export function status(agent, path = configPath(agent)) {
+  let config;
+  try {
+    config = load(path);
+  } catch {
+    return { path, installed: false, error: 'config is not valid JSON' };
+  }
+  const ours = Object.values(config.hooks || {}).flat().flatMap((g) => g.hooks || []).filter(isOurs);
+  const http = ours.find((h) => h.url);
+  return { path, installed: ours.length > 0, url: http ? http.url.split('/ingest/')[0] : null };
+}
+
 export function install(agent, opts = {}) {
   const path = opts.path || configPath(agent);
   const before = load(path);
   const after = opts.remove ? strip(structuredClone(before)) : plan(agent, before, opts);
-  if (!opts.dryRun) {
+  const changed = JSON.stringify(before) !== JSON.stringify(after);
+  // Written only when something changes: Codex re-asks the human to trust
+  // hooks whenever the file's contents change.
+  if (!opts.dryRun && changed) {
     mkdirSync(dirname(path), { recursive: true });
     if (existsSync(path)) copyFileSync(path, `${path}.session-board.bak`);
     writeFileSync(path, JSON.stringify(after, null, 2) + '\n');
   }
-  return { path, after };
+  return { path, after, changed };
 }

@@ -2,7 +2,7 @@
 // Everything the UI shows is derived from the event log through this function,
 // so the projection can be rebuilt at any time (`session-board rebuild`).
 
-export const STATES = ['working', 'needs_input', 'review', 'idle', 'failed', 'ended'];
+export const STATES = ['working', 'needs_input', 'review', 'idle', 'failed', 'unknown', 'ended'];
 
 // Events that mean "the human has seen / handled the pending request".
 const QUESTION_TOOLS = new Set(['AskUserQuestion', 'request_user_input']);
@@ -27,9 +27,19 @@ function blank(ev) {
     repo: null,
     branch: null,
     title: null,
+    // `phase` is the agent's own lifecycle. `requests` are the open questions
+    // it has put to the human. `state` is derived from both: any open request
+    // means needs_input, and resolving the last one falls back to the phase.
+    phase: 'idle',
+    phase_since: ev.ts,
+    requests: [], // { id, kind: 'permission' | 'question', tool, detail, ts }
+    auto_allow: [], // tools the human told the board to approve for this session
+    tmux: null, // { socket, pane } when the agent runs inside tmux
     state: 'idle',
     since: ev.ts,
-    waiting: null, // { kind: 'permission' | 'question', tool, detail }
+    waiting: null, // the oldest open request, for display
+    usage: null, // { model, context_tokens, output_tokens, cost_usd }
+    transcript: null,
     background: 0,
     subagents: 0,
     current_tool: null,
@@ -43,30 +53,52 @@ function blank(ev) {
   };
 }
 
-function enter(s, state, ts) {
-  if (s.state !== state) {
-    s.state = state;
-    s.since = ts;
+function enter(s, phase, ts) {
+  if (s.phase !== phase) {
+    s.phase = phase;
+    s.phase_since = ts;
   }
-  if (state !== 'needs_input') s.waiting = null;
-  if (state !== 'failed') s.error = null;
-  if (state !== 'working') s.current_tool = null;
+  if (phase !== 'failed' && phase !== 'unknown') s.error = null;
+  if (phase !== 'working') s.current_tool = null;
 }
 
-function wait(s, ts, kind, tool, detail) {
-  // Keep the original wait start if we are already waiting on the same thing
-  // (PermissionRequest and Notification both fire for one prompt).
-  const same = s.state === 'needs_input' && s.waiting && s.waiting.kind === kind;
-  if (!same) {
-    s.state = 'needs_input';
-    s.since = ts;
+// Open a request, merging the duplicate reports one prompt produces
+// (PreToolUse/PermissionRequest carry the tool, Notification does not).
+function open(s, ts, kind, tool, detail, id) {
+  const same = s.requests.find(
+    (r) => r.kind === kind && (!tool || !r.tool || (r.tool === tool && (!detail || !r.detail || r.detail === detail))),
+  );
+  if (same) {
+    same.tool ??= tool ?? null;
+    same.detail ??= detail ?? null;
+    same.id ??= id ?? null;
+    return;
   }
-  s.waiting = {
-    kind,
-    tool: tool ?? s.waiting?.tool ?? null,
-    detail: detail ?? s.waiting?.detail ?? null,
-  };
-  s.current_tool = null;
+  s.requests.push({ id: id ?? null, kind, tool: tool ?? null, detail: detail ?? null, ts });
+}
+
+// Resolve the oldest open request that matches. A request reported without a
+// tool name (bare notification) is resolved by anything.
+function resolve(s, { id, kind, tool } = {}) {
+  const i = s.requests.findIndex((r) =>
+    id ? r.id === id : (!kind || r.kind === kind) && (!tool || !r.tool || r.tool === tool),
+  );
+  if (i >= 0) s.requests.splice(i, 1);
+  return i >= 0;
+}
+
+function derive(s) {
+  const first = s.requests[0];
+  if (first) {
+    s.state = 'needs_input';
+    s.since = first.ts;
+    s.waiting = { id: first.id, kind: first.kind, tool: first.tool, detail: first.detail };
+  } else {
+    s.state = s.phase;
+    s.since = s.phase_since;
+    s.waiting = null;
+  }
+  return s;
 }
 
 export function summarizeToolInput(tool, input) {
@@ -86,89 +118,125 @@ export function summarizeToolInput(tool, input) {
 }
 
 export function reduce(prev, ev) {
-  const s = prev ? { ...prev, waiting: prev.waiting && { ...prev.waiting } } : blank(ev);
+  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), auto_allow: [...prev.auto_allow] } : blank(ev);
   const d = ev.data || {};
   const ts = ev.ts;
   s.last_event_ts = ts;
   if (ev.cwd && !s.cwd) s.cwd = ev.cwd;
+  if (ev.transcript) s.transcript = ev.transcript;
   if (ev.host && s.host === 'local') s.host = ev.host;
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && ev.type !== 'session.ended') s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed'].includes(ev.type)) s.archived = false;
+
+  const working = () => enter(s, 'working', ts);
 
   switch (ev.type) {
     case 'session.started':
       if (d.title && !s.title) s.title = clip(d.title, 120);
+      s.tmux = d.tmux || null;
       // A resumed/forked session waits for a prompt; compaction happens mid-turn.
-      if (d.source !== 'compact' && (s.state === 'ended' || !prev)) enter(s, 'idle', ts);
+      if (d.source !== 'compact' && (s.phase === 'ended' || s.phase === 'unknown' || !prev)) {
+        s.requests = [];
+        enter(s, 'idle', ts);
+      }
       break;
 
-    case 'prompt.submitted':
-      s.turns += 1;
+    case 'session.imported':
+      // Found in the agent's own history files, not seen live. We know what it
+      // was about, not whether anything is still running.
+      if (d.title) s.title = clip(d.title, 120);
+      if (d.last_prompt) s.last_prompt = clip(d.last_prompt, 600);
+      if (d.last_message) s.last_message = clip(d.last_message, 1200);
+      if (d.branch) s.branch = d.branch;
+      if (d.repo) s.repo = d.repo;
+      s.turns = d.turns || s.turns;
+      s.imported = true;
+      enter(s, 'ended', ts);
+      break;
+
+    case 'prompt.submitted': {
+      // A message sent from the board is recorded at once, and then reported
+      // again by the agent's own hook when it picks it up: one turn, not two.
+      const echo = s.board_prompt && !d.via && clip(d.prompt, 600) === s.last_prompt;
+      s.board_prompt = d.via === 'board';
+      if (!echo) s.turns += 1;
       s.last_prompt = clip(d.prompt, 600);
       if (!s.title && d.prompt) s.title = clip(String(d.prompt).split('\n')[0], 120);
       s.background = 0;
-      enter(s, 'working', ts);
+      s.requests = []; // the human is at the keyboard: nothing is pending
+      working();
       break;
+    }
 
     case 'tool.started':
       if (QUESTION_TOOLS.has(d.tool)) {
-        wait(s, ts, 'question', d.tool, summarizeToolInput(d.tool, d.input));
-        break;
+        open(s, ts, 'question', d.tool, summarizeToolInput(d.tool, d.input));
+      } else {
+        s.current_tool = { tool: d.tool, detail: summarizeToolInput(d.tool, d.input) };
       }
-      // Parallel tool calls (e.g. from subagents) must not hide a pending request.
-      if (s.state === 'needs_input') break;
-      enter(s, 'working', ts);
-      s.current_tool = { tool: d.tool, detail: summarizeToolInput(d.tool, d.input) };
+      working();
       break;
 
     case 'tool.finished':
-      if (s.state === 'needs_input') {
-        // Only the tool we were waiting on resolves the wait.
-        if (!s.waiting?.tool || s.waiting.tool === d.tool) enter(s, 'working', ts);
-        break;
-      }
-      enter(s, 'working', ts);
+      // Only the tool a request was about resolves it; parallel tool calls
+      // (e.g. from subagents) leave other requests open.
+      resolve(s, { tool: d.tool });
+      working();
       break;
 
     case 'permission.requested':
-      wait(s, ts, 'permission', d.tool, summarizeToolInput(d.tool, d.input));
+      open(s, ts, 'permission', d.tool, summarizeToolInput(d.tool, d.input), d.request_id);
+      working();
       break;
 
     case 'permission.denied':
-      if (s.state === 'needs_input') enter(s, 'working', ts);
+      resolve(s, { kind: 'permission', tool: d.tool });
       break;
 
     case 'question.asked':
-      wait(s, ts, 'question', d.tool ?? null, clip(d.message, 400));
+      open(s, ts, 'question', d.tool ?? null, clip(d.message, 400));
+      break;
+
+    case 'request.resolved':
+      if (d.all) s.requests = [];
+      else resolve(s, { id: d.id, kind: d.kind, tool: d.tool });
+      break;
+
+    case 'rule.added':
+      if (d.tool && !s.auto_allow.includes(d.tool)) s.auto_allow.push(d.tool);
+      break;
+
+    case 'rule.removed':
+      s.auto_allow = s.auto_allow.filter((t) => t !== d.tool);
       break;
 
     case 'turn.completed':
       if (d.message) s.last_message = clip(d.message, 1200);
       s.background = d.background || 0;
-      if (s.background > 0) {
-        // The turn ended but background work will wake the agent up again.
-        enter(s, 'working', ts);
-      } else {
-        // "Agent says done" is not "human accepted": park it for review.
-        enter(s, 'review', ts);
-      }
+      s.requests = [];
+      // With background work pending the agent will wake itself up again.
+      // Otherwise "agent says done" is not "human accepted": park for review.
+      enter(s, s.background > 0 ? 'working' : 'review', ts);
       break;
 
     case 'turn.failed':
       if (d.message) s.last_message = clip(d.message, 1200);
+      s.requests = [];
       enter(s, 'failed', ts);
       s.error = clip(d.error || 'unknown error', 300);
+      s.rate_limited = /rate_limit|quota|billing|account_on_hold/.test(String(d.error));
       break;
 
     case 'turn.interrupted':
       // The human stopped it themselves; nothing to tell them.
+      s.requests = [];
       enter(s, 'idle', ts);
       break;
 
     case 'subagent.started':
       s.subagents += 1;
-      if (s.state !== 'needs_input') enter(s, 'working', ts);
+      working();
       break;
 
     case 'subagent.stopped':
@@ -178,13 +246,27 @@ export function reduce(prev, ev) {
     case 'session.ended':
       s.subagents = 0;
       s.background = 0;
+      s.requests = [];
       // Keep unreviewed results and failures visible after the process exits.
-      if (s.state !== 'review' && s.state !== 'failed') enter(s, 'ended', ts);
+      if (s.phase !== 'review' && s.phase !== 'failed') enter(s, 'ended', ts);
       s.exited = true;
+      s.tmux = null;
+      break;
+
+    case 'session.lost':
+      // Reconciliation found no live agent process behind a session we showed
+      // as active. Say so rather than keep claiming it is working.
+      s.requests = [];
+      s.subagents = 0;
+      s.background = 0;
+      enter(s, 'unknown', ts);
+      s.error = clip(d.reason || 'agent process not found', 300);
+      s.exited = true;
+      s.tmux = null;
       break;
 
     case 'human.acknowledged':
-      if (s.state === 'review' || s.state === 'failed') enter(s, s.exited ? 'ended' : 'idle', ts);
+      if (['review', 'failed', 'unknown'].includes(s.phase)) enter(s, s.exited ? 'ended' : 'idle', ts);
       break;
 
     case 'human.archived':
@@ -197,13 +279,20 @@ export function reduce(prev, ev) {
       if (d.title) s.title = clip(d.title, 120);
       break;
 
+    case 'usage.updated':
+      s.usage = { ...s.usage, ...d };
+      break;
+
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  if (ev.type !== 'session.ended' && !ev.type.startsWith('human.') && ev.type !== 'meta.updated') {
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed', 'request.resolved'];
+  if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.exited = false;
+    s.imported = false;
   }
-  return s;
+  if (s.phase !== 'failed') s.rate_limited = false;
+  return derive(s);
 }
 
 // Attention ordering. Deliberately simple and explainable: a fixed tier per
@@ -212,7 +301,7 @@ export function reduce(prev, ev) {
 export function attentionTier(s) {
   if (s.archived) return null;
   if (s.state === 'needs_input') return s.waiting?.kind === 'permission' ? 0 : 1;
-  if (s.state === 'failed') return 2;
+  if (s.state === 'failed' || s.state === 'unknown') return 2;
   if (s.state === 'review') return 3;
   return null;
 }
