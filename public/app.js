@@ -130,7 +130,9 @@ function describeState(s) {
   }
 }
 
-const where = (s) => [s.host, s.repo || (s.cwd || '').split('/').pop(), s.branch].filter(Boolean).join(' · ');
+// Which Codex client a thread was started from, as its local server reports it.
+const CLIENT = { vscode: 'IDE', appServer: 'desktop app', exec: 'headless' };
+const where = (s) => [s.client && CLIENT[s.client] ? t(CLIENT[s.client]) : null, s.host, s.repo || (s.cwd || '').split('/').pop(), s.branch].filter(Boolean).join(' · ');
 const agentName = (s) => (s.agent === 'claude' ? 'Claude' : s.agent === 'codex' ? 'Codex' : s.agent);
 const resumeCommand = (s) => {
   const cd = s.cwd ? `cd ${JSON.stringify(s.cwd)} && ` : '';
@@ -1200,7 +1202,9 @@ function quotaLine() {
   const part = (name, w) => w && el('span', { className: w.used >= 90 ? 'q hot' : w.used >= 70 ? 'q warm' : 'q' },
     t(' · {name} {used}% used', { name, used: w.used }), w.resets_at ? t(', resets {at}', { at: resetAt(w.resets_at) }) : '');
   return el('span', { className: 'quota', title: t('Your plan’s usage windows, as Claude Code reports them to its status line.') },
-    part(t('5-hour window'), q.five_hour), part(t('week'), q.seven_day));
+    part(t('5-hour window'), q.five_hour), part(t('week'), q.seven_day),
+    q.codex && part(t('Codex {h}h', { h: Math.round((q.codex.primary?.minutes || 300) / 60) }), q.codex.primary),
+    q.codex?.secondary && part(t('Codex week'), q.codex.secondary));
 }
 
 let frame = 0;

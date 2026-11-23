@@ -119,6 +119,7 @@ export function createHub({
   notifier = null, // injectable; built from the environment by default
   boardUrl = '',
   ignoreCwds = [], // sessions running here are not shown (the triage runner's own)
+  codexApp = null, // { poll: async () => ({ threads, limits }) | null } reads Codex's own local server
   cloudGit = null, // { cacheRoot, dirs: () => [...] } turns on finding cloud sessions through git
   launch = (cmd, args, cwd) => spawn(cmd, args, { cwd, detached: true, stdio: 'ignore' }).unref(),
 } = {}) {
@@ -290,6 +291,12 @@ export function createHub({
     const q = { five_hour: ok(quota.five_hour), seven_day: ok(quota.seven_day), at: quota.at };
     return q.five_hour || q.seven_day ? q : null;
   };
+  const allQuota = () => {
+    const claude = liveQuota();
+    const ok = (w) => (w && (!w.resets_at || w.resets_at > now()) ? w : null);
+    const codex = codexLimits && (ok(codexLimits.primary) || ok(codexLimits.secondary)) ? { primary: ok(codexLimits.primary), secondary: ok(codexLimits.secondary) } : null;
+    return claude || codex ? { ...(claude || {}), codex } : null;
+  };
   let rules = store.rules(); // global: [{ tool, detail, mode }]
   // Someone is "present" while a board page has reported itself visible lately.
   let lookedAt = 0;
@@ -299,7 +306,7 @@ export function createHub({
   const snapshot = () => {
     refreshTasks();
     const sessions = store.list().filter((s) => !s.archived).map(view);
-    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length, burn: burn(), quota: liveQuota() };
+    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length, burn: burn(), quota: allQuota() };
   };
 
   // Live updates are deltas: a client gets the full picture once, then only
@@ -336,7 +343,7 @@ export function createHub({
       dirty.clear();
       if (!clients.size || (!changed.length && !removed.length && !quotaChanged)) return;
       const live = store.list().filter((x) => !x.archived).map(view);
-      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length, burn: burn(), quota: liveQuota() })}\n\n`;
+      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length, burn: burn(), quota: allQuota() })}\n\n`;
       for (const res of clients) res.write(msg);
     }, TICK_MS);
   };
@@ -805,6 +812,30 @@ export function createHub({
     }
     return out;
   }
+
+  // Codex through its own local server: every Codex thread on this machine,
+  // from any client, plus the account's usage windows.
+  async function scanCodex() {
+    if (!codexApp) return null;
+    const snap = await codexApp.poll().catch(() => null);
+    if (!snap) return null;
+    for (const t of snap.threads) {
+      // Old, stopped threads are history, not something to put on the board now.
+      const fresh = t.status === 'active' || (t.updated && now() - t.updated < 3 * 86_400_000) || store.get(`codex:${t.id}`);
+      if (!fresh) continue;
+      const data = { title: t.title, cwd: t.cwd, branch: t.branch, repo_id: t.repo_id, client: t.client, status: t.status, waiting: t.waiting, unread: t.unread };
+      store.append({ agent: 'codex', session_id: t.id, ts: now(), host: localHost, cwd: t.cwd, eid: `app:${JSON.stringify(data)}`, type: 'codex.thread', data });
+    }
+    if (snap.limits && JSON.stringify(snap.limits) !== JSON.stringify(codexLimits)) {
+      codexLimits = snap.limits;
+      dirty.add('__quota__');
+      broadcast({});
+    }
+    return { threads: snap.threads.length, limits: !!snap.limits };
+  }
+  let codexLimits = null;
+  const codexScanner = codexApp ? setInterval(() => scanCodex().catch(() => {}), 15_000) : null;
+  codexScanner?.unref();
 
   // --- upkeep -----------------------------------------------------------------
   // Reconciliation: a session we show as active, on this machine, silent for a
@@ -1320,6 +1351,7 @@ export function createHub({
     snapshot,
     ingest,
     reconcile,
+    scanCodex,
     scanCloudBranches,
     settle,
     refreshPr: (key, opts) => refreshPr(store.get(key), opts),
@@ -1332,6 +1364,7 @@ export function createHub({
         clearInterval(tick);
         clearInterval(reconciler);
         clearInterval(cloudScanner);
+        clearInterval(codexScanner);
         clearTimeout(pending);
         clearTimeout(orphanTimer);
         for (const id of [...held.keys()]) release(id);

@@ -240,7 +240,7 @@ export function reduce(prev, ev) {
   }
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone', 'files.attributed', 'context.compacted'].includes(ev.type)) s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone', 'codex.thread', 'files.attributed', 'context.compacted'].includes(ev.type)) s.archived = false;
 
   const working = () => enter(s, 'working', ts);
 
@@ -491,6 +491,36 @@ export function reduce(prev, ev) {
       s.activity = 'gone';
       break;
 
+    case 'codex.thread': {
+      // A row from Codex's own local server: every thread on this machine,
+      // whichever client started it.
+      if (d.title && !s.title_manual && !s.title) s.title = clip(d.title, 120);
+      if (d.cwd && !s.cwd) s.cwd = d.cwd;
+      if (d.branch) s.branch = d.branch;
+      if (d.repo_id && !s.repo_id) s.repo_id = d.repo_id;
+      s.client = d.client || s.client || null;
+      s.listed = true;
+      if (s.hooked) break; // its hooks give finer detail
+      if (d.status === 'active' && d.waiting) {
+        enter(s, 'working', ts);
+        if (!s.requests.some((r) => r.kind === d.waiting)) s.requests = [{ id: null, kind: d.waiting, tool: null, detail: null, ts, questions: null, risky: false }];
+      } else if (d.status === 'active') {
+        s.requests = [];
+        enter(s, 'working', ts);
+      } else if (d.status === 'systemError') {
+        s.requests = [];
+        enter(s, 'failed', ts);
+        s.error = 'Codex reports a system error';
+      } else {
+        s.requests = [];
+        // Stopped. Unread means there is a result you have not looked at.
+        if (d.unread && s.phase !== 'review') enter(s, 'review', ts);
+        else if (!d.unread && s.phase !== 'idle' && s.phase !== 'review' && s.phase !== 'ended') enter(s, 'idle', ts);
+        else if (d.unread === false && s.phase === 'review') { enter(s, 'idle', ts); s.seen_ts = ts; }
+      }
+      break;
+    }
+
     case 'cloud.snapshot': {
       // One row of the vendor's own session list. Coarser than hooks: it says
       // which bucket the session is in, not what it is waiting for.
@@ -614,7 +644,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone', 'reply.queued', 'reply.delivered'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted', 'context.compacted', 'files.attributed', 'cloud.snapshot', 'cloud.branch', 'cloud.branch.gone', 'reply.queued', 'reply.delivered', 'codex.thread'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.last_work_ts = ts;
     if (ev.type !== 'heartbeat' && ev.type !== 'notification') s.hooked = true;

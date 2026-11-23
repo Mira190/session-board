@@ -22,6 +22,8 @@ export const setLangPref = (v) => store.set(LANGS.includes(v) ? v : 'auto');
 export const lang = () => (langPref() === 'auto' ? systemLang() : langPref());
 
 const ZH = {
+  'Codex {h}h': 'Codex {h} 小时窗口', 'Codex week': 'Codex 本周', 'IDE': 'IDE', 'desktop app': '桌面应用', 'headless': '无界面',
+
   // ---- control through hooks
   'It is mid-turn: this is handed to it when the turn ends, and it carries on from there.': '它这一轮还没结束：这条消息会在这一轮结束时交给它，它会接着做。',
   'Waiting for its turn to end, then it gets:': '等它这一轮结束后交给它：',

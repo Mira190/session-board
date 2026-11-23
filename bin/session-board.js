@@ -152,7 +152,20 @@ async function main() {
       dirs: () => [...claudeProjectDirs(), ...watched(home()).filter((w) => !/^(https?:|git@|ssh:)/.test(w))],
       urls: async () => [...watched(home()).filter((w) => /^(https?:|git@|ssh:)/.test(w)), ...(await lately())],
     };
-    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl, ignoreCwds: [triageDir(home())], cloudGit });
+    // Codex through its own local server (what its desktop app and IDE
+    // extension use): on when Codex is installed, unless switched off.
+    let codexApp = null;
+    if (process.env.SESSION_BOARD_CODEX_APP !== 'off') {
+      const { connect, snapshot } = await import('../src/codexapp.js');
+      let conn = null;
+      codexApp = { poll: async () => {
+        if (!conn || conn.closed) conn = connect();
+        const snap = await snapshot(conn);
+        if (!snap) { conn.close(); conn = null; }
+        return snap;
+      } };
+    }
+    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl, ignoreCwds: [triageDir(home())], cloudGit, codexApp });
     await hub.listen(Number(opt.port), opt.bind);
     writeEndpoint({ url, token });
     console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
@@ -191,6 +204,7 @@ async function main() {
     if (cloudGit) {
       hub.scanCloudBranches().then((r) => r.sessions && console.log(`cloud sessions found through git: ${r.sessions} across ${r.remotes} repositor${r.remotes === 1 ? 'y' : 'ies'}`)).catch(() => {});
     }
+    hub.scanCodex().then((r) => r && console.log(`Codex local server: ${r.threads} thread(s)${r.limits ? ', usage windows available' : ''}`)).catch(() => {});
     const lost = await hub.reconcile().catch(() => 0);
     if (lost) console.log(`${lost} session(s) had no agent process left and were marked unknown`);
     const settled = await hub.settle().catch(() => 0);
