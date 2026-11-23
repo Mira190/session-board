@@ -32,6 +32,16 @@ export const SETTLE_MS = 2 * 60 * 1000;
 export const HOLD_MS = 9 * 60 * 1000;
 const LOCAL_NAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 
+// Answering a question tool = allowing it with the answers filled in.
+const answerBody = (input, answers) => ({
+  hookSpecificOutput: {
+    hookEventName: 'PermissionRequest',
+    decision: { behavior: 'allow', updatedInput: { ...input, answers } },
+  },
+});
+// How long finished sessions stay on the board before the hub files them away.
+export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
 const decisionBody = (behavior, message) => ({
   hookSpecificOutput: {
     hookEventName: 'PermissionRequest',
@@ -135,12 +145,15 @@ export function createHub({
     if (!s.cwd || !existsSync(s.cwd)) return;
     if (now() - (looked.get(s.key) || 0) < 15_000) return;
     looked.set(s.key, now());
-    const [top, branch] = await Promise.all([
+    const [top, branch, head] = await Promise.all([
       git(s.cwd, ['rev-parse', '--show-toplevel']),
       git(s.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']),
+      s.start_head ? null : git(s.cwd, ['rev-parse', 'HEAD']),
     ]);
     const repo = top ? basename(top) : basename(s.cwd);
-    if (repo !== s.repo || branch !== s.branch) emit(s, 'meta.updated', { repo, branch });
+    if (repo !== s.repo || branch !== s.branch || (head && !s.start_head)) {
+      emit(s, 'meta.updated', { repo, branch, ...(head ? { head } : {}) });
+    }
   }
 
   // Usage and cost come from the agent's own session file, read at turn ends.
@@ -177,17 +190,29 @@ export function createHub({
     broadcast();
     return true;
   }
-  function decide(id, decision, { message, remember } = {}) {
+  function decide(id, decision, { message, remember, answers } = {}) {
     const h = held.get(id);
     if (!h) return false;
     const s = store.get(h.key);
     if (decision === 'terminal') return release(id); // let the agent ask in its own UI
+    if (decision === 'answer') {
+      // { question text: chosen label | free text | [labels] }
+      const clean = {};
+      for (const [q, a] of Object.entries(answers || {})) {
+        const text = Array.isArray(a) ? a.join(', ') : String(a ?? '');
+        if (text.trim()) clean[q] = text.trim();
+      }
+      if (!Object.keys(clean).length) return false;
+      release(id, answerBody(h.input, clean));
+      emit(s, 'request.resolved', { id, decision: 'answer', by: 'human' });
+      return true;
+    }
     if (remember && decision === 'allow' && h.tool) emit(s, 'rule.added', { tool: h.tool });
     release(id, decisionBody(decision, message));
     emit(s, 'request.resolved', { id, decision, by: 'human' });
     return true;
   }
-  function holdPermission(req, res, event) {
+  function holdPermission(req, res, event, input) {
     const id = randomUUID().slice(0, 8);
     event.data.request_id = id;
     const s = ingest([event]);
@@ -204,7 +229,7 @@ export function createHub({
     if (!parallel && !clients.size) return json(res, 200, {});
     const timer = setTimeout(() => release(id), holdMs);
     timer.unref();
-    held.set(id, { res, key: s.key, tool: event.data.tool || null, timer, parallel });
+    held.set(id, { res, key: s.key, tool: event.data.tool || null, input: input || {}, timer, parallel });
     // The agent gave up on the hook (answered in its own UI, interrupted, died).
     res.on('close', () => held.delete(id) && (clearTimeout(timer), broadcast()));
     broadcast();
@@ -251,12 +276,16 @@ export function createHub({
     );
   }
 
-  async function workingTree(s) {
+  // scope 'session' narrows everything to the files this session's edit
+  // tools touched. Changes it made through shell commands are not attributed,
+  // so the whole-tree view stays one click away.
+  async function workingTree(s, scope = 'all') {
     if (!isLocal(s) || !s.cwd || !existsSync(s.cwd)) return { available: false };
+    const own = scope === 'session' && s.files.length ? ['--', ...s.files] : [];
     const [status, stat, tracked] = await Promise.all([
-      git(s.cwd, ['status', '--porcelain', '-uall']),
-      git(s.cwd, ['diff', 'HEAD', '--stat']),
-      run('git', ['-C', s.cwd, 'diff', 'HEAD']),
+      git(s.cwd, ['status', '--porcelain', '-uall', ...own]),
+      git(s.cwd, ['diff', 'HEAD', '--stat', ...own]),
+      run('git', ['-C', s.cwd, 'diff', 'HEAD', ...own]),
     ]);
     if (status == null && tracked == null) return { available: false };
     // New files are not in `git diff HEAD`; show them as additions too.
@@ -267,6 +296,8 @@ export function createHub({
     const diff = [tracked, ...added].filter(Boolean).join('\n');
     return {
       available: true,
+      scope: own.length ? 'session' : 'all',
+      attributed: s.files.length,
       status: status || '',
       stat: stat || '',
       diff: diff.slice(0, MAX_DIFF),
@@ -294,7 +325,46 @@ export function createHub({
     }
     return lost;
   }
-  const reconciler = setInterval(() => reconcile().catch(() => {}), 60_000);
+  // Settlement: outcomes the hub can establish from recorded facts are closed
+  // without waiting for a click, whether or not anyone has the board open.
+  //  - merged:   a reviewed-pending branch whose commits are now in the default
+  //              branch has been accepted by whoever merged it.
+  //  - inactive: a finished session nobody has touched for a week is archived.
+  // Squash and rebase merges rewrite commits, so they are not detected here.
+  async function mergedInto(cwd, branch) {
+    const base = (await git(cwd, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])) ||
+      (await git(cwd, ['rev-parse', '--verify', '--quiet', '--abbrev-ref', 'main'])) ||
+      (await git(cwd, ['rev-parse', '--verify', '--quiet', '--abbrev-ref', 'master']));
+    if (!base || base === branch || base.endsWith(`/${branch}`)) return null;
+    const tip = await git(cwd, ['rev-parse', '--verify', '--quiet', branch]);
+    if (!tip) return null;
+    const merged = await run('git', ['-C', cwd, 'merge-base', '--is-ancestor', tip, base]);
+    return merged == null ? null : { tip, base };
+  }
+  async function settle() {
+    let settled = 0;
+    for (const s of store.list()) {
+      if (s.archived) continue;
+      if (s.state === 'ended' && now() - s.last_event_ts > STALE_MS) {
+        emit(s, 'session.settled', { reason: 'inactive' });
+        settled += 1;
+      } else if (s.state === 'review' && isLocal(s) && s.cwd && s.branch && s.start_head && existsSync(s.cwd)) {
+        const m = await mergedInto(s.cwd, s.branch);
+        // The branch must have moved since we first saw it: a branch with no
+        // new commits is trivially "in" the default branch.
+        if (m && m.tip !== s.start_head) {
+          emit(s, 'session.settled', { reason: 'merged', into: m.base });
+          settled += 1;
+        }
+      }
+    }
+    return settled;
+  }
+
+  const reconciler = setInterval(() => {
+    reconcile().catch(() => {});
+    settle().catch(() => {});
+  }, 60_000);
   reconciler.unref();
 
   // Backfill: sessions found in the agents' history files that the hub has
@@ -375,7 +445,7 @@ export function createHub({
         tmux,
       });
       if (payload.hook_event_name === 'PermissionRequest' && events.length) {
-        return holdPermission(req, res, events[0]);
+        return holdPermission(req, res, events[0], payload.tool_input);
       }
       ingest(events);
       return json(res, 200, {});
@@ -386,7 +456,7 @@ export function createHub({
       const list = (Array.isArray(sent) ? sent : [sent]).filter(
         (e) => e && e.agent && e.session_id && typeof e.type === 'string',
       );
-      ingest(list.map((e) => ({ ...e, ts: now(), session_id: String(e.session_id) })));
+      ingest(list.map(({ id, ...e }) => ({ ...e, ...(id != null ? { eid: String(id) } : {}), ts: now(), session_id: String(e.session_id) })));
       return json(res, 200, { accepted: list.length });
     }
 
@@ -411,13 +481,15 @@ export function createHub({
       const { days } = await body();
       return json(res, 200, await backfill({ days: Number(days) > 0 ? Number(days) : 7 }));
     }
-    if (path === '/api/reconcile' && req.method === 'POST') return json(res, 200, { lost: await reconcile() });
+    if (path === '/api/reconcile' && req.method === 'POST') {
+      return json(res, 200, { lost: await reconcile(), settled: await settle() });
+    }
 
     const decision = path.match(/^\/api\/requests\/([^/]+)$/);
     if (decision && req.method === 'POST') {
-      const { decision: d, message, remember } = await body();
-      if (!['allow', 'deny', 'terminal'].includes(d)) return json(res, 400, { error: 'decision must be allow, deny or terminal' });
-      return decide(decision[1], d, { message, remember })
+      const { decision: d, message, remember, answers } = await body();
+      if (!['allow', 'deny', 'terminal', 'answer'].includes(d)) return json(res, 400, { error: 'decision must be allow, deny, answer or terminal' });
+      return decide(decision[1], d, { message, remember, answers })
         ? json(res, 200, { ok: true })
         : json(res, 410, { error: 'this request is no longer waiting on the board' });
     }
@@ -430,7 +502,7 @@ export function createHub({
       const verb = act[2];
       if (req.method === 'GET') {
         if (verb === 'events') return json(res, 200, store.events(key));
-        if (verb === 'diff') return json(res, 200, await workingTree(s));
+        if (verb === 'diff') return json(res, 200, await workingTree(s, url.searchParams.get('scope') || 'all'));
       }
       if (req.method === 'POST') {
         if (verb === 'message') {
@@ -483,6 +555,7 @@ export function createHub({
     snapshot,
     ingest,
     reconcile,
+    settle,
     backfill,
     decide,
     listen: (port, host) => new Promise((ok) => server.listen(port, host, () => ok(server.address()))),

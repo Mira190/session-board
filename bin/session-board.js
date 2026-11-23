@@ -25,6 +25,7 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board uninstall <claude|codex>  remove them again
   session-board status                    is the hub up, are the hooks in place
   session-board backfill [--days 7]       import sessions that predate the hooks
+  session-board mcp                       MCP server (stdio) so agents can read the board
   session-board demo                      play scripted sessions into a running hub
   session-board hook <claude|codex>       (used by hooks) forward stdin to the hub
 
@@ -78,6 +79,10 @@ async function hook(agent) {
 async function main() {
   if (opt.help || !cmd) return console.log(HELP);
   if (cmd === 'hook') return hook(arg);
+  if (cmd === 'mcp') {
+    const { serveMcp } = await import('../src/mcp.js');
+    return serveMcp({ endpoint });
+  }
 
   if (cmd === 'serve') {
     const { createHub } = await import('../src/hub.js');
@@ -103,6 +108,8 @@ async function main() {
     }
     const lost = await hub.reconcile().catch(() => 0);
     if (lost) console.log(`${lost} session(s) had no agent process left and were marked unknown`);
+    const settled = await hub.settle().catch(() => 0);
+    if (settled) console.log(`${settled} session(s) were settled (merged or long finished)`);
     return;
   }
 

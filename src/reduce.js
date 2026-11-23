@@ -34,6 +34,9 @@ function blank(ev) {
     phase_since: ev.ts,
     requests: [], // { id, kind: 'permission' | 'question', tool, detail, ts }
     auto_allow: [], // tools the human told the board to approve for this session
+    files: [], // files this session's edit tools were pointed at
+    start_head: null, // commit the working tree was on when first seen
+    settled: null, // why the hub closed a review on its own ('merged')
     tmux: null, // { socket, pane } when the agent runs inside tmux
     state: 'idle',
     since: ev.ts,
@@ -64,7 +67,7 @@ function enter(s, phase, ts) {
 
 // Open a request, merging the duplicate reports one prompt produces
 // (PreToolUse/PermissionRequest carry the tool, Notification does not).
-function open(s, ts, kind, tool, detail, id) {
+function open(s, ts, kind, tool, detail, id, questions) {
   const same = s.requests.find(
     (r) => r.kind === kind && (!tool || !r.tool || (r.tool === tool && (!detail || !r.detail || r.detail === detail))),
   );
@@ -72,9 +75,10 @@ function open(s, ts, kind, tool, detail, id) {
     same.tool ??= tool ?? null;
     same.detail ??= detail ?? null;
     same.id ??= id ?? null;
+    same.questions ??= questions ?? null;
     return;
   }
-  s.requests.push({ id: id ?? null, kind, tool: tool ?? null, detail: detail ?? null, ts });
+  s.requests.push({ id: id ?? null, kind, tool: tool ?? null, detail: detail ?? null, ts, questions: questions ?? null });
 }
 
 // Resolve the oldest open request that matches. A request reported without a
@@ -92,7 +96,7 @@ function derive(s) {
   if (first) {
     s.state = 'needs_input';
     s.since = first.ts;
-    s.waiting = { id: first.id, kind: first.kind, tool: first.tool, detail: first.detail };
+    s.waiting = { id: first.id, kind: first.kind, tool: first.tool, detail: first.detail, questions: first.questions };
   } else {
     s.state = s.phase;
     s.since = s.phase_since;
@@ -100,6 +104,23 @@ function derive(s) {
   }
   return s;
 }
+
+// The structured form of a multiple-choice question, bounded for storage.
+function questionsOf(input) {
+  if (!Array.isArray(input?.questions)) return null;
+  return input.questions.slice(0, 8).map((q) => ({
+    question: clip(String(q.question ?? ''), 400),
+    header: q.header ? clip(String(q.header), 60) : null,
+    multiSelect: !!q.multiSelect,
+    options: (Array.isArray(q.options) ? q.options : []).slice(0, 12).map((o) => ({
+      label: clip(String(o.label ?? o), 120),
+      description: o.description ? clip(String(o.description), 300) : null,
+    })),
+  }));
+}
+
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const MAX_FILES = 300;
 
 export function summarizeToolInput(tool, input) {
   if (input == null) return null;
@@ -118,7 +139,7 @@ export function summarizeToolInput(tool, input) {
 }
 
 export function reduce(prev, ev) {
-  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), auto_allow: [...prev.auto_allow] } : blank(ev);
+  const s = prev ? { ...prev, requests: prev.requests.map((r) => ({ ...r })), auto_allow: [...prev.auto_allow], files: [...prev.files] } : blank(ev);
   const d = ev.data || {};
   const ts = ev.ts;
   s.last_event_ts = ts;
@@ -127,7 +148,7 @@ export function reduce(prev, ev) {
   if (ev.host && s.host === 'local') s.host = ev.host;
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed'].includes(ev.type)) s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed', 'request.resolved'].includes(ev.type)) s.archived = false;
 
   const working = () => enter(s, 'working', ts);
 
@@ -164,6 +185,7 @@ export function reduce(prev, ev) {
       s.last_prompt = clip(d.prompt, 600);
       if (!s.title && d.prompt) s.title = clip(String(d.prompt).split('\n')[0], 120);
       s.background = 0;
+      s.settled = null;
       s.requests = []; // the human is at the keyboard: nothing is pending
       working();
       break;
@@ -171,9 +193,15 @@ export function reduce(prev, ev) {
 
     case 'tool.started':
       if (QUESTION_TOOLS.has(d.tool)) {
-        open(s, ts, 'question', d.tool, summarizeToolInput(d.tool, d.input));
+        open(s, ts, 'question', d.tool, summarizeToolInput(d.tool, d.input), null, questionsOf(d.input));
       } else {
         s.current_tool = { tool: d.tool, detail: summarizeToolInput(d.tool, d.input) };
+      }
+      // Remember which files this session set out to change, so review can
+      // show its own work apart from everything else in the working tree.
+      if (EDIT_TOOLS.has(d.tool)) {
+        const file = d.input?.file_path || d.input?.notebook_path;
+        if (typeof file === 'string' && !s.files.includes(file) && s.files.length < MAX_FILES) s.files.push(file);
       }
       working();
       break;
@@ -186,7 +214,14 @@ export function reduce(prev, ev) {
       break;
 
     case 'permission.requested':
-      open(s, ts, 'permission', d.tool, summarizeToolInput(d.tool, d.input), d.request_id);
+      if (QUESTION_TOOLS.has(d.tool)) {
+        // A question tool asks through the permission channel: same request,
+        // now with an id the board can answer.
+        open(s, ts, 'question', d.tool, summarizeToolInput(d.tool, d.input), d.request_id, questionsOf(d.input));
+      } else if (d.tool || !s.requests.length) {
+        // A bare "needs your permission" notice adds nothing to an open request.
+        open(s, ts, 'permission', d.tool, summarizeToolInput(d.tool, d.input), d.request_id);
+      }
       working();
       break;
 
@@ -273,9 +308,20 @@ export function reduce(prev, ev) {
       s.archived = true;
       break;
 
+    case 'session.settled':
+      // Decided by the hub from recorded facts, with no one watching.
+      if (d.reason === 'merged' && s.phase === 'review') {
+        enter(s, s.exited ? 'ended' : 'idle', ts);
+        s.settled = 'merged';
+      } else if (d.reason === 'inactive') {
+        s.archived = true;
+      }
+      break;
+
     case 'meta.updated':
       if (d.repo !== undefined) s.repo = d.repo;
       if (d.branch !== undefined) s.branch = d.branch;
+      if (d.head && !s.start_head) s.start_head = d.head;
       if (d.title) s.title = clip(d.title, 120);
       break;
 
@@ -286,7 +332,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed', 'request.resolved'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed', 'request.resolved'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.exited = false;
     s.imported = false;

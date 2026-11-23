@@ -29,6 +29,8 @@ let notice = null; // { key, text } transient message in the workbench
 const seen = new Map(); // key -> state signature, to detect new requests
 const extra = new Map(); // key -> { sig, diff, events } lazily loaded detail
 const drafts = new Map(); // key -> unsent reply text
+const picks = new Map(); // request id -> { question: { chosen: Set, other: string } }
+const scopes = new Map(); // key -> 'session' | 'all' for the diff view
 
 const prefs = {
   get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
@@ -75,9 +77,9 @@ function describe(s) {
         verb: '已',
       };
     case 'ended':
-      return { tone: 'rest', what: s.imported ? '历史会话（导入）' : '已结束', detail: s.last_message, verb: '' };
+      return { tone: 'rest', what: s.settled === 'merged' ? '分支已合并，自动算作验收' : s.imported ? '历史会话（导入）' : '已结束', detail: s.last_message, verb: '' };
     default:
-      return { tone: 'rest', what: '空闲，等你派活', detail: s.last_message, verb: '已' };
+      return { tone: 'rest', what: s.settled === 'merged' ? '分支已合并，自动算作验收' : '空闲，等你派活', detail: s.last_message, verb: '已' };
   }
 }
 
@@ -125,6 +127,25 @@ async function act(s, fn, { thenNext = true } = {}) {
 
 const decide = (s, decision, remember = false) =>
   act(s, () => call(`/api/requests/${s.waiting.id}`, { decision, remember }), { thenNext: decision !== 'terminal' });
+// Multiple-choice questions are answered here with the same choices the
+// agent's own terminal offers; free text stands in for "type something".
+function answersFor(s) {
+  const mine = picks.get(s.waiting.id) || {};
+  const out = {};
+  for (const q of s.waiting.questions) {
+    const p = mine[q.question];
+    const chosen = [...(p?.chosen || [])];
+    const other = (p?.other || '').trim();
+    if (other) chosen.push(other);
+    if (chosen.length) out[q.question] = q.multiSelect ? chosen : chosen[chosen.length - 1];
+  }
+  return out;
+}
+const answer = (s) => {
+  const answers = answersFor(s);
+  if (Object.keys(answers).length < s.waiting.questions.length) return say(s.key, '每个问题都要选一个或填一个答案。');
+  return act(s, () => call(`/api/requests/${s.waiting.id}`, { decision: 'answer', answers }));
+};
 const ack = (s) => act(s, () => call(`/api/sessions/${encodeURIComponent(s.key)}/ack`, {}));
 const archive = (s) => act(s, () => call(`/api/sessions/${encodeURIComponent(s.key)}/archive`, {}));
 
@@ -377,15 +398,51 @@ function replyBox(s) {
     ));
 }
 
+function questionForm(s) {
+  const id = s.waiting.id;
+  const mine = picks.get(id) || picks.set(id, {}).get(id);
+  const single = s.waiting.questions.length === 1 && !s.waiting.questions[0].multiSelect;
+  return el('div', { className: 'questions' }, s.waiting.questions.map((q, i) => {
+    const p = (mine[q.question] ||= { chosen: new Set(), other: '' });
+    return el('fieldset', {},
+      el('legend', { textContent: q.question }),
+      q.multiSelect && el('div', { className: 'note', textContent: '可以多选' }),
+      el('div', { className: 'options' }, q.options.map((o) => el('button', {
+        type: 'button', className: 'option', ariaPressed: String(p.chosen.has(o.label)),
+        onclick: () => {
+          if (q.multiSelect) p.chosen.has(o.label) ? p.chosen.delete(o.label) : p.chosen.add(o.label);
+          else { p.chosen.clear(); p.chosen.add(o.label); p.other = ''; }
+          if (single) answer(s); else render();
+        },
+      }, el('b', { textContent: o.label }), o.description && el('span', { textContent: o.description })))),
+      el('input', {
+        id: `other-${id}-${i}`, type: 'text', placeholder: '或者自己写一个答案…', value: p.other,
+        oninput: (e) => { p.other = e.target.value; if (!q.multiSelect && p.other) p.chosen.clear(); },
+        onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); answer(s); } },
+      }),
+    );
+  }));
+}
+
 function nowBlock(s, d) {
+  const asking = s.state === 'needs_input' && s.waiting.kind === 'question';
+  const form = asking && s.waiting.decidable && s.waiting.questions?.length;
   const kids = [
     el('div', { className: 'status' },
       el('span', { className: 'what', textContent: d.what }),
       el('span', { className: 'age', textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前` })),
-    d.detail && el('div', { className: `box${d.code ? ' code' : ' prose'}`, textContent: d.detail }),
+    !form && d.detail && el('div', { className: `box${d.code ? ' code' : ' prose'}`, textContent: d.detail }),
+    form && questionForm(s),
   ];
   const actions = el('div', { className: 'actions' });
-  if (s.state === 'needs_input' && s.waiting.kind === 'permission') {
+  if (form) {
+    actions.append(
+      el('button', { className: 'primary', textContent: '回答', onclick: () => answer(s) }),
+      el('button', { textContent: '交回终端', title: '不在这里回答，让它在自己的终端里问你', onclick: () => decide(s, 'terminal') }),
+    );
+  } else if (asking) {
+    actions.append(el('span', { className: 'note', textContent: '这个提问现在只能在它自己的终端里回答。' }));
+  } else if (s.state === 'needs_input' && s.waiting.kind === 'permission') {
     if (s.waiting.decidable) {
       actions.append(
         el('button', { className: 'primary', textContent: '允许 (A)', onclick: () => decide(s, 'allow') }),
@@ -423,7 +480,9 @@ function renderBench() {
   const more = extra.get(s.key) || {};
   // Typing must survive live re-renders.
   const active = document.activeElement;
-  const typing = active?.id === 'reply' ? { start: active.selectionStart, end: active.selectionEnd } : null;
+  const typing = active?.id && active.matches('input[type="text"], textarea')
+    ? { id: active.id, start: active.selectionStart, end: active.selectionEnd } : null;
+  const scope = scopes.get(s.key) || (s.files.length ? 'session' : 'all');
 
   const diff = more.diff;
   const changed = diff?.available && (diff.status || diff.diff);
@@ -441,7 +500,11 @@ function renderBench() {
     s.last_message && s.state !== 'review' && el('h3', { textContent: '它上一次说的' }),
     s.last_message && s.state !== 'review' && el('div', { className: 'prose', textContent: s.last_message }),
 
-    diff?.available && el('h3', { textContent: '工作区里的改动（相对上一次提交，不只是这个会话改的）' }),
+    diff?.available && el('h3', {}, diff.scope === 'session'
+      ? `这个会话改过的 ${diff.attributed} 个文件（相对上一次提交；它用命令行改的不在内）`
+      : '整个工作区的改动（相对上一次提交，不只是这个会话改的）'),
+    diff?.available && s.files.length > 0 && el('div', { className: 'actions', style: 'margin-top:0' },
+      el('button', { textContent: scope === 'session' ? '看整个工作区' : '只看这个会话改的', onclick: () => { scopes.set(s.key, scope === 'session' ? 'all' : 'session'); render(); } })),
     diff?.available && !changed && el('p', { className: 'note', textContent: '没有未提交的改动。' }),
     changed && el('div', { className: 'box code', textContent: [diff.stat, diff.status].filter(Boolean).join('\n\n') }),
     changed && diff.diff && el('details', { open: s.state === 'review' },
@@ -467,21 +530,22 @@ function renderBench() {
   ].filter(Boolean));
 
   if (typing) {
-    const area = $('#reply');
-    if (area) { area.focus(); area.setSelectionRange(typing.start, typing.end); }
+    const field = document.getElementById(typing.id);
+    if (field) { field.focus(); field.setSelectionRange(typing.start, typing.end); }
   }
 }
 
 // Diff and event history are fetched when a session is opened and again
 // whenever it changes state.
 async function loadExtra(s) {
-  const sig = `${s.state}:${s.last_event_ts}`;
+  const scope = scopes.get(s.key) || (s.files.length ? 'session' : 'all');
+  const sig = `${s.state}:${s.last_event_ts}:${scope}`;
   const have = extra.get(s.key);
   if (have?.sig === sig) return;
   extra.set(s.key, { ...have, sig });
   const key = encodeURIComponent(s.key);
   const [diff, events] = await Promise.all([
-    call(`/api/sessions/${key}/diff`).catch(() => null),
+    call(`/api/sessions/${key}/diff?scope=${scope}`).catch(() => null),
     call(`/api/sessions/${key}/events`).catch(() => null),
   ]);
   extra.set(s.key, { sig, diff, events });
@@ -597,7 +661,7 @@ $('#backfill').onclick = async (e) => {
 };
 
 document.addEventListener('keydown', (e) => {
-  if (e.target.matches('input, textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.matches('input[type="text"], textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
   const s = byKey(selected);
   const k = e.key.toLowerCase();
   if (k === 'n') {
@@ -624,5 +688,5 @@ for (const id of ['notify', 'sound']) {
   };
 }
 setView(['board', 'office'].includes(prefs.get('view')) ? prefs.get('view') : 'inbox');
-setInterval(() => { if (document.activeElement?.id !== 'reply') render(); }, 5000); // keep timers ticking
+setInterval(() => { if (!document.activeElement?.matches('input[type="text"], textarea')) render(); }, 5000); // keep timers ticking
 connect();
