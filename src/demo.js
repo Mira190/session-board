@@ -18,6 +18,9 @@ export async function demo(url, { speed = 1, headers = { 'content-type': 'applic
   const c = S('claude', 'cloud', `demo-docs-${run}`, '/home/user/docs-site', 'cloud');
   const d = S('codex', 'devbox', `demo-migrate-${run}`, '/srv/billing');
   const e = S('claude', 'macbook', `demo-perf-${run}`, '/work/web-app');
+  // The same job given to both agents: one task, two versions to compare.
+  const f = S('claude', 'macbook', `demo-csv-a-${run}`, '/work/shop-api');
+  const g = S('codex', 'macbook', `demo-csv-b-${run}`, '/work/shop-api');
 
   const steps = [
     () => a('SessionStart', { source: 'startup' }),
@@ -37,6 +40,10 @@ export async function demo(url, { speed = 1, headers = { 'content-type': 'applic
     () => d('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'psql -f migrations/0042_split_address.sql' } }),
     () => b('Stop', { last_assistant_message: 'The test raced the payment webhook. I added an explicit wait on the order status and ran it 30 times: 30/30 passing. One file changed: test/checkout.int.test.ts.' }),
     () => c('Stop', { last_assistant_message: '已迁移 14 个文件里的 61 处示例，并开了 PR。有 3 处 v1 独有的字段在 v2 没有对应，我在 PR 描述里列出来了，需要你决定怎么写。' }),
+    () => f('UserPromptSubmit', { prompt: '给订单导出加上 CSV 格式，保留现有的 JSON 导出' }),
+    () => g('UserPromptSubmit', { prompt: '给订单导出加上 CSV 格式，保留现有的 JSON 导出' }),
+    () => f('Stop', { last_assistant_message: '加了 /orders/export?format=csv，用流式写出，10 万行内存稳定。改了 4 个文件，补了 6 个测试。' }),
+    () => g('Stop', { last_assistant_message: 'Added CSV export behind the existing endpoint via an Accept header. 2 files changed, 3 tests. Large exports are buffered in memory.' }),
     () => c('SessionEnd', { reason: 'other' }),
     () => fetch(`${url}/ingest/event`, {
       method: 'POST',

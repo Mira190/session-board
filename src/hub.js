@@ -15,6 +15,7 @@ import { scanHistory, usageFor } from './transcripts.js';
 import { createGitHub } from './github.js';
 import { ruleMatches, ruleProblem, stemOf } from './rules.js';
 import { createNotifier } from './notify.js';
+import { groupTasks } from './tasks.js';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -108,6 +109,7 @@ export function createHub({
   github = createGitHub(),
   notifier = null, // injectable; built from the environment by default
   boardUrl = '',
+  ignoreCwds = [], // sessions running here are not shown (the triage runner's own)
   launch = (cmd, args, cwd) => spawn(cmd, args, { cwd, detached: true, stdio: 'ignore' }).unref(),
 } = {}) {
   const store = new Store(dbPath);
@@ -150,15 +152,34 @@ export function createHub({
     snoozed: !!s.snoozed_until && now() < s.snoozed_until,
     // A reply that the agent has not confirmed receiving.
     undelivered: !!s.outgoing && now() - s.outgoing.ts > UNDELIVERED_MS,
+    // Which task this belongs to, when it shares one with other sessions.
+    task: tasks.get(s.key)?.size > 1 ? { id: tasks.get(s.key).id, size: tasks.get(s.key).size } : null,
+    // A triage note counts only for the item it was written about.
+    triage: s.triage && s.triage.for === itemId(s) ? s.triage : null,
   });
+  // What a triage note is about: this state of this session, since this moment.
+  const itemId = (s) => `${s.key}@${s.waiting?.kind || s.state}@${s.since}`;
   // The board row: everything a card, the queue and the office need, and
   // nothing else. Long text and file lists come with the detail request for
   // the one session that is open. test/more.test.js holds this to a budget.
   const short = (t) => (typeof t === 'string' && t.length > ROW_TEXT ? `${t.slice(0, ROW_TEXT - 1)}…` : t);
   const view = (s) => {
-    const { files, transcript, auto_allow, acked, start_head, pr_alert, ...row } = full(s);
+    const { files, transcript, auto_allow, acked, start_head, pr_alert, repo_id, ...row } = full(s);
     return { ...row, last_prompt: short(row.last_prompt), last_message: short(row.last_message), files_count: files.length };
   };
+  // Task membership depends on every session, so it is recomputed as a whole
+  // and the sessions whose task changed are re-sent.
+  let tasks = new Map();
+  function refreshTasks() {
+    const next = groupTasks(store.list().filter((s) => !s.archived));
+    const changed = [];
+    for (const [key, t] of next) {
+      const was = tasks.get(key);
+      if ((was?.size > 1 ? was.id : null) !== (t.size > 1 ? t.id : null) || (was?.size || 1) !== t.size) changed.push(key);
+    }
+    tasks = next;
+    return changed;
+  }
   let rules = store.rules(); // global: [{ tool, detail, mode }]
   // Someone is "present" while a board page has reported itself visible lately.
   let lookedAt = 0;
@@ -166,6 +187,7 @@ export function createHub({
   const push = notifier || createNotifier({ boardUrl, isPresent: present });
   store.onChange((s) => push.consider(s));
   const snapshot = () => {
+    refreshTasks();
     const sessions = store.list().filter((s) => !s.archived).map(view);
     return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length };
   };
@@ -184,6 +206,7 @@ export function createHub({
     if (pending) return;
     pending = setTimeout(() => {
       pending = null;
+      for (const key of refreshTasks()) dirty.add(key);
       const changed = [];
       const removed = [];
       for (const key of dirty) {
@@ -229,14 +252,19 @@ export function createHub({
     if (!s.cwd || !existsSync(s.cwd)) return;
     if (now() - (looked.get(s.key) || 0) < 15_000) return;
     looked.set(s.key, now());
-    const [top, branch, head] = await Promise.all([
+    const [top, branch, head, remote, common] = await Promise.all([
       git(s.cwd, ['rev-parse', '--show-toplevel']),
       git(s.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']),
       s.start_head ? null : git(s.cwd, ['rev-parse', 'HEAD']),
+      s.repo_id ? null : git(s.cwd, ['remote', 'get-url', 'origin']),
+      s.repo_id ? null : git(s.cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
     ]);
     const repo = top ? basename(top) : basename(s.cwd);
-    if (repo !== s.repo || branch !== s.branch || (head && !s.start_head)) {
-      emit(s, 'meta.updated', { repo, branch, ...(head ? { head } : {}) });
+    // Worktrees of one repository have different folders but share a remote
+    // (or at least a git directory): that is what makes them the same repo.
+    const repoId = s.repo_id ? null : (remote ? remote.replace(/\/\/[^@/]*@/, '//') : common);
+    if (repo !== s.repo || branch !== s.branch || (head && !s.start_head) || repoId) {
+      emit(s, 'meta.updated', { repo, branch, ...(head ? { head } : {}), ...(repoId ? { repo_id: repoId } : {}) });
     }
   }
 
@@ -584,6 +612,8 @@ export function createHub({
       } catch {
         return json(res, 200, {});
       }
+      // The triage runner is itself an agent session; it stays off the board.
+      if (payload.cwd && ignoreCwds.includes(payload.cwd)) return json(res, 200, {});
       const q = url.searchParams;
       const tmux = q.get('tmux_pane') && q.get('tmux_socket')
         ? { socket: q.get('tmux_socket'), pane: q.get('tmux_pane') }
@@ -629,6 +659,58 @@ export function createHub({
       });
       return;
     }
+    // --- triage: an agent may read what is open and attach advice; nothing more.
+    if (path === '/api/triage' && req.method === 'GET') {
+      const live = store.list().filter((s) => !s.archived);
+      const open = attentionQueue(live, now()).filter((s) => s.triage?.for !== itemId(s)).slice(0, 12);
+      return json(res, 200, open.map((s) => ({
+        item: itemId(s),
+        kind: s.waiting?.kind || s.state,
+        agent: s.agent,
+        repo: s.repo,
+        task: s.title,
+        tool: s.waiting?.tool || null,
+        request: s.waiting?.detail || null,
+        looks_drastic: !!s.waiting?.risky,
+        error: s.error,
+        last_instruction: s.last_prompt,
+        last_reply: s.state === 'review' || s.state === 'failed' ? s.last_message : null,
+        files_edited: s.files.length,
+      })));
+    }
+    if (path === '/api/triage' && req.method === 'POST') {
+      const { item, summary, suggestion } = await body();
+      const s = store.get(String(item || '').split('@')[0]);
+      if (!s || itemId(s) !== item) return json(res, 409, { error: 'that item is no longer open' });
+      if (typeof summary !== 'string' || !summary.trim()) return json(res, 400, { error: 'summary required' });
+      if (!['allow', 'deny', 'look', 'none'].includes(suggestion || 'none')) return json(res, 400, { error: 'suggestion must be allow, deny, look or none' });
+      emit(s, 'triage.noted', { for: item, summary: summary.trim(), suggestion: suggestion || 'none' });
+      return json(res, 200, { ok: true });
+    }
+
+    // --- tasks: accept a whole task at once, optionally adopting one version.
+    const task = path.match(/^\/api\/tasks\/([^/]+)\/ack$/);
+    if (task && req.method === 'POST') {
+      const id = decodeURIComponent(task[1]);
+      const { adopt } = await body();
+      refreshTasks();
+      const members = [...new Set([...tasks.values()].filter((t) => t.id === id).flatMap((t) => t.members))];
+      if (!members.length) return json(res, 404, { error: 'no such task' });
+      if (adopt && !members.includes(adopt)) return json(res, 400, { error: 'that session is not part of this task' });
+      const acked = [];
+      const archived = [];
+      for (const key of members) {
+        const s = store.get(key);
+        if (['review', 'failed', 'unknown'].includes(s.phase)) { emit(s, 'human.acknowledged'); acked.push(key); }
+        // Adopting one version files the others away; work still running is left alone.
+        if (adopt && key !== adopt && store.get(key).state !== 'working' && store.get(key).state !== 'needs_input') {
+          emit(store.get(key), 'human.archived');
+          archived.push(key);
+        }
+      }
+      return json(res, 200, { acked, archived });
+    }
+
     if (path === '/api/presence' && req.method === 'POST') {
       const { visible } = await body();
       lookedAt = visible ? now() : 0;
@@ -696,7 +778,7 @@ export function createHub({
         : json(res, 410, { error: 'this request is no longer waiting on the board' });
     }
 
-    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail)$/);
+    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail|task)$/);
     if (act) {
       const key = decodeURIComponent(act[1]);
       const s = store.get(key);
@@ -717,6 +799,13 @@ export function createHub({
           const { tool, allow } = await body();
           if (typeof tool !== 'string') return json(res, 400, { error: 'tool required' });
           emit(s, allow === false ? 'rule.removed' : 'rule.added', { tool });
+          return json(res, 200, view(store.get(key)));
+        }
+        if (verb === 'task') {
+          // { join: <session key> } puts it with that session's task; { join: null } pulls it out.
+          const { join } = await body();
+          if (join && (!store.get(join) || join === key)) return json(res, 400, { error: 'no such session to join' });
+          emit(s, 'task.assigned', { task: join || 'solo' });
           return json(res, 200, view(store.get(key)));
         }
         if (verb === 'snooze') {
