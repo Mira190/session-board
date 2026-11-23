@@ -246,3 +246,10 @@ dialog h3 { margin: 0 0 6px; font-size: 16px; }
 .desk .flag.wait { color: #fff; background: var(--urgent); border-color: var(--urgent); }
 .desk .flag.done { color: var(--ok); border-color: var(--ok); }
 .queue-more { position: absolute; z-index: 2; min-width: 44px; height: 44px; border-radius: 50%; border: 2px dashed var(--urgent); color: var(--urgent); font-weight: 700; background: var(--card); }
+
+/* ---- filing: unread, snooze, undo ---- */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: middle; }
+#toast { position: fixed; left: 50%; bottom: 44px; transform: translateX(-50%); z-index: 20; display: flex; gap: 12px; align-items: center;
+  background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 10px; box-shadow: var(--shadow); font-size: 13px; max-width: calc(100vw - 32px); }
+#toast[hidden] { display: none; }
+#toast button { background: none; border: 1px solid currentColor; color: inherit; padding: 1px 10px; }

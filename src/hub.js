@@ -47,6 +47,9 @@ export const PR_POLL_MS = 2 * 60 * 1000;
 const PR_WATCH_MS = 14 * 24 * 60 * 60 * 1000;
 // How long finished sessions stay on the board before the hub files them away.
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
+// A reply not confirmed by the agent within this long is shown as undelivered.
+export const UNDELIVERED_MS = 20_000;
+const ROW_TEXT = 200; // characters of prompt / reply text carried on a board row
 
 const decisionBody = (behavior, message) => ({
   hookSpecificOutput: {
@@ -110,25 +113,48 @@ export function createHub({
 
   const isLocal = (s) => s.runtime !== 'cloud' && !!localHost && s.host === localHost;
   // How a message typed in the board can reach this session, if at all.
+  // Keys typed into a terminal go to whatever it is showing. While the agent
+  // is asking for permission or putting a question, "text + Enter" would be
+  // taken as the answer to that prompt, so typing is refused until it clears.
+  const promptOpen = (s) => s.requests.some((r) => r.kind === 'permission' || r.kind === 'question');
   const replyRoute = (s) => {
     if (!isLocal(s)) return null;
-    if (s.tmux?.pane) return 'tmux';
+    if (s.tmux?.pane) return promptOpen(s) ? null : 'tmux';
     if (s.exited || s.imported) return 'headless';
     return null;
   };
 
-  const view = (s) => ({
+  // How an open request can still be answered: 'live' (its hook is waiting on
+  // us), 'message' (only by sending the session a message), or 'terminal'
+  // (only in the agent's own UI).
+  const capability = (s, r) => (r.id && held.has(r.id) ? 'live' : r.kind === 'pr' && replyRoute(s) ? 'message' : 'terminal');
+  const ATTENTION = new Set(['needs_input', 'review', 'failed', 'unknown']);
+  const full = (s) => ({
     ...s,
-    requests: s.requests.map((r) => ({ ...r, decidable: !!r.id && held.has(r.id) })),
-    waiting: s.waiting && { ...s.waiting, decidable: !!s.waiting.id && held.has(s.waiting.id) },
+    requests: s.requests.map((r) => ({ ...r, decidable: !!r.id && held.has(r.id), capability: capability(s, r) })),
+    waiting: s.waiting && { ...s.waiting, decidable: !!s.waiting.id && held.has(s.waiting.id), capability: capability(s, s.waiting) },
     quiet: s.state === 'working' && now() - s.last_event_ts > QUIET_MS,
     local: isLocal(s),
     reply: replyRoute(s),
+    reply_blocked: isLocal(s) && !!s.tmux?.pane && promptOpen(s),
+    // Something the human has not looked at since it came up.
+    unseen: ATTENTION.has(s.state) && s.since > s.seen_ts,
+    snoozed: !!s.snoozed_until && now() < s.snoozed_until,
+    // A reply that the agent has not confirmed receiving.
+    undelivered: !!s.outgoing && now() - s.outgoing.ts > UNDELIVERED_MS,
   });
+  // The board row: everything a card, the queue and the office need, and
+  // nothing else. Long text and file lists come with the detail request for
+  // the one session that is open. test/more.test.js holds this to a budget.
+  const short = (t) => (typeof t === 'string' && t.length > ROW_TEXT ? `${t.slice(0, ROW_TEXT - 1)}…` : t);
+  const view = (s) => {
+    const { files, transcript, auto_allow, acked, start_head, pr_alert, ...row } = full(s);
+    return { ...row, last_prompt: short(row.last_prompt), last_message: short(row.last_message), files_count: files.length };
+  };
   let rules = store.rules(); // global: [{ tool, detail }]
   const snapshot = () => {
     const sessions = store.list().filter((s) => !s.archived).map(view);
-    return { now: now(), sessions, queue: attentionQueue(sessions).map((s) => s.key), rules: rules.length };
+    return { now: now(), sessions, queue: attentionQueue(sessions, now()).map((s) => s.key), rules: rules.length };
   };
 
   // Live updates are deltas: a client gets the full picture once, then only
@@ -163,7 +189,7 @@ export function createHub({
       dirty.clear();
       if (!clients.size || (!changed.length && !removed.length)) return;
       const live = store.list().filter((x) => !x.archived).map(view);
-      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live).map((x) => x.key), rules: rules.length })}\n\n`;
+      const msg = `data: ${JSON.stringify({ now: now(), changed, removed, queue: attentionQueue(live, now()).map((x) => x.key), rules: rules.length })}\n\n`;
       for (const res of clients) res.write(msg);
     }, TICK_MS);
   };
@@ -326,7 +352,20 @@ export function createHub({
   }
 
   // --- talking back -------------------------------------------------------
-  async function sendMessage(s, text) {
+  // A double click or a client retry must not type the message twice.
+  const commands = new Map(); // command id -> result
+  async function sendMessage(s, text, commandId) {
+    if (commandId && commands.has(commandId)) return commands.get(commandId);
+    const done = (result) => {
+      if (commandId) {
+        commands.set(commandId, result);
+        if (commands.size > 500) commands.delete(commands.keys().next().value);
+      }
+      // Recorded as sent; it becomes "delivered" only when the agent's own
+      // hook reports this prompt.
+      emit(s, 'reply.sent', { text, via: result.via });
+      return result;
+    };
     const route = replyRoute(s);
     if (route === 'tmux') {
       const t = ['-S', s.tmux.socket];
@@ -337,7 +376,7 @@ export function createHub({
           (await run('tmux', [...t, 'send-keys', '-t', s.tmux.pane, 'Enter'])) == null) {
         throw Object.assign(new Error('tmux refused the keys'), { status: 502 });
       }
-      return { via: 'tmux' };
+      return done({ via: 'tmux' });
     }
     if (route === 'headless') {
       if (!s.cwd || !existsSync(s.cwd)) throw Object.assign(new Error('the session directory no longer exists'), { status: 409 });
@@ -347,11 +386,12 @@ export function createHub({
         ? ['claude', ['-p', text, '--resume', s.session_id]]
         : ['codex', ['exec', 'resume', s.session_id, text]];
       launch(cmd, args, s.cwd);
-      emit(s, 'prompt.submitted', { prompt: text, via: 'board' });
-      return { via: 'headless' };
+      return done({ via: 'headless' });
     }
     throw Object.assign(
-      new Error('this session is open in a terminal the board cannot type into (not tmux, not on this machine)'),
+      new Error(isLocal(s) && s.tmux?.pane
+        ? 'the terminal is showing a prompt; typing now would answer it. Deal with the open request first'
+        : 'this session is open in a terminal the board cannot type into (not tmux, not on this machine)'),
       { status: 409 },
     );
   }
@@ -626,7 +666,7 @@ export function createHub({
         : json(res, 410, { error: 'this request is no longer waiting on the board' });
     }
 
-    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|archive|events|message|diff|rule)$/);
+    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|unack|archive|unarchive|seen|unseen|snooze|unsnooze|events|message|diff|rule|detail)$/);
     if (act) {
       const key = decodeURIComponent(act[1]);
       const s = store.get(key);
@@ -634,13 +674,14 @@ export function createHub({
       const verb = act[2];
       if (req.method === 'GET') {
         if (verb === 'events') return json(res, 200, store.events(key));
+        if (verb === 'detail') return json(res, 200, full(s));
         if (verb === 'diff') return json(res, 200, await workingTree(s, url.searchParams.get('scope') || 'all'));
       }
       if (req.method === 'POST') {
         if (verb === 'message') {
-          const { text } = await body();
+          const { text, command_id } = await body();
           if (typeof text !== 'string' || !text.trim()) return json(res, 400, { error: 'empty message' });
-          return json(res, 200, await sendMessage(s, text.trim()));
+          return json(res, 200, await sendMessage(s, text.trim(), command_id));
         }
         if (verb === 'rule') {
           const { tool, allow } = await body();
@@ -648,8 +689,18 @@ export function createHub({
           emit(s, allow === false ? 'rule.removed' : 'rule.added', { tool });
           return json(res, 200, view(store.get(key)));
         }
-        if (verb === 'ack' || verb === 'archive') {
-          emit(s, verb === 'ack' ? 'human.acknowledged' : 'human.archived');
+        if (verb === 'snooze') {
+          const { minutes, until } = await body();
+          const at = Number(until) || now() + (Number(minutes) > 0 ? Number(minutes) : 60) * 60_000;
+          emit(s, 'human.snoozed', { until: at });
+          return json(res, 200, view(store.get(key)));
+        }
+        const filing = {
+          ack: 'human.acknowledged', unack: 'human.unacknowledged', archive: 'human.archived', unarchive: 'human.unarchived',
+          seen: 'human.seen', unseen: 'human.unseen', unsnooze: 'human.unsnoozed',
+        }[verb];
+        if (filing) {
+          emit(s, filing);
           return json(res, 200, view(store.get(key)));
         }
       }
