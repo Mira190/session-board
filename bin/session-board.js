@@ -8,82 +8,144 @@ const { values: opt, positionals } = parseArgs({
   options: {
     port: { type: 'string', default: process.env.SESSION_BOARD_PORT || '4590' },
     bind: { type: 'string', default: process.env.SESSION_BOARD_BIND || '127.0.0.1' },
-    db: { type: 'string', default: process.env.SESSION_BOARD_DB || join(homedir(), '.session-board', 'board.db') },
-    url: { type: 'string', default: process.env.SESSION_BOARD_URL },
+    db: { type: 'string' },
+    url: { type: 'string' },
     host: { type: 'string', default: hostname() },
+    days: { type: 'string', default: '7' },
     'dry-run': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
   },
 });
 const [cmd, arg] = positionals;
-const url = (opt.url || `http://127.0.0.1:${opt.port}`).replace(/\/$/, '');
-const token = process.env.SESSION_BOARD_TOKEN || null;
 
-const HELP = `session-board — one inbox for all your coding-agent sessions
+const HELP = `session-board — one place for all your coding-agent sessions
 
-  session-board serve                 start the hub and the board UI
+  session-board serve                     start the hub and the board UI
   session-board install <claude|codex>    add hooks to the agent's config
   session-board uninstall <claude|codex>  remove them again
-  session-board demo                  play scripted sessions into a running hub
-  session-board hook <claude|codex>   (used by hooks) forward stdin to the hub
+  session-board status                    is the hub up, are the hooks in place
+  session-board backfill [--days 7]       import sessions that predate the hooks
+  session-board demo                      play scripted sessions into a running hub
+  session-board hook <claude|codex>       (used by hooks) forward stdin to the hub
 
 Options: --port 4590  --bind 127.0.0.1  --db <file>  --url <hub url>
          --host <label for this machine>  --dry-run
-Env:     SESSION_BOARD_TOKEN  require this bearer token on every request`;
+Env:     SESSION_BOARD_TOKEN  require this bearer token on every request
+         SESSION_BOARD_HOME   where the database and endpoint file live`;
+
+async function endpoint() {
+  const { readEndpoint } = await import('../src/endpoint.js');
+  const found = readEndpoint();
+  return { url: (opt.url || found.url).replace(/\/$/, ''), token: process.env.SESSION_BOARD_TOKEN || found.token || null };
+}
+const authHeaders = (token) => ({
+  'content-type': 'application/json',
+  ...(token ? { authorization: `Bearer ${token}` } : {}),
+});
+
+// Runs inside the agent's hook: quick, silent, and it never fails the agent.
+async function hook(agent) {
+  try {
+    let body = '';
+    for await (const chunk of process.stdin) body += chunk;
+    const { url, token } = await endpoint();
+    const q = new URLSearchParams({
+      host: opt.host,
+      source: 'bridge',
+      // Microsecond send time: lets the hub drop a report that arrives after
+      // a newer one from this bridge.
+      seq: String(Math.round((performance.timeOrigin + performance.now()) * 1000)),
+    });
+    if (process.env.TMUX && process.env.TMUX_PANE) {
+      q.set('tmux_socket', process.env.TMUX.split(',')[0]);
+      q.set('tmux_pane', process.env.TMUX_PANE);
+    }
+    // A permission request waits for the human's answer; the rest must not.
+    const waits = /"hook_event_name"\s*:\s*"PermissionRequest"/.test(body);
+    const res = await fetch(`${url}/ingest/${agent}?${q}`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body,
+      signal: AbortSignal.timeout(waits ? 590_000 : 1500),
+    });
+    const answer = await res.text();
+    if (waits && res.ok && answer.includes('hookSpecificOutput')) process.stdout.write(answer);
+  } catch {
+    /* hub not running: the agent must not notice */
+  }
+}
 
 async function main() {
   if (opt.help || !cmd) return console.log(HELP);
-
-  if (cmd === 'hook') {
-    // Runs inside the agent's hook: must be quick, silent, and never fail.
-    try {
-      let body = '';
-      for await (const chunk of process.stdin) body += chunk;
-      await fetch(`${url}/ingest/${arg}?host=${encodeURIComponent(opt.host)}`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          ...(token ? { authorization: `Bearer ${token}` } : {}),
-        },
-        body,
-        signal: AbortSignal.timeout(1500),
-      });
-    } catch {
-      /* hub not running: the agent must not notice */
-    }
-    return;
-  }
+  if (cmd === 'hook') return hook(arg);
 
   if (cmd === 'serve') {
     const { createHub } = await import('../src/hub.js');
-    if (opt.bind !== '127.0.0.1' && opt.bind !== 'localhost' && !token) {
+    const { writeEndpoint, home } = await import('../src/endpoint.js');
+    const { install, status } = await import('../src/install.js');
+    const token = process.env.SESSION_BOARD_TOKEN || null;
+    const local = opt.bind === '127.0.0.1' || opt.bind === 'localhost';
+    if (!local && !token) {
       console.error('Refusing to listen beyond localhost without SESSION_BOARD_TOKEN set.');
       process.exit(1);
     }
-    const hub = createHub({ dbPath: opt.db, token });
+    const db = opt.db || process.env.SESSION_BOARD_DB || join(home(), 'board.db');
+    const hub = createHub({ dbPath: db, token, localHost: opt.host });
     await hub.listen(Number(opt.port), opt.bind);
-    console.log(`session-board on http://${opt.bind}:${opt.port}  (db: ${opt.db})`);
+    const url = `http://127.0.0.1:${opt.port}`;
+    writeEndpoint({ url, token });
+    console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
+    // Claude Code's HTTP hooks carry the hub address; follow the hub if it moved.
+    const claude = status('claude');
+    if (claude.installed && claude.url !== url) {
+      install('claude', { url, host: opt.host, token });
+      console.log(`updated Claude Code hooks: ${claude.url} -> ${url}`);
+    }
+    const lost = await hub.reconcile().catch(() => 0);
+    if (lost) console.log(`${lost} session(s) had no agent process left and were marked unknown`);
     return;
   }
 
   if (cmd === 'install' || cmd === 'uninstall') {
     if (arg !== 'claude' && arg !== 'codex') throw new Error('specify claude or codex');
     const { install } = await import('../src/install.js');
-    const { path, after } = install(arg, {
-      url, host: opt.host, token, dryRun: opt['dry-run'], remove: cmd === 'uninstall',
+    const { url, token } = await endpoint();
+    const { path, after, changed } = install(arg, {
+      url, host: opt.host, token, pin: !!opt.url, dryRun: opt['dry-run'], remove: cmd === 'uninstall',
     });
     if (opt['dry-run']) console.log(JSON.stringify(after, null, 2));
-    console.log(`${opt['dry-run'] ? 'Would write' : 'Wrote'} ${path}`);
-    if (arg === 'codex' && cmd === 'install' && !opt['dry-run']) {
+    console.log(!changed ? `${path} is already up to date` : `${opt['dry-run'] ? 'Would write' : 'Wrote'} ${path}`);
+    if (arg === 'codex' && cmd === 'install' && changed && !opt['dry-run']) {
       console.log('Codex asks you to review new hooks: run /hooks inside Codex once to trust them.');
     }
     return;
   }
 
-  if (cmd === 'demo') {
-    const { demo } = await import('../src/demo.js');
-    await demo(url);
-    return console.log('demo events sent');
+  if (cmd === 'status') {
+    const { status } = await import('../src/install.js');
+    const { url, token } = await endpoint();
+    const up = await fetch(`${url}/api/sessions`, { headers: authHeaders(token), signal: AbortSignal.timeout(1500) })
+      .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    console.log(`hub     ${url}  ${up ? `up, ${up.sessions.length} sessions, ${up.queue.length} waiting on you` : 'not reachable'}`);
+    for (const agent of ['claude', 'codex']) {
+      const s = status(agent);
+      const note = !s.installed ? 'hooks not installed' : s.url && s.url !== url ? `hooks point at ${s.url} (start the hub to repair)` : 'hooks installed';
+      console.log(`${agent.padEnd(7)} ${note}  (${s.path})`);
+    }
+    return;
+  }
+
+  if (cmd === 'backfill' || cmd === 'demo') {
+    const { url, token } = await endpoint();
+    if (cmd === 'demo') {
+      const { demo } = await import('../src/demo.js');
+      await demo(url, { headers: authHeaders(token) });
+      return console.log('demo events sent. Its permission requests stay open until you answer them in the board (Ctrl+C to stop).');
+    }
+    const res = await fetch(`${url}/api/backfill`, { method: 'POST', headers: authHeaders(token), body: JSON.stringify({ days: Number(opt.days) }) });
+    const out = await res.json();
+    if (!res.ok) throw new Error(out.error);
+    return console.log(`found ${out.scanned} sessions in the last ${opt.days} days, imported ${out.imported} new`);
   }
 
   console.log(HELP);

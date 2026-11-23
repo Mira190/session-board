@@ -4,7 +4,7 @@
 
 const text = (v) => (typeof v === 'string' ? v : v == null ? null : JSON.stringify(v));
 
-export function fromHook(agent, p, { host, runtime, now = Date.now() } = {}) {
+export function fromHook(agent, p, { host, runtime, now = Date.now(), seq = null, source = null, tmux = null } = {}) {
   if (!p || typeof p !== 'object' || !p.session_id || !p.hook_event_name) return [];
   const base = {
     ts: now,
@@ -13,12 +13,14 @@ export function fromHook(agent, p, { host, runtime, now = Date.now() } = {}) {
     host: host || null,
     runtime: runtime || null,
     cwd: p.cwd || null,
+    transcript: p.transcript_path || null,
+    ...(seq != null ? { seq, source } : {}),
   };
   const ev = (type, data = {}) => [{ ...base, type, data }];
 
   switch (p.hook_event_name) {
     case 'SessionStart':
-      return ev('session.started', { source: p.source, title: p.session_title, model: p.model });
+      return ev('session.started', { source: p.source, title: p.session_title, model: p.model, tmux });
     case 'UserPromptSubmit':
       return ev('prompt.submitted', { prompt: text(p.prompt) });
     case 'PreToolUse':
@@ -36,6 +38,9 @@ export function fromHook(agent, p, { host, runtime, now = Date.now() } = {}) {
       switch (p.notification_type) {
         case 'permission_prompt':
           return ev('permission.requested', {});
+        case 'elicitation_complete':
+        case 'elicitation_response':
+          return ev('request.resolved', { kind: 'question' });
         case 'elicitation_dialog':
         case 'elicitation_url_dialog':
         case 'agent_needs_input':

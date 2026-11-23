@@ -1,13 +1,17 @@
-// The hub: receives hook events, keeps the projection, serves the board.
+// The hub: receives hook events, keeps the projection, serves the board, and
+// carries the human's decisions back to the agents.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { basename, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.js';
 import { fromHook } from './adapters/hooks.js';
 import { attentionQueue } from './reduce.js';
+import { liveAgents, orphanReason } from './reconcile.js';
+import { scanHistory, usageFor } from './transcripts.js';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -17,9 +21,23 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 const MAX_BODY = 2 * 1024 * 1024;
+const MAX_DIFF = 200 * 1024;
 // A "working" session that has been silent this long is flagged, not hidden:
 // we cannot tell a long build from a dead process, so we say what we know.
 export const QUIET_MS = 10 * 60 * 1000;
+// Do not judge a session orphaned until it has been silent this long.
+export const SETTLE_MS = 2 * 60 * 1000;
+// How long a permission request is held open for an answer from the board
+// before it is handed back to the agent's own prompt.
+export const HOLD_MS = 9 * 60 * 1000;
+const LOCAL_NAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+const decisionBody = (behavior, message) => ({
+  hookSpecificOutput: {
+    hookEventName: 'PermissionRequest',
+    decision: behavior === 'allow' ? { behavior } : { behavior, message: message || 'Denied from session-board' },
+  },
+});
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -37,21 +55,48 @@ function readBody(req) {
   });
 }
 
-function git(cwd, args) {
-  return new Promise((resolve) => {
-    execFile('git', ['-C', cwd, ...args], { timeout: 2000 }, (err, out) =>
-      resolve(err ? null : out.trim() || null),
+// Resolves with stdout, or null on failure. `okCodes` lists non-zero exit
+// codes that still mean success (git diff --no-index exits 1 on a difference).
+const run = (cmd, args, { okCodes = [], ...opts } = {}) =>
+  new Promise((resolve) => {
+    execFile(cmd, args, { timeout: 5000, maxBuffer: 16 << 20, ...opts }, (err, out) =>
+      resolve(err && !okCodes.includes(err.code) ? null : out),
     );
   });
-}
+const git = async (cwd, args) => (await run('git', ['-C', cwd, ...args]))?.trim() || null;
 
-export function createHub({ dbPath = ':memory:', token = null, now = () => Date.now() } = {}) {
+export function createHub({
+  dbPath = ':memory:',
+  token = null,
+  now = () => Date.now(),
+  localHost = null, // the host label this machine's hooks report as
+  allowedHosts = [], // extra Host names the UI may be reached under
+  holdMs = HOLD_MS,
+  agents = liveAgents, // injectable for tests
+  history = scanHistory,
+  launch = (cmd, args, cwd) => spawn(cmd, args, { cwd, detached: true, stdio: 'ignore' }).unref(),
+} = {}) {
   const store = new Store(dbPath);
   const clients = new Set();
+  const held = new Map(); // request id -> { res, key, tool, timer }
+  const hostNames = new Set([...LOCAL_NAMES, ...allowedHosts]);
+
+  const isLocal = (s) => s.runtime !== 'cloud' && !!localHost && s.host === localHost;
+  // How a message typed in the board can reach this session, if at all.
+  const replyRoute = (s) => {
+    if (!isLocal(s)) return null;
+    if (s.tmux?.pane) return 'tmux';
+    if (s.exited || s.imported) return 'headless';
+    return null;
+  };
 
   const view = (s) => ({
     ...s,
+    requests: s.requests.map((r) => ({ ...r, decidable: !!r.id && held.has(r.id) })),
+    waiting: s.waiting && { ...s.waiting, decidable: !!s.waiting.id && held.has(s.waiting.id) },
     quiet: s.state === 'working' && now() - s.last_event_ts > QUIET_MS,
+    local: isLocal(s),
+    reply: replyRoute(s),
   });
   const snapshot = () => {
     const sessions = store.list().filter((s) => !s.archived).map(view);
@@ -68,88 +113,284 @@ export function createHub({ dbPath = ':memory:', token = null, now = () => Date.
     }, 50);
   };
   store.onChange(broadcast);
+  // A request answered somewhere else (in the terminal, or swept away by the
+  // turn ending) must not stay answerable here.
+  store.onChange((s) => {
+    for (const [id, h] of [...held]) {
+      if (h.key === s.key && !s.requests.some((r) => r.id === id)) release(id);
+    }
+  });
   // Re-send periodically so "quiet" flags and timers stay honest without events.
   const tick = setInterval(() => clients.size && broadcast(), 30_000);
   tick.unref();
 
+  const emit = (s, type, data = {}) =>
+    store.append({ ts: now(), agent: s.agent, session_id: s.session_id, type, data });
+
+  // --- enrichment -----------------------------------------------------------
   // Repo/branch are looked up from the session's cwd when it exists on this
   // machine. Remote hosts can send them explicitly with a meta.updated event.
   const looked = new Map();
   async function refreshGitMeta(s) {
     if (!s.cwd || !existsSync(s.cwd)) return;
-    const last = looked.get(s.key) || 0;
-    if (now() - last < 15_000) return;
+    if (now() - (looked.get(s.key) || 0) < 15_000) return;
     looked.set(s.key, now());
     const [top, branch] = await Promise.all([
       git(s.cwd, ['rev-parse', '--show-toplevel']),
       git(s.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']),
     ]);
     const repo = top ? basename(top) : basename(s.cwd);
-    if (repo !== s.repo || branch !== s.branch) {
-      store.append({
-        ts: now(), agent: s.agent, session_id: s.session_id, type: 'meta.updated',
-        data: { repo, branch },
-      });
+    if (repo !== s.repo || branch !== s.branch) emit(s, 'meta.updated', { repo, branch });
+  }
+
+  // Usage and cost come from the agent's own session file, read at turn ends.
+  const USAGE_AT = new Set(['turn.completed', 'turn.failed', 'session.ended']);
+  async function refreshUsage(s) {
+    if (!s.transcript || !existsSync(s.transcript)) return;
+    const usage = await usageFor(s.agent, s.transcript);
+    if (usage && JSON.stringify({ ...s.usage, ...usage }) !== JSON.stringify(s.usage)) {
+      emit(s, 'usage.updated', usage);
     }
   }
 
   function ingest(events) {
     let last = null;
-    for (const ev of events) last = store.append(ev);
+    for (const ev of events) {
+      last = store.append(ev) || last;
+      if (last && USAGE_AT.has(ev.type)) refreshUsage(last).catch(() => {});
+    }
     if (last) refreshGitMeta(last).catch(() => {});
     return last;
   }
 
-  const json = (res, status, body) => {
+  // --- permission round-trip --------------------------------------------------
+  // A PermissionRequest hook is a request/response: whatever we answer is the
+  // decision. We answer at once when a rule covers it or nobody has the board
+  // open (the agent then shows its own prompt), and otherwise hold the request
+  // until the human decides here.
+  function release(id, body = {}) {
+    const h = held.get(id);
+    if (!h) return false;
+    held.delete(id);
+    clearTimeout(h.timer);
+    if (!h.res.writableEnded) json(h.res, 200, body);
+    broadcast();
+    return true;
+  }
+  function decide(id, decision, { message, remember } = {}) {
+    const h = held.get(id);
+    if (!h) return false;
+    const s = store.get(h.key);
+    if (decision === 'terminal') return release(id); // let the agent ask in its own UI
+    if (remember && decision === 'allow' && h.tool) emit(s, 'rule.added', { tool: h.tool });
+    release(id, decisionBody(decision, message));
+    emit(s, 'request.resolved', { id, decision, by: 'human' });
+    return true;
+  }
+  function holdPermission(req, res, event) {
+    const id = randomUUID().slice(0, 8);
+    event.data.request_id = id;
+    const s = ingest([event]);
+    if (!s) return json(res, 200, {});
+    if (event.data.tool && s.auto_allow.includes(event.data.tool)) {
+      emit(s, 'request.resolved', { id, decision: 'allow', by: 'rule' });
+      return json(res, 200, decisionBody('allow'));
+    }
+    // Claude Code keeps showing its own prompt while the hook is pending and
+    // takes whichever answer comes first (verified, v2.1.330), so holding costs
+    // the terminal nothing. That is not verified for other agents: for them we
+    // only hold while someone actually has the board open.
+    const parallel = event.agent === 'claude';
+    if (!parallel && !clients.size) return json(res, 200, {});
+    const timer = setTimeout(() => release(id), holdMs);
+    timer.unref();
+    held.set(id, { res, key: s.key, tool: event.data.tool || null, timer, parallel });
+    // The agent gave up on the hook (answered in its own UI, interrupted, died).
+    res.on('close', () => held.delete(id) && (clearTimeout(timer), broadcast()));
+    broadcast();
+  }
+  // Nobody is watching the board any more: hand open requests back.
+  let orphanTimer = null;
+  function clientsChanged() {
+    clearTimeout(orphanTimer);
+    if (clients.size || !held.size) return;
+    orphanTimer = setTimeout(() => {
+      if (!clients.size) for (const [id, h] of [...held]) if (!h.parallel) release(id);
+    }, 5000);
+    orphanTimer.unref();
+  }
+
+  // --- talking back -------------------------------------------------------
+  async function sendMessage(s, text) {
+    const route = replyRoute(s);
+    if (route === 'tmux') {
+      const t = ['-S', s.tmux.socket];
+      const alive = await run('tmux', [...t, 'display-message', '-p', '-t', s.tmux.pane, '#{pane_id}']);
+      if (alive == null) throw Object.assign(new Error('the tmux pane this session ran in is gone'), { status: 409 });
+      // -l sends the text literally; Enter is a separate key so it is not typed.
+      if ((await run('tmux', [...t, 'send-keys', '-t', s.tmux.pane, '-l', '--', text])) == null ||
+          (await run('tmux', [...t, 'send-keys', '-t', s.tmux.pane, 'Enter'])) == null) {
+        throw Object.assign(new Error('tmux refused the keys'), { status: 502 });
+      }
+      return { via: 'tmux' };
+    }
+    if (route === 'headless') {
+      if (!s.cwd || !existsSync(s.cwd)) throw Object.assign(new Error('the session directory no longer exists'), { status: 409 });
+      // The agent process is gone, so continue the same session without a
+      // terminal. Its hooks report back here like any other turn.
+      const [cmd, args] = s.agent === 'claude'
+        ? ['claude', ['-p', text, '--resume', s.session_id]]
+        : ['codex', ['exec', 'resume', s.session_id, text]];
+      launch(cmd, args, s.cwd);
+      emit(s, 'prompt.submitted', { prompt: text, via: 'board' });
+      return { via: 'headless' };
+    }
+    throw Object.assign(
+      new Error('this session is open in a terminal the board cannot type into (not tmux, not on this machine)'),
+      { status: 409 },
+    );
+  }
+
+  async function workingTree(s) {
+    if (!isLocal(s) || !s.cwd || !existsSync(s.cwd)) return { available: false };
+    const [status, stat, tracked] = await Promise.all([
+      git(s.cwd, ['status', '--porcelain', '-uall']),
+      git(s.cwd, ['diff', 'HEAD', '--stat']),
+      run('git', ['-C', s.cwd, 'diff', 'HEAD']),
+    ]);
+    if (status == null && tracked == null) return { available: false };
+    // New files are not in `git diff HEAD`; show them as additions too.
+    const fresh = (status || '').split('\n').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3)).slice(0, 30);
+    const added = await Promise.all(
+      fresh.map((f) => run('git', ['-C', s.cwd, 'diff', '--no-index', '--', '/dev/null', f], { okCodes: [1] })),
+    );
+    const diff = [tracked, ...added].filter(Boolean).join('\n');
+    return {
+      available: true,
+      status: status || '',
+      stat: stat || '',
+      diff: diff.slice(0, MAX_DIFF),
+      truncated: diff.length > MAX_DIFF,
+    };
+  }
+
+  // --- upkeep -----------------------------------------------------------------
+  // Reconciliation: a session we show as active, on this machine, silent for a
+  // while, with no agent process behind it, is marked unknown instead of
+  // being left "working" forever. Runs at startup and then every minute.
+  async function reconcile() {
+    const suspects = store.list().filter(
+      (s) => !s.archived && isLocal(s) && (s.state === 'working' || s.state === 'needs_input') &&
+        now() - s.last_event_ts > SETTLE_MS,
+    );
+    if (!suspects.length) return 0;
+    const procs = await agents();
+    let lost = 0;
+    for (const s of suspects) {
+      const reason = orphanReason(s, procs);
+      if (!reason) continue;
+      emit(s, 'session.lost', { reason });
+      lost += 1;
+    }
+    return lost;
+  }
+  const reconciler = setInterval(() => reconcile().catch(() => {}), 60_000);
+  reconciler.unref();
+
+  // Backfill: sessions found in the agents' history files that the hub has
+  // never seen (they predate the hooks). Imported as history, never as live.
+  async function backfill({ days = 7 } = {}) {
+    const found = await history({ days, now: now() });
+    let imported = 0;
+    for (const f of found) {
+      const id = { agent: f.agent, session_id: String(f.summary.session_id) };
+      if (store.get(`${id.agent}:${id.session_id}`)) continue;
+      const { session_id, cwd, ...data } = f.summary;
+      store.append({ ...id, ts: f.mtime, host: localHost, cwd, transcript: f.path, type: 'session.imported', data });
+      if (f.usage) store.append({ ...id, ts: f.mtime, type: 'usage.updated', data: f.usage });
+      imported += 1;
+    }
+    return { scanned: found.length, imported };
+  }
+
+  // --- http -----------------------------------------------------------------
+  function json(res, status, body) {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(body));
-  };
+  }
 
-  function authorized(req, url) {
-    if (!token) return true;
-    const header = req.headers.authorization || '';
-    return header === `Bearer ${token}` || url.searchParams.get('token') === token;
+  // The board can approve commands, so a web page in the same browser must not
+  // be able to drive it. Without a token we only answer requests addressed to
+  // a local name (stops DNS rebinding) and refuse cross-origin ones (stops
+  // CSRF). With a token, the token is the gate.
+  function guard(req, url) {
+    if (token) {
+      const header = req.headers.authorization || '';
+      return header === `Bearer ${token}` || url.searchParams.get('token') === token ? null : 401;
+    }
+    const host = (req.headers.host || '').replace(/:\d+$/, '');
+    if (!hostNames.has(host)) return 403;
+    const origin = req.headers.origin;
+    if (origin) {
+      try {
+        if (new URL(origin).host !== req.headers.host) return 403;
+      } catch {
+        return 403;
+      }
+    }
+    return null;
   }
 
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
+    const body = async () => JSON.parse((await readBody(req)) || '{}');
 
     if (path.startsWith('/ingest/') || path.startsWith('/api/')) {
-      if (!authorized(req, url)) return json(res, 401, { error: 'unauthorized' });
+      const denied = guard(req, url);
+      if (denied) return json(res, denied, { error: denied === 401 ? 'unauthorized' : 'forbidden' });
     }
 
-    // --- ingest -----------------------------------------------------------
+    // --- ingest ---------------------------------------------------------
     const hook = path.match(/^\/ingest\/(claude|codex)$/);
     if (hook && req.method === 'POST') {
-      // Always answer with an empty object: session-board only observes, it
-      // never makes a decision on the agent's behalf.
+      // A hook must never fail because of us: anything unreadable gets the
+      // empty "no opinion" answer.
       let payload;
       try {
         payload = JSON.parse(await readBody(req));
       } catch {
         return json(res, 200, {});
       }
-      ingest(
-        fromHook(hook[1], payload, {
-          host: url.searchParams.get('host'),
-          runtime: url.searchParams.get('runtime'),
-          now: now(),
-        }),
-      );
+      const q = url.searchParams;
+      const tmux = q.get('tmux_pane') && q.get('tmux_socket')
+        ? { socket: q.get('tmux_socket'), pane: q.get('tmux_pane') }
+        : null;
+      const events = fromHook(hook[1], payload, {
+        host: q.get('host'),
+        runtime: q.get('runtime'),
+        now: now(),
+        seq: q.has('seq') ? Number(q.get('seq')) : null,
+        source: q.get('source'),
+        tmux,
+      });
+      if (payload.hook_event_name === 'PermissionRequest' && events.length) {
+        return holdPermission(req, res, events[0]);
+      }
+      ingest(events);
       return json(res, 200, {});
     }
     if (path === '/ingest/event' && req.method === 'POST') {
       // Normalized events from anything else (cloud sessions, other agents).
-      const body = JSON.parse(await readBody(req));
-      const list = (Array.isArray(body) ? body : [body]).filter(
+      const sent = await body();
+      const list = (Array.isArray(sent) ? sent : [sent]).filter(
         (e) => e && e.agent && e.session_id && typeof e.type === 'string',
       );
       ingest(list.map((e) => ({ ...e, ts: now(), session_id: String(e.session_id) })));
       return json(res, 200, { accepted: list.length });
     }
 
-    // --- api --------------------------------------------------------------
+    // --- api ------------------------------------------------------------
     if (path === '/api/sessions' && req.method === 'GET') return json(res, 200, snapshot());
     if (path === '/api/stream' && req.method === 'GET') {
       res.writeHead(200, {
@@ -159,23 +400,58 @@ export function createHub({ dbPath = ':memory:', token = null, now = () => Date.
       });
       res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
       clients.add(res);
-      req.on('close', () => clients.delete(res));
+      clientsChanged();
+      req.on('close', () => {
+        clients.delete(res);
+        clientsChanged();
+      });
       return;
     }
-    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|archive|events)$/);
+    if (path === '/api/backfill' && req.method === 'POST') {
+      const { days } = await body();
+      return json(res, 200, await backfill({ days: Number(days) > 0 ? Number(days) : 7 }));
+    }
+    if (path === '/api/reconcile' && req.method === 'POST') return json(res, 200, { lost: await reconcile() });
+
+    const decision = path.match(/^\/api\/requests\/([^/]+)$/);
+    if (decision && req.method === 'POST') {
+      const { decision: d, message, remember } = await body();
+      if (!['allow', 'deny', 'terminal'].includes(d)) return json(res, 400, { error: 'decision must be allow, deny or terminal' });
+      return decide(decision[1], d, { message, remember })
+        ? json(res, 200, { ok: true })
+        : json(res, 410, { error: 'this request is no longer waiting on the board' });
+    }
+
+    const act = path.match(/^\/api\/sessions\/([^/]+)\/(ack|archive|events|message|diff|rule)$/);
     if (act) {
       const key = decodeURIComponent(act[1]);
       const s = store.get(key);
       if (!s) return json(res, 404, { error: 'no such session' });
-      if (act[2] === 'events' && req.method === 'GET') return json(res, 200, store.events(key));
+      const verb = act[2];
+      if (req.method === 'GET') {
+        if (verb === 'events') return json(res, 200, store.events(key));
+        if (verb === 'diff') return json(res, 200, await workingTree(s));
+      }
       if (req.method === 'POST') {
-        const type = act[2] === 'ack' ? 'human.acknowledged' : 'human.archived';
-        store.append({ ts: now(), agent: s.agent, session_id: s.session_id, type, data: {} });
-        return json(res, 200, view(store.get(key)));
+        if (verb === 'message') {
+          const { text } = await body();
+          if (typeof text !== 'string' || !text.trim()) return json(res, 400, { error: 'empty message' });
+          return json(res, 200, await sendMessage(s, text.trim()));
+        }
+        if (verb === 'rule') {
+          const { tool, allow } = await body();
+          if (typeof tool !== 'string') return json(res, 400, { error: 'tool required' });
+          emit(s, allow === false ? 'rule.removed' : 'rule.added', { tool });
+          return json(res, 200, view(store.get(key)));
+        }
+        if (verb === 'ack' || verb === 'archive') {
+          emit(s, verb === 'ack' ? 'human.acknowledged' : 'human.archived');
+          return json(res, 200, view(store.get(key)));
+        }
       }
     }
 
-    // --- static -----------------------------------------------------------
+    // --- static ---------------------------------------------------------
     if (req.method === 'GET') {
       const rel = normalize(path === '/' ? '/index.html' : path).replace(/^(\.\.[/\\])+/, '');
       const file = join(PUBLIC, rel);
@@ -198,17 +474,25 @@ export function createHub({ dbPath = ':memory:', token = null, now = () => Date.
       else res.end();
     });
   });
+  // Held permission requests legitimately stay open for minutes.
+  server.requestTimeout = 0;
 
   return {
     store,
     server,
     snapshot,
     ingest,
+    reconcile,
+    backfill,
+    decide,
     listen: (port, host) => new Promise((ok) => server.listen(port, host, () => ok(server.address()))),
     close: () =>
       new Promise((ok) => {
         clearInterval(tick);
+        clearInterval(reconciler);
         clearTimeout(pending);
+        clearTimeout(orphanTimer);
+        for (const id of [...held.keys()]) release(id);
         for (const res of clients) res.end();
         server.close(() => {
           store.close();

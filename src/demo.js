@@ -2,11 +2,11 @@
 // hook endpoints real agents use. For trying the UI without wiring anything.
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export async function demo(url, { speed = 1 } = {}) {
+export async function demo(url, { speed = 1, headers = { 'content-type': 'application/json' } } = {}) {
   const post = (agent, host, body, runtime) =>
     fetch(`${url}/ingest/${agent}?host=${host}${runtime ? `&runtime=${runtime}` : ''}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
     });
   const S = (agent, host, id, cwd, runtime) => (hook_event_name, extra = {}) =>
@@ -39,8 +39,10 @@ export async function demo(url, { speed = 1 } = {}) {
     () => c('Stop', { last_assistant_message: '已迁移 14 个文件里的 61 处示例，并开了 PR。有 3 处 v1 独有的字段在 v2 没有对应，我在 PR 描述里列出来了，需要你决定怎么写。' }),
     () => c('SessionEnd', { reason: 'other' }),
   ];
+  // Permission requests stay open until someone answers them in the board,
+  // so steps are fired without waiting for their responses.
   for (const step of steps) {
-    await step();
+    step().catch(() => {});
     await sleep(700 / speed);
   }
 }

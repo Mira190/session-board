@@ -11,19 +11,21 @@
   <h1>Session Board</h1>
   <p id="summary" aria-live="polite"></p>
   <div class="tools">
-    <button id="next" title="跳到等得最久、最该处理的会话 (N)">下一个等你的 <kbd>N</kbd></button>
+    <div class="seg" role="group" aria-label="视图">
+      <button id="view-inbox" aria-pressed="true">处理台</button>
+      <button id="view-board" aria-pressed="false">看板</button>
+    </div>
+    <button id="backfill" title="把装 hooks 之前就存在的会话从历史文件里导入进来">导入历史</button>
     <label><input type="checkbox" id="notify"> 桌面通知</label>
     <label><input type="checkbox" id="sound"> 提示音</label>
     <span id="conn" class="conn">连接中…</span>
   </div>
 </header>
-<main id="board">
-  <section data-col="attention"><h2>等你回应 <span class="count"></span></h2><p class="hint">权限请求、提问、失败。越靠上越该先处理。</p><div class="cards"></div></section>
-  <section data-col="review"><h2>待验收 <span class="count"></span></h2><p class="hint">agent 说做完了，你还没看。</p><div class="cards"></div></section>
-  <section data-col="working"><h2>工作中 <span class="count"></span></h2><p class="hint">不需要你，除非它安静太久。</p><div class="cards"></div></section>
-  <section data-col="rest"><h2>空闲 / 已结束 <span class="count"></span></h2><p class="hint">等你派下一件事，或已退出。</p><div class="cards"></div></section>
+<main id="app" data-view="inbox">
+  <nav id="lists" aria-label="会话"></nav>
+  <section id="bench" aria-live="polite"></section>
 </main>
-<dialog id="detail"><article></article></dialog>
+<footer><kbd>N</kbd> 下一个等你的 <kbd>A</kbd> 允许 <kbd>D</kbd> 拒绝 <kbd>E</kbd> 已验收 <kbd>R</kbd> 回复</footer>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

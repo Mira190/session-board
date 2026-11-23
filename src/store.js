@@ -21,6 +21,7 @@ export class Store {
     `);
     this.insert = this.db.prepare('INSERT INTO events (ts, key, type, body) VALUES (?, ?, ?, ?)');
     this.sessions = new Map();
+    this.seqs = new Map(); // `${session}|${source}` -> highest sequence accepted
     this.listeners = new Set();
     this.rebuild();
   }
@@ -28,15 +29,34 @@ export class Store {
   // Replay the whole log. Cheap at personal scale and keeps the projection honest.
   rebuild() {
     this.sessions.clear();
+    this.seqs.clear();
     for (const row of this.db.prepare('SELECT body FROM events ORDER BY id').iterate()) {
       const ev = JSON.parse(row.body);
+      if (ev.late) continue;
       const key = sessionKey(ev);
+      this.inOrder(key, ev);
       this.sessions.set(key, reduce(this.sessions.get(key), ev));
     }
   }
 
+  // Reporters that number their events (the hook bridge, remote senders) get
+  // out-of-order protection: a report whose sequence is not higher than the
+  // last one accepted from the same source is recorded but never applied.
+  inOrder(key, ev) {
+    if (ev.seq == null) return true;
+    const k = `${key}|${ev.source || ''}`;
+    const last = this.seqs.get(k);
+    if (last != null && ev.seq <= last) return false;
+    this.seqs.set(k, ev.seq);
+    return true;
+  }
+
   append(ev) {
     const key = sessionKey(ev);
+    if (!this.inOrder(key, ev)) {
+      this.insert.run(ev.ts, key, ev.type, JSON.stringify({ ...ev, late: true }));
+      return this.sessions.get(key);
+    }
     this.insert.run(ev.ts, key, ev.type, JSON.stringify(ev));
     const prev = this.sessions.get(key);
     const next = reduce(prev, ev);
