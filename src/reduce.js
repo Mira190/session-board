@@ -44,6 +44,9 @@ function blank(ev) {
     snoozed_until: null, // out of the queue until then, unless it needs them sooner
     acked: null, // { phase, since } before the last acknowledgement, for undo
     outgoing: null, // { text, via, ts } a reply sent from the board, not yet confirmed received
+    repo_id: null, // what identifies the repository across worktrees (remote, or the shared git dir)
+    task_manual: null, // another session's key (joined by hand) or 'solo' (pulled out by hand)
+    triage: null, // { for, summary, suggestion, ts } a triage agent's note on what is currently open
     pr: null, // { number, url, title, state: open|merged|closed, draft, checks, review, base, head_sha }
     github: null, // "owner/repo", when a sender tells us (cloud sessions)
     tmux: null, // { socket, pane } when the agent runs inside tmux
@@ -179,7 +182,7 @@ export function reduce(prev, ev) {
   if (ev.host && s.host === 'local') s.host = ev.host;
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved'].includes(ev.type)) s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted'].includes(ev.type)) s.archived = false;
 
   const working = () => enter(s, 'working', ts);
 
@@ -372,6 +375,15 @@ export function reduce(prev, ev) {
       s.snoozed_until = null;
       break;
 
+    case 'task.assigned':
+      s.task_manual = d.task || null;
+      break;
+
+    case 'triage.noted':
+      // Advice about one specific open item; it is ignored once that item is gone.
+      s.triage = { for: d.for, summary: clip(d.summary, 240), suggestion: d.suggestion || 'none', ts };
+      break;
+
     case 'reply.sent':
       s.outgoing = { text: clip(d.text, 600), via: d.via, ts };
       break;
@@ -391,6 +403,7 @@ export function reduce(prev, ev) {
       if (d.branch !== undefined) s.branch = d.branch;
       if (d.head && !s.start_head) s.start_head = d.head;
       if (d.github) s.github = d.github;
+      if (d.repo_id) s.repo_id = d.repo_id;
       if (d.title) s.title = clip(d.title, 120);
       break;
 
@@ -419,7 +432,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved', 'reply.sent', 'task.assigned', 'triage.noted'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.exited = false;
     s.imported = false;

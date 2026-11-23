@@ -258,3 +258,22 @@ dialog h3 { margin: 0 0 6px; font-size: 16px; }
 .cmds { margin: 4px 0 0; padding: 0 0 0 16px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
 .rules-row { margin-top: 8px; }
 .rules-row button { font-size: 12px; padding: 2px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ---- tasks and triage notes ---- */
+.card.task { cursor: default; }
+.tasktag { font-weight: 700; color: var(--ink); border: 1px solid var(--line); border-radius: 5px; padding: 0 6px; }
+.members { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.member { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; width: 100%; text-align: left; padding: 4px 8px; border-left: 3px solid var(--line); border-radius: 6px; font-size: 13px; }
+.member[data-tone="urgent"] { border-left-color: var(--urgent); }
+.member[data-tone="review"] { border-left-color: var(--ok); }
+.member[data-tone="working"] { border-left-color: var(--work); }
+.member[aria-current="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.member .age { margin-left: auto; }
+.member .facts { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.taskstrip { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; }
+.triage { margin-top: 4px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.triage b { margin-right: 6px; border-radius: 5px; padding: 0 6px; background: var(--panel); color: var(--ink); white-space: nowrap; }
+.triage.allow b, .chip-s.allow { color: var(--ok); }
+.triage.deny b, .chip-s.deny, .triage.look b, .chip-s.look { color: var(--urgent); }
+.triage.big { margin-top: 10px; font-size: 14px; color: var(--ink); }
+.chip-s { font-size: 11px; font-weight: 700; }

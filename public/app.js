@@ -285,12 +285,61 @@ function tickAges() {
   }
 }
 
+// A triage agent's note: advice, clearly marked as such.
+const SUGGEST = { allow: '建议允许', deny: '建议拒绝', look: '需要你看', none: '' };
+const triageLine = (s) => s.triage && el('div', { className: `triage ${s.triage.suggestion}` },
+  SUGGEST[s.triage.suggestion] && el('b', { textContent: SUGGEST[s.triage.suggestion] }), s.triage.summary);
+
+// ---- tasks: several sessions that are attempts at the same thing ----
+const COL_ORDER = ['attention', 'review', 'working', 'rest'];
+const siblings = (s) => (s.task ? snap.sessions.filter((x) => x.task?.id === s.task.id) : [s]);
+
+// Sessions that share a task become one entry, placed in the column of the
+// member that needs the most from you.
+function stack(groups) {
+  const members = new Map();
+  for (const name of COL_ORDER) for (const s of groups[name]) if (s.task) (members.get(s.task.id) || members.set(s.task.id, []).get(s.task.id)).push(s);
+  const done = new Set();
+  const out = {};
+  for (const name of COL_ORDER) {
+    out[name] = [];
+    for (const s of groups[name]) {
+      const group = s.task && members.get(s.task.id);
+      if (!group || group.length < 2) { out[name].push(s); continue; }
+      if (done.has(s.task.id)) continue;
+      done.add(s.task.id); // first met in column order = its most urgent member's column
+      out[name].push({ task: s.task.id, members: group, lead: group[0] });
+    }
+  }
+  return out;
+}
+
+function taskCard(entry) {
+  const tone = describe(entry.lead).tone;
+  const agents = [...new Set(entry.members.map(agentName))].join(' + ');
+  return el('div', { className: 'card task', dataset: { tone } },
+    el('div', { className: 'meta' }, el('span', { className: 'tasktag', textContent: `任务 · ${entry.members.length} 个会话` }),
+      el('span', { className: 'where', textContent: [agents, repoOf(entry.lead)].join(' · ') })),
+    el('div', { className: 'title', textContent: entry.lead.title || '(还没有任务描述)' }),
+    el('div', { className: 'members' }, entry.members.map((m) => {
+      const d = describe(m);
+      return el('button', {
+          className: 'member', type: 'button', dataset: { tone: d.tone }, ariaCurrent: String(m.key === selected), onclick: () => select(m.key, true),
+        },
+        m.unseen && el('span', { className: 'dot' }),
+        el('span', { className: `badge ${m.agent}`, textContent: agentName(m) }),
+        el('span', { className: 'what', textContent: d.what }),
+        m.triage && SUGGEST[m.triage.suggestion] && el('span', { className: `chip-s ${m.triage.suggestion}`, textContent: SUGGEST[m.triage.suggestion] }),
+        ageSpan(m, d));
+    })));
+}
+
 const cardSig = (s) => JSON.stringify([
   s.state, s.since, s.title, s.host, s.repo, s.cwd, s.branch, s.runtime, s.agent, s.subagents, s.requests.length,
   s.waiting && [s.waiting.kind, s.waiting.tool, s.waiting.detail, s.waiting.risky],
   s.current_tool, s.background, s.quiet, s.pr, s.error, s.exited, s.settled, s.imported, s.rate_limited,
   s.state === 'working' ? s.last_prompt?.slice(0, 90) : s.last_message?.slice(0, 90), s.key === selected,
-  s.unseen, s.snoozed && s.snoozed_until, column(s),
+  s.unseen, s.snoozed && s.snoozed_until, column(s), s.triage,
 ]);
 
 function card(s) {
@@ -312,6 +361,7 @@ function card(s) {
     ),
     s.waiting?.risky && el('div', { className: 'warn', textContent: '高风险命令，请单独确认' }),
     d.detail && el('div', { className: 'peek', textContent: d.detail.split('\n')[0] }),
+    triageLine(s),
     s.pr && el('div', { className: `pr ${prTone(s.pr)}`, textContent: prLine(s.pr) }),
     s.quiet && el('div', { className: 'warn', textContent: '超过 10 分钟没有任何动静' }),
   );
@@ -399,6 +449,7 @@ const rollup = (list) => {
 };
 
 function renderLists(groups) {
+  const shown = stack(groups);
   const lists = $('#lists');
   if (!lists.children.length) {
     lists.replaceChildren(...GROUPS.map(([name, label, hint]) =>
@@ -412,15 +463,17 @@ function renderLists(groups) {
   }
   for (const [name] of GROUPS) {
     const sec = $(`.group[data-col="${name}"]`, lists);
-    const list = groups[name];
+    const list = shown[name];
     const fold = folded(name) && list.length > 0;
     sec.dataset.folded = String(fold);
     $('.count', sec).textContent = list.length || '';
     $('.fold', sec).setAttribute('aria-expanded', String(!fold));
-    $('.rollup', sec).textContent = fold ? rollup(list) : '';
-    const items = fold ? [] : list.map((s) => ({ key: s.key, sig: cardSig(s), make: () => card(s) }));
+    $('.rollup', sec).textContent = fold ? rollup(groups[name]) : '';
+    const items = fold ? [] : list.map((e) => (e.task
+      ? { key: e.task, sig: e.members.map(cardSig).join('|'), make: () => taskCard(e) }
+      : { key: e.key, sig: cardSig(e), make: () => card(e) }));
     if (name === 'attention' && !fold) {
-      items.unshift(...batches(list).map((g) => ({
+      items.unshift(...batches(groups.attention).map((g) => ({
         key: `batch:${g[0].waiting.tool}:${g.stem ? `kind:${g.stem}` : g[0].waiting.detail}`, sig: g.map((s) => s.waiting.id).join(','), make: () => batchCard(g),
       })));
     }
@@ -697,6 +750,41 @@ function questionForm(s) {
   }));
 }
 
+// Accept by task: all its sessions at once, or adopt one version and file the rest.
+async function ackTask(s, adopt) {
+  try {
+    const out = await call(`/api/tasks/${encodeURIComponent(s.task.id)}/ack`, adopt ? { adopt } : {});
+    const undo = () => Promise.all([
+      ...out.archived.map((k) => call(`/api/sessions/${encodeURIComponent(k)}/unarchive`, {})),
+      ...out.acked.map((k) => call(`/api/sessions/${encodeURIComponent(k)}/unack`, {})),
+    ]);
+    toast(adopt ? `已采用这一版，验收 ${out.acked.length} 个，归档其余 ${out.archived.length} 个。` : `已验收这个任务的 ${out.acked.length} 个会话。`, undo);
+    advance(s.key);
+  } catch (err) {
+    say(s.key, err.message);
+  }
+}
+
+function taskStrip(s) {
+  const group = siblings(s);
+  if (!s.task || group.length < 2) return null;
+  const reviewable = group.filter((m) => ['review', 'failed', 'unknown'].includes(m.state));
+  return el('div', { className: 'taskstrip' },
+    el('div', { className: 'note', textContent: `同一个任务的 ${group.length} 个会话（同一句指令或同一个分支）。点一行切换，逐个对比后按任务验收。` }),
+    el('div', { className: 'members' }, group.map((m) => {
+      const d = describe(m);
+      return el('button', { className: 'member wide', type: 'button', dataset: { tone: d.tone }, ariaCurrent: String(m.key === s.key), onclick: () => select(m.key, true) },
+        el('span', { className: `badge ${m.agent}`, textContent: agentName(m) }),
+        el('span', { className: 'what', textContent: d.what }),
+        el('span', { className: 'facts', textContent: [m.branch, m.files_count ? `改了 ${m.files_count} 个文件` : null, m.pr && prLine(m.pr), m.usage?.cost_usd != null ? `$${m.usage.cost_usd.toFixed(2)}` : null].filter(Boolean).join(' · ') }));
+    })),
+    el('div', { className: 'actions' },
+      s.state === 'review' && el('button', { className: 'primary', textContent: '采用这一版，其余归档', title: '验收当前这个会话，把同任务里其他已停下的会话归档；还在干活的不动', onclick: () => ackTask(s, s.key) }),
+      reviewable.length > 0 && el('button', { textContent: `全部验收（${reviewable.length}）`, onclick: () => ackTask(s) }),
+      el('button', { textContent: '把这个会话拆出去', title: '它其实是另一件事', onclick: () => call(`/api/sessions/${encodeURIComponent(s.key)}/task`, { join: null }).catch((e) => say(s.key, e.message)) }),
+    ));
+}
+
 function nowBlock(s, d) {
   const asking = s.state === 'needs_input' && s.waiting.kind === 'question';
   const form = asking && s.waiting.decidable && s.waiting.questions?.length;
@@ -706,6 +794,9 @@ function nowBlock(s, d) {
       el('span', { className: 'age', textContent: d.verb ? `${d.verb} ${age(s.since)}` : `${age(s.since)}前` })),
     !form && d.detail && el('div', { className: `box${d.code ? ' code' : ' prose'}`, textContent: d.detail }),
     form && questionForm(s),
+    s.triage && el('div', { className: `triage big ${s.triage.suggestion}` },
+      el('b', { textContent: SUGGEST[s.triage.suggestion] || '分诊备注' }), s.triage.summary,
+      el('span', { className: 'note', textContent: '　分诊 agent 的建议，不是决定' })),
   ];
   const actions = el('div', { className: 'actions' });
   if (s.state === 'needs_input' && s.waiting.kind === 'pr') {
@@ -804,6 +895,7 @@ function renderBench() {
       el('a', { href: s.pr.url, target: '_blank', rel: 'noreferrer', textContent: prLine(s.pr) }),
       s.pr.title ? `　${s.pr.title}` : '', s.pr.base ? ` → ${s.pr.base}` : ''),
     notice?.key === s.key && el('div', { className: 'warn', textContent: notice.text }),
+    taskStrip(s),
     nowBlock(s, d),
 
     s.last_prompt && el('h3', { textContent: '你上一次说的' }),
@@ -920,7 +1012,7 @@ function paint() {
   const s = byKey(selected);
   // The workbench is rebuilt only when what it shows has changed.
   const more = extra.get(selected) || {};
-  const benchSig = JSON.stringify([s, more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
+  const benchSig = JSON.stringify([s, s && siblings(s).map((m) => [m.key, m.state, m.since, m.files_count, m.pr]), more.sig, !!more.diff, !!more.events, !!more.full, notice, scopes.get(selected), snap.sessions.length > 0]);
   if (benchSig !== paint.bench) { paint.bench = benchSig; renderBench(); }
   if (s) loadExtra(s);
   noteReading();

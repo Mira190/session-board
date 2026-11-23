@@ -13,6 +13,10 @@ const { values: opt, positionals } = parseArgs({
     host: { type: 'string', default: hostname() },
     days: { type: 'string', default: '7' },
     sessions: { type: 'string' },
+    triage: { type: 'boolean', default: false },
+    once: { type: 'boolean', default: false },
+    model: { type: 'string' },
+    interval: { type: 'string', default: '20' },
     'dry-run': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
   },
@@ -28,6 +32,7 @@ const HELP = `session-board — one place for all your coding-agent sessions
   session-board status                    is the hub up, are the hooks in place
   session-board backfill [--days 7]       import sessions that predate the hooks
   session-board mcp                       MCP server (stdio) so agents can read the board
+  session-board triage [--once] [--model m]   have an agent pre-read the queue and write a note on each item
   session-board demo [--sessions 150]     play scripted sessions into a running hub
   session-board hook <claude|codex>       (used by hooks) forward stdin to the hub
 
@@ -85,7 +90,7 @@ async function main() {
   if (cmd === 'hook') return hook(arg);
   if (cmd === 'mcp') {
     const { serveMcp } = await import('../src/mcp.js');
-    return serveMcp({ endpoint });
+    return serveMcp({ endpoint, triage: opt.triage });
   }
 
   // `up`: the one command for a fresh machine. Wires in whichever agents are
@@ -116,7 +121,8 @@ async function main() {
     const url = `http://127.0.0.1:${opt.port}`;
     // Links in phone notifications must point somewhere the phone can reach.
     const boardUrl = (process.env.SESSION_BOARD_PUBLIC_URL || url).replace(/\/$/, '');
-    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl });
+    const { triageDir } = await import('../src/triage.js');
+    const hub = createHub({ dbPath: db, token, localHost: opt.host, boardUrl, ignoreCwds: [triageDir(home())] });
     await hub.listen(Number(opt.port), opt.bind);
     writeEndpoint({ url, token });
     console.log(`session-board on ${url}${token ? '/?token=…' : ''}  (db: ${db})`);
@@ -147,6 +153,29 @@ async function main() {
       console.log('Codex asks you to review new hooks: run /hooks inside Codex once to trust them.');
     }
     return;
+  }
+
+  // Pre-read the queue with a boxed-in agent whenever something has no note yet.
+  if (cmd === 'triage') {
+    const { runOnce } = await import('../src/triage.js');
+    const { home } = await import('../src/endpoint.js');
+    const { url, token } = await endpoint();
+    const pending = () => fetch(`${url}/api/triage`, { headers: authHeaders(token), signal: AbortSignal.timeout(3000) })
+      .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    console.log(`triage: watching ${url}${opt.model ? ` with model ${opt.model}` : ''}. It writes notes; it cannot approve anything.`);
+    for (;;) {
+      const items = await pending();
+      if (items === null) console.log('triage: hub not reachable');
+      else if (items.length) {
+        const t0 = Date.now();
+        const { ok, out } = await runOnce({ home: home(), model: opt.model });
+        const left = (await pending())?.length ?? '?';
+        console.log(`triage: ${items.length} item(s) -> ${ok ? 'done' : 'run failed'} in ${Math.round((Date.now() - t0) / 1000)}s, ${left} still without a note${ok ? '' : `\n${out.slice(-400)}`}`);
+        if (!ok && !opt.once) await new Promise((r) => setTimeout(r, 60_000)); // do not hammer on a failure
+      } else if (opt.once) console.log('triage: nothing to do');
+      if (opt.once) return;
+      await new Promise((r) => setTimeout(r, Math.max(5, Number(opt.interval)) * 1000));
+    }
   }
 
   if (cmd === 'status') {
