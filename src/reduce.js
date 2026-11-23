@@ -37,6 +37,8 @@ function blank(ev) {
     files: [], // files this session's edit tools were pointed at
     start_head: null, // commit the working tree was on when first seen
     settled: null, // why the hub closed a review on its own ('merged')
+    pr: null, // { number, url, title, state: open|merged|closed, draft, checks, review, base, head_sha }
+    github: null, // "owner/repo", when a sender tells us (cloud sessions)
     tmux: null, // { socket, pane } when the agent runs inside tmux
     state: 'idle',
     since: ev.ts,
@@ -148,7 +150,7 @@ export function reduce(prev, ev) {
   if (ev.host && s.host === 'local') s.host = ev.host;
   if (ev.runtime) s.runtime = ev.runtime;
   // Any sign of life un-archives a session, except the human's own actions.
-  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed', 'request.resolved'].includes(ev.type)) s.archived = false;
+  if (!ev.type.startsWith('human.') && !['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved'].includes(ev.type)) s.archived = false;
 
   const working = () => enter(s, 'working', ts);
 
@@ -322,6 +324,11 @@ export function reduce(prev, ev) {
       if (d.repo !== undefined) s.repo = d.repo;
       if (d.branch !== undefined) s.branch = d.branch;
       if (d.head && !s.start_head) s.start_head = d.head;
+      if (d.github) s.github = d.github;
+      break;
+
+    case 'pr.updated':
+      s.pr = d.pr || null;
       if (d.title) s.title = clip(d.title, 120);
       break;
 
@@ -332,7 +339,7 @@ export function reduce(prev, ev) {
     default:
       break; // unknown event types are kept in the log but do not move state
   }
-  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'rule.added', 'rule.removed', 'request.resolved'];
+  const passive = ['session.ended', 'session.lost', 'session.imported', 'session.settled', 'meta.updated', 'usage.updated', 'pr.updated', 'rule.added', 'rule.removed', 'request.resolved'];
   if (!passive.includes(ev.type) && !ev.type.startsWith('human.')) {
     s.exited = false;
     s.imported = false;

@@ -66,6 +66,7 @@ const brief = (s) => ({
   seconds_in_state: null,
   doing: s.current_tool ? `${s.current_tool.tool}: ${s.current_tool.detail || ''}`.trim() : null,
   error: s.error,
+  pull_request: s.pr ? { number: s.pr.number, url: s.pr.url, state: s.pr.state, checks: s.pr.checks, review: s.pr.review } : null,
 });
 
 export function createMcp({ call }) {

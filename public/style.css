@@ -201,3 +201,10 @@ main[data-view="office"] #office { display: block; }
 .option[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .questions input { font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; width: min(100%, 420px); }
 .questions input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---- pull request status ---- */
+.pr { font-size: 12px; color: var(--muted); margin: 4px 0 0; overflow-wrap: anywhere; }
+.pr.ok, .pr.ok a { color: var(--ok); }
+.pr.bad, .pr.bad a { color: var(--urgent); }
+.pr a { color: var(--work); font-weight: 600; }
+#bench .pr { font-size: 13px; margin: 0 0 4px; }

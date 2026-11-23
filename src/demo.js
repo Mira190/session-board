@@ -38,6 +38,14 @@ export async function demo(url, { speed = 1, headers = { 'content-type': 'applic
     () => b('Stop', { last_assistant_message: 'The test raced the payment webhook. I added an explicit wait on the order status and ran it 30 times: 30/30 passing. One file changed: test/checkout.int.test.ts.' }),
     () => c('Stop', { last_assistant_message: '已迁移 14 个文件里的 61 处示例，并开了 PR。有 3 处 v1 独有的字段在 v2 没有对应，我在 PR 描述里列出来了，需要你决定怎么写。' }),
     () => c('SessionEnd', { reason: 'other' }),
+    () => fetch(`${url}/ingest/event`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify([
+        { agent: 'claude', session_id: `demo-docs-${run}`, type: 'pr.updated', data: { pr: { number: 214, url: 'https://github.com/example/docs-site/pull/214', title: 'Migrate API examples to v2', state: 'open', draft: false, checks: 'passing', review: 'review_required', base: 'main' } } },
+        { agent: 'codex', session_id: `demo-flaky-${run}`, type: 'pr.updated', data: { pr: { number: 87, url: 'https://github.com/example/shop-api/pull/87', title: 'Fix flaky checkout test', state: 'open', draft: false, checks: 'failing', review: null, base: 'main' } } },
+      ]),
+    }),
   ];
   // Permission requests stay open until someone answers them in the board,
   // so steps are fired without waiting for their responses.
