@@ -8,14 +8,29 @@
 // needs, not the command or question itself: that text may contain code or
 // secrets and the push service is someone else's computer. Set
 // SESSION_BOARD_NOTIFY_DETAIL=1 to include it.
+// Wording follows SESSION_BOARD_LANG / the system locale (see lang.js).
 const KIND = {
-  permission: ['要权限', 'high'],
-  question: ['有问题问你', 'high'],
-  failed: ['出错停下了', 'default'],
-  unknown: ['失联了', 'default'],
-  pr: ['PR 需要处理', 'default'],
-  review: ['做完了，待验收', 'low'],
+  en: {
+    permission: ['Needs permission', 'high'],
+    question: ['Has a question', 'high'],
+    failed: ['Stopped on an error', 'default'],
+    unknown: ['Lost contact', 'default'],
+    pr: ['PR needs attention', 'default'],
+    review: ['Finished, awaiting review', 'low'],
+  },
+  zh: {
+    permission: ['要权限', 'high'],
+    question: ['有问题问你', 'high'],
+    failed: ['出错停下了', 'default'],
+    unknown: ['失联了', 'default'],
+    pr: ['PR 需要处理', 'default'],
+    review: ['做完了，待验收', 'low'],
+  },
 };
+const WAITING = { en: (n) => `${n} sessions are waiting for you`, zh: (n) => `${n} 个会话在等你` };
+const SEP = { en: ': ', zh: '：' };
+import { serverLang } from './lang.js';
+
 const BURST = 5; // more than this many at once becomes one summary
 
 export const attentionKind = (s) => {
@@ -29,6 +44,8 @@ export function createNotifier({ env = process.env, fetcher = fetch, boardUrl = 
   const ntfy = env.SESSION_BOARD_NTFY || null;
   const webhook = env.SESSION_BOARD_WEBHOOK || null;
   if (!ntfy && !webhook) return { enabled: false, consider() {} };
+  const lang = serverLang(env);
+  const sep = SEP[lang];
   const detail = env.SESSION_BOARD_NOTIFY_DETAIL === '1';
   const kinds = new Set((env.SESSION_BOARD_NOTIFY_ON || 'permission,question,failed,unknown,pr').split(',').map((k) => k.trim()));
   const told = new Map(); // key -> signature already pushed
@@ -55,9 +72,9 @@ export function createNotifier({ env = process.env, fetcher = fetch, boardUrl = 
     if (!items.length || isPresent()) return; // they came back and can see it
     if (items.length > BURST) {
       const high = items.some((i) => i.priority === 'high');
-      return post(`${items.length} 个会话在等你`, items.slice(0, 8).map((i) => `${i.label}：${i.title}`).join('\n'), high ? 'high' : 'default', boardUrl || undefined);
+      return post(WAITING[lang](items.length), items.slice(0, 8).map((i) => `${i.label}${sep}${i.title}`).join('\n'), high ? 'high' : 'default', boardUrl || undefined);
     }
-    for (const i of items) post(`${i.label}：${i.title}`, i.body, i.priority, boardUrl ? `${boardUrl}/#${encodeURIComponent(i.key)}` : undefined);
+    for (const i of items) post(`${i.label}${sep}${i.title}`, i.body, i.priority, boardUrl ? `${boardUrl}/#${encodeURIComponent(i.key)}` : undefined);
   }
 
   return {
@@ -70,7 +87,7 @@ export function createNotifier({ env = process.env, fetcher = fetch, boardUrl = 
       if (told.get(s.key) === sig) return;
       told.set(s.key, sig);
       if (!kinds.has(kind) || isPresent()) return;
-      const [label, priority] = KIND[kind] || KIND.question;
+      const [label, priority] = KIND[lang][kind] || KIND[lang].question;
       const where = [s.repo, s.host].filter(Boolean).join(' · ');
       batch.push({
         key: s.key, label, priority, title: s.title || s.session_id,

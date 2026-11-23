@@ -1,232 +1,240 @@
 # Session Board
 
-一个地方，管住你所有的编码 agent 会话：Claude Code 和 Codex，本地和云端，**不管是从哪里启动的**。看到谁在等你，并且就在这里把它处理掉。
+English | [简体中文](README.zh-CN.md)
 
-![处理台](docs/workbench.png)
+One place to manage all your coding-agent sessions: Claude Code and Codex, local and cloud, **no matter where they were started**. See who is waiting for you, and deal with it right here.
 
-## 它解决什么问题
+![Workbench](docs/workbench.png)
 
-并行跑多个 agent 时，瓶颈是你一个人的注意力。时间浪费在四件事上：
+## What problem it solves
 
-| 浪费在哪 | 根因 | 这里怎么解决 |
+When you run several agents in parallel, the bottleneck is your own attention. Time is wasted on four things:
+
+| Where time goes | Root cause | How it is solved here |
 |---|---|---|
-| 不知道谁在等你 | 状态散在各个终端和网页里 | hooks 把所有会话的事件推到一处，按“谁最该先处理”排成一个队列 |
-| 知道了还得跳过去处理 | 管理工具只读，动作只能在原处做 | 权限在这里批准或拒绝，选择题在这里答，消息在这里回，改动在这里看，验收在这里点 |
-| 跳过去要重新想起上下文 | 切换会话时上下文不在眼前 | 右侧处理台直接给出：它在等什么、你上次说了什么、它上次说了什么、工作区改了什么 |
-| 以为在干活其实早死了 | 进程崩溃不会发事件 | 定期核对进程，找不到就标成“失联”，不再显示“工作中” |
-| 你成了会话之间的传话人 | 会话互相看不见 | 只读的 MCP 服务：任何 agent 都能自己查看板、等另一个会话做完 |
-| 同一件事要决定几十遍 | 每个会话各问各的 | 相同的请求合并成一次决定，可设为以后自动允许的规则 |
-| 已经有定论的事还要你点一下 | 状态只认人工确认 | PR 合并了（包括 squash 合并）自动算验收，结束一周没人碰的自动归档 |
+| Not knowing who is waiting for you | State is scattered across terminals and web pages | Hooks push every session's events to one place, ordered into a single queue by "who should be handled first" |
+| Having to jump over to handle it | Management tools are read-only; actions can only be taken where the session lives | Approve or deny permissions here, answer multiple-choice questions here, reply to messages here, review changes here, click Accept here |
+| Re-loading the context after you jump over | The context is not in front of you when you switch sessions | The Workbench on the right shows it directly: what it is waiting for, what you said last, what it said last, what changed in the workspace |
+| Thinking it is working when it died long ago | A crashed process sends no event | Processes are checked periodically; if one cannot be found it is marked "Lost" and no longer shown as "Working" |
+| You become the messenger between sessions | Sessions cannot see each other | A read-only MCP server: any agent can check the board itself and wait for another session to finish |
+| Deciding the same thing dozens of times | Every session asks on its own | Identical requests are merged into one decision, which can become a rule that auto-allows them from now on |
+| Having to click on things already settled | Status only recognizes manual confirmation | A merged PR (squash merges included) counts as Accepted automatically; sessions untouched for a week after finishing are archived automatically |
 
-三种视图画的是同一份状态：**处理台**（队列加右侧处理区）、**看板**（四列）、**办公室**。
+Three views draw the same state: the **Workbench** (a queue plus a handling area on the right), the **Board** (four columns), and the **Office**.
 
-![办公室](docs/office.png)
+![Office](docs/office.png)
 
-办公室里，在工位上的不用管；需要你的会走到你桌前排队，排在最前面的最该先处理；做完的把文件放进你的收件盘；出错的工位冒烟，失联的变成半透明。点任何一个角色、工位或文件，都在右边的处理台里处理，批准后它会自己走回工位。
+In the Office, anyone at their own desk needs nothing from you. Those who need you walk to your desk and queue, and whoever is at the front needs you most. Finished work goes into your in-tray. Desks of sessions that hit an error smoke, and Lost ones turn translucent. Click any character, desk or file to handle it in the Workbench on the right; after you approve, it walks back to its desk by itself.
 
-处理完一个，自动跳到下一个等你的。键盘：`N` 下一个、`A` 允许、`D` 拒绝、`E` 已验收、`R` 回复。
+After you handle one, the board jumps to the next one waiting. Keyboard: `N` next, `A` allow, `D` deny, `E` Accepted, `R` reply.
 
-## 快速开始
+## Quick start
 
-需要 Node 22.5 以上，没有任何依赖。
+Requires Node 22.5 or later. No dependencies.
 
 ```bash
 node bin/session-board.js up
 ```
 
-这一条命令会给本机找到的 agent（Claude Code、Codex）装好 hooks，然后启动 hub。打开 <http://127.0.0.1:4590>，之后在任何终端、任何目录启动的会话都会自动出现。
+This one command installs hooks for the agents it finds on your machine (Claude Code, Codex), then starts the hub. Open <http://127.0.0.1:4590>; from then on, sessions started in any terminal and any directory appear automatically.
 
-想分开做，也可以用 `serve`、`install claude`、`install codex`。
+To do it in separate steps, use `serve`, `install claude` and `install codex`.
 
-- 想先看效果：hub 运行时执行 `node bin/session-board.js demo`。
-- 装 hooks 之前就存在的会话：点“导入历史”，或执行 `node bin/session-board.js backfill`。
-- 检查安装情况：`node bin/session-board.js status`。
-- **在 tmux 里启动 agent**，才能从看板直接往它的终端里发消息。
+- To see it in action first: run `node bin/session-board.js demo` while the hub is running.
+- Sessions that existed before the hooks were installed: click "Import history", or run `node bin/session-board.js backfill`.
+- Check the installation: `node bin/session-board.js status`.
+- **Start agents inside tmux** if you want to send messages from the board straight into their terminals.
 
-`install` 只往 agent 自己的配置文件（`~/.claude/settings.json`、`~/.codex/hooks.json`）里追加 hooks，不动已有的，写入前留一份 `.session-board.bak`；内容没变就不重写。`uninstall` 原样移除，`--dry-run` 只看不写。Codex 要求你在它里面执行一次 `/hooks` 来信任新 hooks。
+`install` only appends hooks to the agent's own config files (`~/.claude/settings.json`, `~/.codex/hooks.json`). It leaves existing entries alone, keeps a `.session-board.bak` copy before writing, and does not rewrite a file whose content would not change. `uninstall` removes them exactly, and `--dry-run` shows what would happen without writing. Codex requires you to run `/hooks` once inside it to trust the new hooks.
 
-## 能做到什么
+## Language
 
-| | Claude Code 本地 | Codex 本地 | 云端会话 |
+The web UI language is set under Settings (the ⚙ button in the header): **Follow system** (the default), **English**, or **简体中文**. "Follow system" uses Chinese if the browser language is `zh*` and English otherwise.
+
+Text the hub itself produces (phone pushes and the triage agent's notes) follows `SESSION_BOARD_LANG=en|zh`. If that is unset it falls back to the system locale (`LC_ALL` / `LANG`), and the default is English.
+
+## What it can do
+
+| | Claude Code local | Codex local | Cloud sessions |
 |---|---|---|---|
-| 自动发现、实时状态 | ✅ 真实会话验证 | ⚠️ 按官方文档实现，未实测 | ⚠️ 需云环境能访问你的 hub |
-| 在看板里批准 / 拒绝权限 | ✅ 真实会话验证 | ⚠️ 未实测 | ❌ |
-| 在看板里回答 agent 的选择题 | ✅ 真实会话验证（单选、多选） | ❌ 不清楚 Codex 是否有对应机制 | ❌ |
-| agent 通过 MCP 读看板 | ✅ 真实会话验证 | ⚠️ 未实测 | ⚠️ 需能访问你的 hub |
-| 从看板回复（tmux 里的会话） | ✅ 真实会话验证 | ⚠️ 未实测 | ❌ |
-| 从看板回复（已退出的会话，后台续跑） | ✅ 真实会话验证 | ⚠️ 未实测 | ❌ |
-| 看改动，默认只看这个会话改过的文件 | ✅ | ⚠️ 只能看整个工作区 | ❌ |
-| 花费和 token | ✅ 取 Claude Code 自己记的数 | ⚠️ 只有 token，格式未实测 | ❌ |
-| 失联检测、历史导入 | ✅ | ⚠️ 未实测 | ❌ |
-| PR 状态、合并后自动验收 | ⚠️ 用模拟的 GitHub 测过，未连真实 GitHub | ⚠️ 同左 | ⚠️ 需上报方提供仓库和分支 |
+| Automatic discovery, live status | ✅ Verified with real sessions | ⚠️ Implemented from the official docs, untested | ⚠️ The cloud environment must be able to reach your hub |
+| Approve / deny permissions in the board | ✅ Verified with real sessions | ⚠️ Untested | ❌ |
+| Answer the agent's multiple-choice questions in the board | ✅ Verified with real sessions (single and multiple choice) | ❌ Unclear whether Codex has an equivalent mechanism | ❌ |
+| Agent reads the board through MCP | ✅ Verified with real sessions | ⚠️ Untested | ⚠️ Must be able to reach your hub |
+| Reply from the board (sessions in tmux) | ✅ Verified with real sessions | ⚠️ Untested | ❌ |
+| Reply from the board (exited sessions, continued in the background) | ✅ Verified with real sessions | ⚠️ Untested | ❌ |
+| See changes, by default only files this session changed | ✅ | ⚠️ Whole workspace only | ❌ |
+| Cost and tokens | ✅ Uses the numbers Claude Code records itself | ⚠️ Tokens only, format untested | ❌ |
+| Lost detection, history import | ✅ | ⚠️ Untested | ❌ |
+| PR status, auto-accept after merge | ⚠️ Tested against a simulated GitHub, not the real one | ⚠️ Same as left | ⚠️ The reporter must provide the repository and branch |
 
-“真实会话验证”指用 Claude Code 2.1.330 实际跑过。这台开发机没有 Codex，所以 Codex 一列全部是按文档写的。
+"Verified with real sessions" means it was actually run with Claude Code 2.1.330. This development machine has no Codex, so the whole Codex column is written from the docs.
 
-几个值得知道的行为：
+A few behaviors worth knowing:
 
-- **看板和终端同时可答。** 看板挂着权限请求时，Claude Code 的终端提示照常显示，谁先答谁算数；在终端答了，看板上的请求自动撤回。
-- **选择题和权限一样**：终端照常显示题目，在看板里点选项或自己写答案都行，支持多题和多选。
+- **The board and the terminal can both answer.** While a permission request is open in the board, Claude Code's terminal prompt still shows as usual, and whichever answers first counts; if you answer in the terminal, the request in the board is withdrawn automatically.
+- **Multiple-choice questions work like permissions**: the terminal still shows the question, and in the board you can click an option or write your own answer. Multiple questions and multiple selection are supported.
 
-  ![在看板里回答选择题](docs/question.png)
-- **“本会话都允许 X”** 是看板自己的规则，只对这个会话、这个工具生效，可随时在处理台里撤销。
-- **“agent 说做完了”不等于“你验收了”。** 会话停在“待验收”，直到你点“已验收”。
-- **看过和处理过是两回事。** 没看过的会话标题前有个圆点；在处理台里停留一两秒算看过，状态不变。已读存在 hub 里，换设备也一致，可以“标为未读”。
-- **稍后处理。** 待验收、出错、PR 问题可以推迟 1 小时或到明早，期间不占队列；它一旦有新情况（新的请求、失败、新的结果）会提前回来。
-- **归档、验收、推迟都能撤销**，操作后 5 秒内点“撤销”。
-- **发出去不等于送达。** 从看板发的消息，要等 agent 自己报告收到同一句话才算送达；20 秒没确认会标成“未送达”。
-- **终端停在确认提示上时不能往里打字。** 那时的文字加回车会被当成对提示的回答，所以看板会拒绝，要求先处理请求。
-- **只为阻塞 agent 的事打断你。** 权限、提问、失败、失联会通知；做完待验收只加计数。
+  ![Answering a multiple-choice question in the board](docs/question.png)
+- **"Allow X for this session"** is a rule of the board itself. It applies only to this session and this tool, and can be revoked at any time in the Workbench.
+- **"The agent says it is done" is not "you accepted it".** The session stays in "To review" until you click Accepted.
+- **Seen and handled are two different things.** A session you have not seen has a dot before its title; staying in the Workbench for a second or two counts as seen, and the state does not change. Read status is stored in the hub, so it is consistent across devices, and you can "Mark unread".
+- **Snooze.** Sessions in To review, errors and PR problems can be postponed for 1 hour or until tomorrow morning, and do not take up the queue meanwhile; as soon as something new happens (a new request, a failure, a new result) they come back early.
+- **Archive, Accepted and Snooze can all be undone**: click "Undo" within 5 seconds of the action.
+- **Sent is not delivered.** A message sent from the board only counts as delivered once the agent itself reports receiving the same sentence; with no confirmation after 20 seconds it is marked "not delivered".
+- **You cannot type into a terminal stopped at a confirmation prompt.** Text plus Enter would then be taken as the answer to that prompt, so the board refuses and asks you to handle the request first.
+- **It interrupts you only for things that block the agent.** Permissions, questions, failures and Lost sessions notify you; finished work awaiting review only adds to the count.
 
-## 已知限制
+## Known limitations
 
-- **不在 tmux 里的活会话，看板没法往里打字。** 这类会话只能看、能批权限，回复要回终端。
-- **往 tmux 里打字只防得住 hooks 看得见的提示**（权限、提问）。终端停在别的菜单上时（比如 `/model` 选择器），看板不知道，文字和回车会被那个菜单吃掉；这种情况靠“未送达”提示事后发现。
-- **改动归属只认编辑工具**：会话用 Edit、Write 这类工具改的文件会归到它名下；它用命令行改的（比如跑脚本、`sed`）归不到，要点“看整个工作区”才看得到。
-- **PR 状态没有对着真实 GitHub 验证过**：开发环境连不上 GitHub，只用模拟的接口和模拟的 `gh` 输出测过。
-- **rebase 合并且之后删了 PR 的情况**检测不到；没有 PR、直接推主干的 squash 也检测不到。
-- **云端**：两家都没有公开的“列出会话 / 读状态”接口，只能靠 hooks 往外推。
-- **额度窗口**看不到，只能在被限流而失败时标出来。
-- 会话文件格式是各家的内部格式，随时可能变；读不懂的内容会被跳过，不会报错，但花费和历史导入可能因此失效。
+- **For live sessions not in tmux, the board cannot type into them.** Such sessions can only be watched and have permissions approved; replies have to go back to the terminal.
+- **Typing into tmux is only guarded against prompts the hooks can see** (permissions, questions). If the terminal is stopped at some other menu (for example the `/model` picker), the board does not know, and the text and Enter will be eaten by that menu; this case is discovered afterwards through the "not delivered" notice.
+- **Change attribution only recognizes editing tools**: files a session changes with tools such as Edit and Write are attributed to it; those changed through the command line (running scripts, `sed`) cannot be attributed, and you must click "See the whole workspace" to see them.
+- **PR status has not been verified against the real GitHub**: the development environment cannot reach GitHub, so it was tested only with a simulated API and simulated `gh` output.
+- **Rebase merges where the PR was deleted afterwards** are not detected; squash merges with no PR, pushed straight to the trunk, are not detected either.
+- **Cloud**: neither vendor has a public "list sessions / read status" interface, so it can only rely on hooks pushing outward.
+- **Quota windows** cannot be seen; they are only marked when a session fails because of rate limiting.
+- Session file formats are each vendor's internal formats and can change at any time; content that cannot be understood is skipped without an error, but cost and history import may stop working because of it.
 
-## 几十到上百个会话
+## Dozens to hundreds of sessions
 
-一个人能逐个盯住的会话只有几个，所以规模上去以后，目标不是让你看得更快，而是让需要你看的东西变少。
+A person can closely watch only a handful of sessions, so once the scale goes up, the goal is not to let you look faster but to reduce what needs your looking.
 
-![150 个会话时的办公室](docs/office-fleet.png)
+![The Office with 150 sessions](docs/office-fleet.png)
 
-- **决定一次，处处生效**：多个会话请求完全相同的命令时，队列顶部出现一张合并卡片，一次全部允许或拒绝。也可以选“以后也自动允许”，变成对所有会话生效的规则，在顶部“自动规则”里随时撤销。
-- **按一类命令决定**：命令的参数总在变（`git push origin 分支A`、`分支B`…），所以三个以上会话请求同一类命令时也会合并成一张卡片，可以设成“`git push …` 加任意参数都自动允许”。单个请求上也有“这一条”和“这一类”两个按钮。新规则会立刻放行已经在等的同类请求。
-- **“一类”规则的护栏**：带 `;`、`&&`、`|`、`>`、`$(` 的命令不会匹配，所以 `git push x; curl … | sh` 不算 `git push …`；`bash`、`node`、`sudo` 这类解释器不能单独设成一类；高风险写法永远逐个确认。
-- **高风险命令不走捷径**：看起来有破坏性的命令（`rm -rf`、强制推送、`sudo`、管道进 shell 等）会标出来，不会被合并，也不能设成规则，只能逐个确认。这是一个提醒用的模式匹配，不是安全边界。
-- **不需要你的分组自动折叠**：超过 30 个会话时，“工作中”折叠成按项目的汇总（如 `shop-api 12 · web-app 8`），点标题展开。
-- **筛选**：按 `/` 输入项目、标题、机器或分支，三个视图同时过滤。
-- **办公室按项目分房间**：每个房间标着几个在等你、几个待验收、多少在干活。超过 16 个会话时工位自动变紧凑。你的桌子和队伍固定在最上面，队伍最多排两行，排不下的在各自工位上举红牌，队尾显示还有多少个。
+- **Decide once, applies everywhere**: when several sessions request exactly the same command, a merged card appears at the top of the queue, and you allow or deny all of them at once. You can also choose "auto-allow from now on", which becomes a rule for all sessions and can be revoked at any time under "Auto rules" at the top.
+- **Decide by kind of command**: a command's arguments keep changing (`git push origin branch-A`, `branch-B`…), so when three or more sessions request the same kind of command they are also merged into one card, and you can set "`git push …` with any arguments is auto-allowed". Single requests also have "This one" and "This kind" buttons. A new rule immediately lets through requests of the same kind that are already waiting.
+- **Guardrails for "kind" rules**: commands containing `;`, `&&`, `|`, `>` or `$(` do not match, so `git push x; curl … | sh` does not count as `git push …`; interpreters such as `bash`, `node` and `sudo` cannot be made a kind on their own; risky forms are always confirmed one by one.
+- **No shortcuts for risky commands**: commands that look destructive (`rm -rf`, force push, `sudo`, piping into a shell, etc.) are flagged, are never merged, and cannot be made into rules; they can only be confirmed one by one. This is pattern matching meant as a reminder, not a security boundary.
+- **Groups that do not need you fold automatically**: past 30 sessions, "Working" folds into a per-project summary (such as `shop-api 12 · web-app 8`); click the heading to expand.
+- **Filter**: press `/` and type a project, title, machine or branch; all three views are filtered at the same time.
+- **The Office has one room per project**: each room is labeled with how many are waiting for you, how many are to review, and how many are working. Past 16 sessions the desks automatically become compact. Your desk and the queue stay fixed at the top, the queue takes at most two rows, those that do not fit raise a red flag at their own desks, and the end of the queue shows how many more there are.
 
-性能上做了三件事：给浏览器的实时更新改成只发变化的会话；页面只重画内容变了的卡片；同一个仓库的 PR 一次查完，git 子进程限制并发。
+Three things were done for performance: the live updates sent to the browser now carry only the sessions that changed; the page redraws only the cards whose content changed; and the PRs of one repository are queried together, with git subprocesses limited in concurrency.
 
-在这台开发机上用模拟数据量过：200 个会话并发、1 万条事件，hub 每秒处理约 4000 条，发给一个页面的数据从 8 MB 降到 1.4 MB，重启重放 30 毫秒；150 个会话持续更新时页面最慢一帧 17 毫秒。**没有用上百个真实 agent 测过**，真实场景下每个 agent 的 hook 开销、GitHub 限流都还没验证。
+Measured on this development machine with simulated data: 200 sessions concurrently and 10,000 events, the hub handles about 4,000 per second, the data sent to a page dropped from 8 MB to 1.4 MB, and restart replay takes 30 ms; with 150 sessions updating continuously, the slowest page frame was 17 ms. **It has not been tested with hundreds of real agents**; in real use, the hook overhead per agent and GitHub rate limits are still unverified.
 
-## 任务：按任务验收，而不是按会话
+## Tasks: accept by task, not by session
 
-你脑中的单位是任务，agent 跑的是会话。看板把“看起来是同一件事”的会话归到一张卡片上：
+The unit in your head is the task, while agents run sessions. The board groups sessions that "look like the same thing" onto one card:
 
-![任务卡片和按任务验收](docs/task.png)
+![Task card and accepting by task](docs/task.png)
 
-- **怎么认定是同一个任务**：同一个仓库里用了同一句开场指令（重试，或者让 Claude 和 Codex 各做一版），或者在同一个功能分支上干活。不同文件夹的 worktree 只要是同一个仓库也算。`main` 这类主干分支、“继续”这种太短的指令不算依据。
-- **卡片放在哪**：放在它最需要你的那个会话所在的一栏，里面列出每个会话各自的状态。
-- **按任务验收**：打开任一会话，处理台顶部列出同任务的所有会话（分支、改了几个文件、PR、花费），点一行切换对比。可以“全部验收”，或“采用这一版，其余归档”。还在干活的会话不会被动。都能撤销。
-- **认错了**：点“把这个会话拆出去”。也可以通过接口手动把两个会话并成一个任务。
+- **How sessions are judged to be the same task**: the same opening instruction used in the same repository (a retry, or having Claude and Codex each make a version), or work on the same feature branch. Worktrees in different folders count if they belong to the same repository. Trunk branches like `main` and instructions too short to go on, like "continue", are not used as a basis.
+- **Where the card goes**: in the column of the session that needs you most, and it lists each session's own state inside.
+- **Accept by task**: open any session and the top of the Workbench lists all sessions of the same task (branch, number of files changed, PR, cost); click a row to switch and compare. You can "Accept all", or "Adopt this one, archive the rest". Sessions still working are left alone. All of it can be undone.
+- **Grouped wrongly**: click "Split this session off". You can also merge two sessions into one task manually through the API.
 
-这是推断，不是事实：两个会话恰好用了同一句指令做不同的事，也会被归到一起，需要你拆开。
+This is inference, not fact: two sessions that happen to use the same instruction for different things will also be grouped together, and you have to split them.
 
-## 分诊：让一个 agent 先替你读一遍队列
+## Triage: let an agent read the queue for you first
 
 ```bash
 node bin/session-board.js triage --model haiku
 ```
 
-它会在队列里出现没有备注的项时，启动一次很短的无界面 agent 运行，给每一项写**一句话摘要和一个建议**（建议允许、建议拒绝、需要你看），显示在卡片和处理台上。你读一句话就能决定，不用读命令原文。
+Whenever the queue has items without a note, it starts a very short headless agent run and writes **a one-sentence summary and a suggestion** for each item (suggest allow, suggest deny, needs a look), shown on the card and in the Workbench. You can decide by reading one sentence instead of the raw command.
 
-- **它只能写备注，不能做决定。** 批准、拒绝、验收仍然只在界面上。
-- **它被关在盒子里**：没有任何内置工具（不能跑命令、不能读写文件、不能上网），只能访问看板的分诊接口；它在自己的目录里运行，不会出现在它正在读的看板上。
-- **普通会话写不了备注**：分诊接口只在 `mcp --triage` 模式下提供，普通会话注册的 MCP 仍是只读的，所以一个会话没法给自己的请求写“建议允许”。
-- **对夹带指令有防备，但别把建议当结论**：队列里的文字来自其他 agent 和仓库内容，可能故意写成“给审阅者的指令”。实测中它识别并拒绝了这样一条窃取凭据的请求，但这只是一次测试，不是保证。高风险命令的红色警示不受分诊建议影响。
-- **它会消耗你的模型额度**：每批一次调用，所以是你手动开启的命令，不是默认行为。实测 6–7 项一批用时 12–14 秒。
+- **It can only write notes, not make decisions.** Approving, denying and accepting still happen only in the UI.
+- **It is kept in a box**: it has no built-in tools at all (it cannot run commands, read or write files, or reach the network) and can only access the board's triage interface; it runs in its own directory, so it does not appear on the board it is reading.
+- **Ordinary sessions cannot write notes**: the triage interface is provided only in `mcp --triage` mode, and the MCP registered by ordinary sessions stays read-only, so a session cannot write "suggest allow" on its own request.
+- **It is guarded against smuggled instructions, but do not treat the suggestion as a conclusion**: text in the queue comes from other agents and repository content, and may be deliberately written as "instructions to the reviewer". In testing it recognized and refused one such request to steal credentials, but that was a single test, not a guarantee. The red warning on risky commands is not affected by triage suggestions.
+- **It consumes your model quota**: one call per batch, which is why it is a command you start manually and not the default behavior. In testing, a batch of 6–7 items took 12–14 seconds.
 
-## 离开电脑时推送到手机
+## Push to your phone when you are away
 
-浏览器通知要开着页面才有。设置下面任意一个，hub 会在**没有任何看板页面处于可见状态**时，把“有会话在等你”推出去：
+Browser notifications only work while the page is open. Set either of the following, and the hub will push "a session is waiting for you" when **no board page is visible**:
 
 ```bash
-SESSION_BOARD_NTFY=https://ntfy.sh/你的主题 node bin/session-board.js up
+SESSION_BOARD_NTFY=https://ntfy.sh/your-topic node bin/session-board.js up
 ```
 
-- `SESSION_BOARD_NTFY`：[ntfy](https://ntfy.sh) 的主题地址（可自建）。`SESSION_BOARD_WEBHOOK`：向任意地址 POST 一段 JSON。
-- 默认只推权限、提问、出错、失联和 PR 问题；做完待验收不推。用 `SESSION_BOARD_NOTIFY_ON` 改。
-- **默认不带命令原文**：只说哪个会话、需要什么。命令和问题里可能有代码或密钥，而推送服务是别人的机器。确实想带上，设 `SESSION_BOARD_NOTIFY_DETAIL=1`。
-- 同时来很多个会合并成一条；几秒内自己解决了的不推。
-- 通知里的链接指向看板上的那个会话。手机要能访问到看板才点得开，用 `SESSION_BOARD_PUBLIC_URL` 指定手机可达的地址。
+- `SESSION_BOARD_NTFY`: the topic URL of [ntfy](https://ntfy.sh) (can be self-hosted). `SESSION_BOARD_WEBHOOK`: POST a piece of JSON to any URL.
+- By default only permissions, questions, errors, Lost sessions and PR problems are pushed; finished work awaiting review is not. Change this with `SESSION_BOARD_NOTIFY_ON`.
+- **The command text is not included by default**: it only says which session and what it needs. Commands and questions may contain code or secrets, and the push service is someone else's machine. If you really want it included, set `SESSION_BOARD_NOTIFY_DETAIL=1`.
+- Many arriving at the same time are merged into one; ones that resolve themselves within a few seconds are not pushed.
+- The link in the notification points to that session on the board. Your phone must be able to reach the board to open it; use `SESSION_BOARD_PUBLIC_URL` to specify an address reachable from the phone.
 
-只用本地的模拟服务测过，没有真的推到 ntfy。
+Tested only against a local simulated server; nothing was actually pushed to ntfy.
 
-## PR 状态和自动验收
+## PR status and auto-accept
 
-会话所在分支如果有 PR，卡片和处理台上会显示它的编号、状态（开着、已合并、已关闭）、检查结果和评审结论，点编号直接打开。
+If the branch a session is on has a PR, the card and the Workbench show its number, state (open, merged, closed), check results and review verdict; click the number to open it directly.
 
-- **怎么查**：优先用你机器上已登录的 `gh`（私有仓库、企业版都不用额外配置）；没有就走 GitHub 接口，可设 `GITHUB_TOKEN`。设 `SESSION_BOARD_GITHUB=off` 关闭。
-- **什么时候查**：每轮结束时立刻查一次（agent 可能刚推了代码、开了或合了 PR），之后对待验收的会话和开着的 PR 每两分钟查一次，所以你在 GitHub 网页上点合并也能被发现。
-- **自动验收的条件**：PR 已合并，并且被合并的正是这个会话留在分支上的那个提交。分支名被复用时，旧的已合并 PR 不会让新的工作被误判为已验收；本地还有没推上去的提交时也不会。
-- 普通合并不依赖 GitHub，单靠 git 就能识别。
-- **检查失败或被要求修改会进“等你回应”队列并通知**，排在被卡住和出错的会话之后、普通待验收之前。agent 正在干活时不提醒（它可能正在修），等这一轮结束问题还在才提醒；同一个问题只提醒一次，新的提交再失败算新问题；修好了自动离开队列。处理台上可以一键“让它去修”、打开 PR，或点“知道了”。
+- **How it is checked**: it prefers the `gh` already logged in on your machine (private repositories and enterprise need no extra configuration); if there is none it uses the GitHub API, and you can set `GITHUB_TOKEN`. Set `SESSION_BOARD_GITHUB=off` to turn it off.
+- **When it is checked**: once immediately at the end of each turn (the agent may have just pushed code, or opened or merged a PR), and after that every two minutes for sessions awaiting review and for open PRs, so a merge you click on the GitHub website is noticed too.
+- **Conditions for auto-accept**: the PR is merged, and the commit that was merged is exactly the one this session left on the branch. When a branch name is reused, an old merged PR does not cause new work to be wrongly judged as accepted; neither do local commits that have not been pushed.
+- Ordinary merges do not depend on GitHub; git alone can recognize them.
+- **Failed checks or requested changes enter the "Needs you" queue and notify you**, ranked after blocked and errored sessions and before ordinary To review. No reminder while the agent is working (it may be fixing it); you are reminded only if the problem is still there when the turn ends; the same problem is reminded only once, a new commit that fails again counts as a new problem, and once fixed it leaves the queue automatically. The Workbench offers one-click "Have it fix this", opening the PR, or clicking "Got it".
 
-## 让 agent 自己读看板（MCP）
+## Let agents read the board themselves (MCP)
 
 ```bash
 claude mcp add session-board -- node /path/to/session-board/bin/session-board.js mcp
 ```
 
-提供四个工具：`whats_waiting`（谁在等人）、`list_sessions`、`get_session`、`wait_for_session`（等某个会话做完，不用轮询）。
+It provides four tools: `whats_waiting` (who is waiting for a person), `list_sessions`, `get_session`, and `wait_for_session` (wait for a session to finish, no polling).
 
-**默认模式是只读的，而且是故意的**：如果 agent 能批准自己的权限请求，或者把自己的活标成已验收，看板就失去意义了。决定权只在界面上。分诊用的 `mcp --triage` 模式多一个写备注的工具，仍然不能做决定。
+**The default mode is read-only, and on purpose**: if an agent could approve its own permission requests, or mark its own work as Accepted, the board would lose its point. The power to decide lives only in the UI. The `mcp --triage` mode used for triage adds one tool for writing notes, and still cannot make decisions.
 
-## 安全
+## Security
 
-看板能批准命令，所以：
+The board can approve commands, so:
 
-- 默认只监听 `127.0.0.1`，并且只响应发往本机地址、且不是跨站来源的请求，其他网页无法操控它。
-- 要让别的机器访问，必须设置 `SESSION_BOARD_TOKEN` 再用 `--bind` 放开，否则拒绝启动；带 token 时用 `http://…/?token=…` 打开看板。
-- 无法识别的 hook 内容一律回空对象，即“没有意见”，不会替 agent 做决定。
-- **防不住的情况**：看板挡得住别的网页，挡不住本机上以你的身份运行的程序。一个已经拿到任意命令执行权限的 agent，理论上可以直接请求本机的看板接口来批准自己的请求，也可以直接改掉 hooks 配置。所以不要给 agent 开放不受限制的命令执行，再指望看板把关。
+- It listens only on `127.0.0.1` by default, and responds only to requests sent to a local address and not from a cross-site origin, so other web pages cannot control it.
+- To let other machines reach it, you must set `SESSION_BOARD_TOKEN` and then open it up with `--bind`, otherwise it refuses to start; with a token, open the board with `http://…/?token=…`.
+- Hook content it cannot recognize always gets an empty object back, meaning "no opinion", and never decides anything on the agent's behalf.
+- **What it cannot prevent**: the board can stop other web pages, but not programs running on your machine as you. An agent that has already gained arbitrary command execution could in theory request the local board's API directly to approve its own requests, or edit the hooks config directly. So do not give agents unrestricted command execution and then count on the board to stand guard.
 
-## 架构
+## Architecture
 
 ```
-Claude Code hooks ─┐                       ┌─▶ 处理台 / 看板（SSE 实时推送）
-Codex hooks ───────┼─▶ hub：事件日志 ─▶ 状态机 ─┤
-/ingest/event ─────┘     （SQLite）            └─▶ 决定和消息回到 agent
+Claude Code hooks ─┐                       ┌─▶ Workbench / Board (live SSE push)
+Codex hooks ───────┼─▶ hub: event log ─▶ state machine ─┤
+/ingest/event ─────┘     (SQLite)            └─▶ decisions and messages back to the agent
 ```
 
-- **事件日志是唯一事实来源**，状态由 `src/reduce.js` 这个纯函数推导，重启时整体重放。带序号的上报如果迟到，会被记录但不采用；自带 ID 的事件（提问、工具调用）重复送达只算一次。
-- **两层状态**：agent 自己的生命周期（`working`、`review`、`idle`、`failed`、`unknown`、`ended`），加上它向你提出的未解决请求；只要有请求未解决，就是 `needs_input`。
-- **hub 地址写在 `~/.session-board/endpoint.json`**，命令桥每次调用时读取；Claude Code 的 HTTP hooks 写死了地址，hub 启动时发现不一致会自动改回来。
-- 视图只是同一份状态的不同画法：办公室视图没有改动 hub 和状态机，角色位置完全由状态决定。角色和家具是本项目自己画的像素图，没有用任何第三方素材。
+- **The event log is the single source of truth**; state is derived by `src/reduce.js`, a pure function, and replayed in full on restart. A sequenced report that arrives late is recorded but not used; events that carry their own ID (questions, tool calls) count only once if delivered repeatedly.
+- **Two layers of state**: the agent's own lifecycle (`working`, `review`, `idle`, `failed`, `unknown`, `ended`), plus the unresolved requests it has made to you; as long as a request is unresolved, the state is `needs_input`.
+- **The hub address is written in `~/.session-board/endpoint.json`**, which the command bridge reads on each call; Claude Code's HTTP hooks have the address hard-coded, and when the hub starts it fixes them automatically if they do not match.
+- Views are just different ways of drawing the same state: the Office view changed nothing in the hub or the state machine, and the characters' positions are determined entirely by state. The characters and furniture are pixel art drawn for this project, with no third-party assets.
 
-## 从 T3 Code 学到的
+## What was learned from T3 Code
 
-T3 Code 好用，靠的不是功能多，而是几条纪律（详见[拆解笔记](research_notes/AI%20编码%20agent%20会话管理调研/t3code_teardown.md)，读的是它的源码）。搬过来的：
+T3 Code is good not because it has many features, but because of a few disciplines (see the [teardown notes](research_notes/AI%20编码%20agent%20会话管理调研/t3code_teardown.md); what was read is its source code). What was carried over:
 
-- 列表是收件箱：不需要你的分组默认折叠，只有需要你的才展开。
-- 状态和归档分开：已读、稍后处理、归档是独立于状态的记录，由 hub 保存。
-- 每个待处理请求都标明现在还能怎么回答（看板可答，或只能回终端）。
-- 发送、送达、完成是三个不同的时刻。
-- 列表行只带卡片需要的数据（每行不到 2.5 KB，有测试卡住上限），长文本和文件列表在打开会话时才取。
-- 状态变化有 0.4 秒的防抖，避免卡片在两列之间来回跳。
-- 用真实录制的 hook 序列做回放测试（`test/fixtures/`）。
+- The list is an inbox: groups that do not need you are folded by default, and only those that need you are expanded.
+- State and archiving are separate: read, snoozed and archived are records independent of state, kept by the hub.
+- Every pending request states how it can still be answered right now (answerable in the board, or only back in the terminal).
+- Sending, delivery and completion are three different moments.
+- List rows carry only the data the card needs (under 2.5 KB per row, with a test enforcing the cap); long text and file lists are fetched only when a session is opened.
+- State changes have a 0.4-second debounce, so cards do not jump back and forth between columns.
+- Replay tests use really recorded hook sequences (`test/fixtures/`).
 
-没搬的：通过 SDK 驱动 agent（那会让我们也看不到外部会话）、只保留一天的事件日志、基于隐藏 git 引用的检查点和回滚。
+What was not carried over: driving agents through the SDK (that would leave us unable to see external sessions too), an event log kept for only one day, and checkpoints and rollback based on hidden git refs.
 
-设计依据见[调研报告](reports/AI%20编码%20agent%20会话管理调研.md)和[六个同类工具的补充调研](research_notes/AI%20编码%20agent%20会话管理调研/named_tools_followup.md)。
+For the design rationale see the [research report](reports/AI%20编码%20agent%20会话管理调研.md) and the [supplementary research on six similar tools](research_notes/AI%20编码%20agent%20会话管理调研/named_tools_followup.md).
 
-## 接下来
+## What's next
 
-1. 用真实 Codex 验证整列能力。
-2. 对着真实 GitHub 验证 PR 状态。
-3. 把命令行造成的改动也归属到会话（每个任务一个 worktree）。
-5. 事件日志快照：现在重启时重放全部事件，几十万条以内没问题，再多需要快照。
-6. 任务的并排对比：现在是点一行切换着看，还不能把两个版本的改动并排放。
+1. Verify the whole Codex column with real Codex.
+2. Verify PR status against the real GitHub.
+3. Attribute changes made through the command line to sessions as well (one worktree per task).
+5. Event-log snapshots: today a restart replays all events, which is fine up to a few hundred thousand, and more than that needs snapshots.
+6. Side-by-side comparison of tasks: today you click a row to switch and look, and cannot yet put the changes of two versions side by side.
 
-## 来源与声明
+## Sources and disclaimers
 
-- 本项目的代码、界面和像素图都是为本项目新写、新画的，没有复制其他项目的代码或素材，也没有任何第三方依赖。
-- 设计上参考了多个公开产品和论文的**思路**（见调研报告和笔记），其中对 T3 Code（MIT 许可）的参考只限于机制层面；与它的源码逐行比对过，除三行通用写法外没有相同的代码行。
-- 调研笔记里对文档、论文和公开讨论的引用都是带出处的短句。
-- Claude、Claude Code 是 Anthropic 的商标，Codex 是 OpenAI 的商标，T3 Code 属于 T3 Tools。本项目与这些公司没有关联，也未获其认可；提到这些名字只是为了说明兼容和参考对象。
+- The code, UI and pixel art of this project were all newly written and drawn for it; no code or assets were copied from other projects, and there are no third-party dependencies.
+- The design draws on the **ideas** of several public products and papers (see the research report and notes); the reference to T3 Code (MIT license) is limited to the mechanism level; compared line by line with its source, there are no identical lines of code apart from three generic idioms.
+- Citations of documents, papers and public discussions in the research notes are short quotations with sources.
+- Claude and Claude Code are trademarks of Anthropic, Codex is a trademark of OpenAI, and T3 Code belongs to T3 Tools. This project is not affiliated with or endorsed by these companies; these names are mentioned only to describe compatibility and what was referenced.
 
-## 许可证
+## License
 
 [MIT](LICENSE) © 2026 Mira
 
-## 开发
+## Development
 
 ```bash
 npm test
